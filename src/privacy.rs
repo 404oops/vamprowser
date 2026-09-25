@@ -1,0 +1,588 @@
+//! Tracking protection and cookie blocking, as WebKit content rule lists:
+//! compiled once by WebKit, then enforced inside its network stack for every
+//! tab, with no per-request work here.
+
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+};
+
+use block2::RcBlock;
+use objc2::{MainThreadMarker, Message, rc::Retained};
+use objc2_foundation::{NSError, NSString};
+use objc2_web_kit::{WKContentRuleList, WKContentRuleListStore, WKWebView};
+use serde_json::{Value, json};
+
+use crate::settings::{Protection, Settings};
+
+/// Analytics, session recording and cross-site tracking. Blocked when a
+/// page loads them from another site, so the services' own sites still work.
+const TRACKERS: &[&str] = &[
+    "google-analytics.com",
+    "googletagmanager.com",
+    "googletagservices.com",
+    "doubleclick.net",
+    "connect.facebook.net",
+    "scorecardresearch.com",
+    "quantserve.com",
+    "quantcount.com",
+    "hotjar.com",
+    "hotjar.io",
+    "mouseflow.com",
+    "fullstory.com",
+    "crazyegg.com",
+    "clarity.ms",
+    "mixpanel.com",
+    "amplitude.com",
+    "segment.io",
+    "cdn.segment.com",
+    "heapanalytics.com",
+    "heap.io",
+    "nr-data.net",
+    "optimizely.com",
+    "chartbeat.com",
+    "chartbeat.net",
+    "parsely.com",
+    "parse.ly",
+    "comscore.com",
+    "krxd.net",
+    "bluekai.com",
+    "demdex.net",
+    "omtrdc.net",
+    "everesttech.net",
+    "rlcdn.com",
+    "agkn.com",
+    "tapad.com",
+    "mathtag.com",
+    "bat.bing.com",
+    "analytics.twitter.com",
+    "ads-twitter.com",
+    "px.ads.linkedin.com",
+    "snap.licdn.com",
+    "analytics.tiktok.com",
+    "sc-static.net",
+    "analytics.yahoo.com",
+    "mc.yandex.ru",
+    "mc.yandex.com",
+    "top-fwz1.mail.ru",
+    "kissmetrics.com",
+    "woopra.com",
+    "statcounter.com",
+    "histats.com",
+    "hs-analytics.net",
+    "hsadspixel.net",
+    "track.hubspot.com",
+    "pardot.com",
+    "munchkin.marketo.net",
+    "newrelic.com",
+    "matomo.cloud",
+    "branch.io",
+    "app-measurement.com",
+    "adjust.com",
+    "appsflyer.com",
+    "kochava.com",
+    "braze.com",
+    "iterable.com",
+    "exponea.com",
+    "pendo.io",
+    "logrocket.io",
+    "lr-ingest.io",
+    "smartlook.com",
+    "inspectlet.com",
+    "luckyorange.com",
+    "contentsquare.net",
+    "quantummetric.com",
+    "glassboxdigital.io",
+    "decibelinsight.net",
+];
+
+/// Ad networks and exchanges, added in strict mode.
+const ADVERTISING: &[&str] = &[
+    "googlesyndication.com",
+    "googleadservices.com",
+    "adservice.google.com",
+    "2mdn.net",
+    "amazon-adsystem.com",
+    "adsrvr.org",
+    "adnxs.com",
+    "criteo.com",
+    "criteo.net",
+    "taboola.com",
+    "outbrain.com",
+    "rubiconproject.com",
+    "pubmatic.com",
+    "openx.net",
+    "casalemedia.com",
+    "moatads.com",
+    "doubleverify.com",
+    "adsafeprotected.com",
+    "ads.linkedin.com",
+    "ads.tiktok.com",
+    "turn.com",
+    "yieldmo.com",
+    "sharethrough.com",
+    "teads.tv",
+    "smartadserver.com",
+    "33across.com",
+    "indexww.com",
+    "lijit.com",
+    "sovrn.com",
+    "contextweb.com",
+    "gumgum.com",
+    "media.net",
+    "zemanta.com",
+    "revcontent.com",
+    "mgid.com",
+    "adform.net",
+    "adroll.com",
+    "advertising.com",
+    "bidswitch.net",
+    "smaato.net",
+    "inmobi.com",
+    "unityads.unity3d.com",
+    "applovin.com",
+    "adcolony.com",
+    "vungle.com",
+    "yieldlove.com",
+    "triplelift.com",
+    "spotxchange.com",
+    "springserve.com",
+    "undertone.com",
+    "districtm.io",
+    "emxdgt.com",
+    "rhythmone.com",
+    "improvedigital.com",
+    "adition.com",
+    "yandexadexchange.net",
+    "popads.net",
+    "propellerads.com",
+    "exoclick.com",
+    "juicyads.com",
+];
+
+/// The rule list for these settings as WebKit's JSON, or `None` when there
+/// is nothing to enforce.
+pub fn rules(settings: &Settings) -> Option<String> {
+    let mut rules: Vec<Value> = Vec::new();
+    let mut block = |domains: &[&str]| {
+        for domain in domains {
+            // WebKit's rule regexes have no alternation, so one rule per
+            // domain; the prefix matches the domain and its subdomains.
+            let escaped = regex_escape(domain);
+            rules.push(json!({
+                "trigger": {
+                    "url-filter": format!("^https?://([^/:]*\\.)?{escaped}[/:?]"),
+                    "load-type": ["third-party"],
+                },
+                "action": { "type": "block" },
+            }));
+        }
+    };
+    match settings.protection {
+        Protection::Off => {}
+        Protection::Standard => block(TRACKERS),
+        Protection::Strict => {
+            block(TRACKERS);
+            block(ADVERTISING);
+        }
+    }
+    // Facebook's pixel is served from its own domain, so it needs a path.
+    if settings.protection != Protection::Off {
+        rules.push(json!({
+            "trigger": {
+                "url-filter": "^https?://([^/:]*\\.)?facebook\\.com/tr",
+                "load-type": ["third-party"],
+            },
+            "action": { "type": "block" },
+        }));
+    }
+    if settings.block_third_party_cookies || settings.protection == Protection::Strict {
+        rules.push(json!({
+            "trigger": { "url-filter": ".*", "load-type": ["third-party"] },
+            "action": { "type": "block-cookies" },
+        }));
+    }
+    (!rules.is_empty()).then(|| Value::Array(rules).to_string())
+}
+
+fn regex_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() * 2);
+    for c in text.chars() {
+        if ".*+?^${}()|[]\\/".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// The compiled list shared by every tab, recompiled when the settings that
+/// shape it change.
+#[derive(Default)]
+pub struct ContentRules {
+    current: Rc<RefCell<Option<Retained<WKContentRuleList>>>>,
+    /// The JSON the current list was compiled from, to skip no-op rebuilds.
+    source: Option<String>,
+    /// uBlock Origin's network filters, compiled (see `crate::filters`).
+    ublock: Rc<RefCell<Vec<Retained<WKContentRuleList>>>>,
+    /// Fingerprints of the lists `ublock` was built from.
+    ublock_sources: Vec<String>,
+    /// Which compile of each is the latest. WebKit finishes compiles in its
+    /// own time, so an older one can finish after a newer one; only the
+    /// latest may take effect.
+    generation: Rc<Cell<u64>>,
+    ublock_generation: Rc<Cell<u64>>,
+    /// Every list ever put on a page, to take off again: only ours, as
+    /// WebKit also adds extensions' own rule lists to pages.
+    applied: RefCell<Vec<Retained<WKContentRuleList>>>,
+    /// Lists still being compiled or looked up since launch; pages wait
+    /// for them before loading (see [`ContentRules::ready`]).
+    outstanding: Rc<Cell<u32>>,
+    /// The first list has been asked for.
+    primed: bool,
+    /// Pages stopped waiting, ready or not.
+    gave_up: bool,
+}
+
+impl ContentRules {
+    /// Compiles the list for `settings` if it differs from the current one,
+    /// then calls `ready` on the main thread. `ready` should re-apply rules
+    /// to every open tab.
+    pub fn update(&mut self, settings: &Settings, ready: impl Fn() + 'static) {
+        let source = rules(settings);
+        self.primed = true;
+        if source == self.source {
+            return;
+        }
+        self.source = source.clone();
+        let current = self.current.clone();
+        let generation = self.generation.clone();
+        generation.set(generation.get() + 1);
+        let mine = generation.get();
+        let Some(source) = source else {
+            *current.borrow_mut() = None;
+            ready();
+            return;
+        };
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        // SAFETY: called on the main thread, which the store requires.
+        let Some(store) = (unsafe { WKContentRuleListStore::defaultStore(mtm) }) else {
+            return;
+        };
+        let outstanding = self.outstanding.clone();
+        outstanding.set(outstanding.get() + 1);
+        let handler = RcBlock::new(move |list: *mut WKContentRuleList, error: *mut NSError| {
+            outstanding.set(outstanding.get().saturating_sub(1));
+            // SAFETY: WebKit passes either a valid list or null, retained
+            // for the duration of the callback; we take our own reference.
+            let list = unsafe { Retained::retain(list) };
+            if list.is_none() && !error.is_null() {
+                // SAFETY: non-null error pointer from WebKit.
+                let error = unsafe { &*error };
+                eprintln!(
+                    "Could not compile content rules: {}",
+                    error.localizedDescription()
+                );
+            }
+            // Settings changed again while this compiled: the newer
+            // compile's list is the one to use.
+            if generation.get() != mine {
+                return;
+            }
+            *current.borrow_mut() = list;
+            ready();
+        });
+        // SAFETY: arguments are valid NSStrings and a block with the
+        // signature WebKit documents; it calls back on the main thread.
+        unsafe {
+            store.compileContentRuleListForIdentifier_encodedContentRuleList_completionHandler(
+                Some(&NSString::from_str("vamprowser-protection")),
+                Some(&NSString::from_str(&source)),
+                Some(&handler),
+            );
+        }
+    }
+
+    /// Whether pages can load with every list in place: the first
+    /// compile, and uBlock Origin's lists from last time, are done (or
+    /// pages have waited long enough).
+    pub fn ready(&self) -> bool {
+        self.gave_up || (self.primed && self.outstanding.get() == 0)
+    }
+
+    /// Pages stop waiting for the lists.
+    pub fn give_up_waiting(&mut self) {
+        self.gave_up = true;
+    }
+
+    /// Brings back uBlock Origin's lists enforced last time, already
+    /// compiled in WebKit's store, so pages are filtered from the first
+    /// one at launch rather than once uBlock Origin reports in, seconds
+    /// later. Calls `ready` once they're in place (or couldn't all be
+    /// found: its report compiles them again).
+    pub fn restore_ublock(&mut self, fingerprints: Vec<String>, ready: impl Fn() + 'static) {
+        if fingerprints.is_empty() {
+            return;
+        }
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        // SAFETY: called on the main thread, which the store requires.
+        let Some(store) = (unsafe { WKContentRuleListStore::defaultStore(mtm) }) else {
+            return;
+        };
+        // `ublock_sources` stays empty: uBlock Origin's first report looks
+        // its lists up again (quick, as they're compiled) and takes over.
+        let generation = self.ublock_generation.clone();
+        generation.set(generation.get() + 1);
+        let mine = generation.get();
+        let outstanding = self.outstanding.clone();
+        outstanding.set(outstanding.get() + 1);
+        let found: Rc<RefCell<Vec<Option<Retained<WKContentRuleList>>>>> =
+            Rc::new(RefCell::new(vec![None; fingerprints.len()]));
+        let remaining = Rc::new(Cell::new(fingerprints.len()));
+        let ready = Rc::new(ready);
+        for (index, fingerprint) in fingerprints.iter().enumerate() {
+            let (found, remaining, ready, outstanding, generation) = (
+                found.clone(),
+                remaining.clone(),
+                ready.clone(),
+                outstanding.clone(),
+                generation.clone(),
+            );
+            let target = self.ublock.clone();
+            let looked_up = RcBlock::new(move |list: *mut WKContentRuleList, _error: *mut NSError| {
+                // SAFETY: WebKit passes a valid list or null.
+                found.borrow_mut()[index] = unsafe { Retained::retain(list) };
+                remaining.set(remaining.get() - 1);
+                if remaining.get() > 0 {
+                    return;
+                }
+                outstanding.set(outstanding.get().saturating_sub(1));
+                // Anything newer asked for meanwhile wins.
+                if generation.get() == mine {
+                    let lists: Vec<_> = found.borrow_mut().drain(..).collect();
+                    // Only if they all are: part of the filters could let
+                    // through what the rest were written around.
+                    if lists.iter().all(Option::is_some) {
+                        *target.borrow_mut() = lists.into_iter().flatten().collect();
+                    }
+                }
+                ready();
+            });
+            let identifier = NSString::from_str(&format!("{UBLOCK_PREFIX}{fingerprint}"));
+            // SAFETY: a valid identifier and a block of the documented type.
+            unsafe {
+                store.lookUpContentRuleListForIdentifier_completionHandler(Some(&identifier), Some(&looked_up));
+            }
+        }
+    }
+
+    /// Replaces a tab's rule lists with the current ones.
+    pub fn apply(&self, webview: &WKWebView) {
+        // SAFETY: plain property access and list mutation on a live web view,
+        // on the main thread where all WebKit calls here are made.
+        unsafe {
+            let controller = webview.configuration().userContentController();
+            let mut applied = self.applied.borrow_mut();
+            for list in applied.iter() {
+                controller.removeContentRuleList(list);
+            }
+            let current = self.current.borrow();
+            let ublock = self.ublock.borrow();
+            for list in current.iter().chain(ublock.iter()) {
+                controller.addContentRuleList(list);
+                // By identifier: WebKit removes by it, and hands out a new
+                // object for the same list.
+                let identifier = list.identifier();
+                if !applied.iter().any(|seen| seen.identifier() == identifier) {
+                    applied.push(list.clone());
+                }
+            }
+        }
+    }
+
+    /// Enforces uBlock Origin's network filters, given as WebKit rule lists
+    /// (empty to stop). Lists already compiled — this launch or an earlier
+    /// one — are reused by content, so a relaunch doesn't recompile tens of
+    /// thousands of rules. Calls `ready` once they're in place.
+    /// `fingerprints` are the chunks' [`crate::filters::fingerprint`]s,
+    /// worked out off the main thread: the chunks run to megabytes.
+    pub fn set_ublock(
+        &mut self,
+        chunks: Vec<String>,
+        fingerprints: Vec<String>,
+        ready: impl Fn() + 'static,
+    ) {
+        if fingerprints == self.ublock_sources {
+            return;
+        }
+        self.ublock_sources = fingerprints.clone();
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        // SAFETY: called on the main thread, which the store requires.
+        let Some(store) = (unsafe { WKContentRuleListStore::defaultStore(mtm) }) else {
+            return;
+        };
+        forget_stale_lists(&store, &fingerprints);
+        let target = self.ublock.clone();
+        let generation = self.ublock_generation.clone();
+        generation.set(generation.get() + 1);
+        let mine = generation.get();
+        if chunks.is_empty() {
+            target.borrow_mut().clear();
+            crate::filters::save_enforced(&[]);
+            ready();
+            return;
+        }
+        let ready = Rc::new(ready);
+        let compiled: Rc<RefCell<Vec<Option<Retained<WKContentRuleList>>>>> =
+            Rc::new(RefCell::new(vec![None; chunks.len()]));
+        let remaining = Rc::new(std::cell::Cell::new(chunks.len()));
+        let fingerprints_kept = Rc::new(fingerprints.clone());
+        for (index, (chunk, fingerprint)) in chunks.into_iter().zip(fingerprints).enumerate() {
+            let identifier = NSString::from_str(&format!("{UBLOCK_PREFIX}{fingerprint}"));
+            let finish = {
+                let compiled = compiled.clone();
+                let remaining = remaining.clone();
+                let target = target.clone();
+                let ready = ready.clone();
+                let generation = generation.clone();
+                let fingerprints_kept = fingerprints_kept.clone();
+                move |list: Option<Retained<WKContentRuleList>>| {
+                    compiled.borrow_mut()[index] = list;
+                    remaining.set(remaining.get() - 1);
+                    // Newer lists were asked for meanwhile: those win.
+                    if remaining.get() == 0 && generation.get() == mine {
+                        let lists: Vec<_> = compiled.borrow_mut().drain(..).collect();
+                        // Remembered for the next launch, if all of them
+                        // are in the store to come back from.
+                        if lists.iter().all(Option::is_some) {
+                            crate::filters::save_enforced(&fingerprints_kept);
+                        }
+                        *target.borrow_mut() = lists.into_iter().flatten().collect();
+                        ready();
+                    }
+                }
+            };
+            let store_again = store.clone();
+            let identifier_again = identifier.clone();
+            let looked_up = RcBlock::new(
+                move |list: *mut WKContentRuleList, _error: *mut NSError| {
+                    // SAFETY: WebKit passes a valid list or null.
+                    if let Some(list) = unsafe { Retained::retain(list) } {
+                        finish(Some(list));
+                        return;
+                    }
+                    let finish = finish.clone();
+                    let compiled_block =
+                        RcBlock::new(move |list: *mut WKContentRuleList, error: *mut NSError| {
+                            // SAFETY: as above; the error, if any, is valid.
+                            let list = unsafe { Retained::retain(list) };
+                            if list.is_none() && !error.is_null() {
+                                let error = unsafe { &*error };
+                                eprintln!(
+                                    "Could not compile uBlock Origin's filters: {}",
+                                    error.localizedDescription()
+                                );
+                            }
+                            finish(list);
+                        });
+                    // SAFETY: valid strings and a block of the documented type.
+                    unsafe {
+                        store_again
+                        .compileContentRuleListForIdentifier_encodedContentRuleList_completionHandler(
+                            Some(&identifier_again),
+                            Some(&NSString::from_str(&chunk)),
+                            Some(&compiled_block),
+                        );
+                    }
+                },
+            );
+            // SAFETY: a valid identifier and a block of the documented type.
+            unsafe {
+                store.lookUpContentRuleListForIdentifier_completionHandler(
+                    Some(&identifier),
+                    Some(&looked_up),
+                );
+            }
+        }
+    }
+}
+
+const UBLOCK_PREFIX: &str = "vamprowser-ublock-";
+
+/// Deletes compiled uBlock Origin lists no longer in use, so old versions
+/// of the filter lists don't pile up on disk.
+fn forget_stale_lists(store: &WKContentRuleListStore, keep: &[String]) {
+    let keep: Vec<String> = keep.iter().map(|f| format!("{UBLOCK_PREFIX}{f}")).collect();
+    let store_again = store.retain();
+    let handler = RcBlock::new(
+        move |identifiers: *mut objc2_foundation::NSArray<NSString>| {
+            // SAFETY: WebKit passes a valid array or null.
+            let Some(identifiers) = (unsafe { identifiers.as_ref() }) else {
+                return;
+            };
+            for identifier in identifiers.iter() {
+                let name = identifier.to_string();
+                if name.starts_with(UBLOCK_PREFIX) && !keep.contains(&name) {
+                    let done = RcBlock::new(|_error: *mut NSError| {});
+                    // SAFETY: an identifier the store just listed.
+                    unsafe {
+                        store_again.removeContentRuleListForIdentifier_completionHandler(
+                            Some(&identifier),
+                            Some(&done),
+                        );
+                    }
+                }
+            }
+        },
+    );
+    // SAFETY: a block of the documented type.
+    unsafe { store.getAvailableContentRuleListIdentifiers(Some(&handler)) };
+}
+
+/// Script run in every page before its own: announces Global Privacy
+/// Control, which sites in several jurisdictions must honour.
+pub const GPC_SCRIPT: &str = "Object.defineProperty(Navigator.prototype, 'globalPrivacyControl', \
+    { get: () => true, configurable: true, enumerable: true });";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn levels_build_bigger_lists() {
+        let off = Settings {
+            protection: Protection::Off,
+            block_third_party_cookies: false,
+            ..Settings::default()
+        };
+        assert_eq!(rules(&off), None);
+        let count = |s: &Settings| {
+            serde_json::from_str::<Vec<Value>>(&rules(s).unwrap())
+                .unwrap()
+                .len()
+        };
+        let standard = Settings::default();
+        let strict = Settings {
+            protection: Protection::Strict,
+            ..Settings::default()
+        };
+        assert!(count(&strict) > count(&standard));
+        let cookies_only = Settings {
+            protection: Protection::Off,
+            ..Settings::default()
+        };
+        assert_eq!(count(&cookies_only), 1);
+    }
+
+    #[test]
+    fn domains_are_escaped_into_anchored_filters() {
+        let list = rules(&Settings::default()).unwrap();
+        assert!(list.contains(r#"^https?://([^/:]*\\.)?doubleclick\\.net[/:?]"#));
+    }
+}

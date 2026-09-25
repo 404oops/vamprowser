@@ -1,0 +1,87 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleDevelopmentRegion</key><string>en</string>
+  <key>CFBundleDisplayName</key><string>Vamprowser</string>
+  <key>CFBundleExecutable</key><string>vamprowser</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
+  <key>CFBundleIdentifier</key><string>dev.oops404.vamprowser</string>
+  <key>CFBundleName</key><string>Vamprowser</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>0.4.0</string>
+  <key>CFBundleVersion</key><string>5</string>
+  <key>LSApplicationCategoryType</key><string>public.app-category.productivity</string>
+  <key>LSMinimumSystemVersion</key><string>13.0</string>
+  <key>NSHighResolutionCapable</key><true/>
+  <key>NSPrincipalClass</key><string>NSApplication</string>
+  <key>NSSupportsAutomaticTermination</key><false/>
+
+  <!-- A web browser: offered as the default for web links. -->
+  <key>CFBundleURLTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleURLName</key><string>Web site URL</string>
+      <key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>CFBundleURLSchemes</key>
+      <array>
+        <string>http</string>
+        <string>https</string>
+      </array>
+    </dict>
+  </array>
+
+  <!-- Files it opens from Finder's Open With menu and dropped on its icon. -->
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeName</key><string>Web page</string>
+      <key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>LSHandlerRank</key><string>Alternate</string>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>public.html</string>
+        <string>public.xhtml</string>
+        <string>com.apple.webarchive</string>
+      </array>
+    </dict>
+    <dict>
+      <key>CFBundleTypeName</key><string>PDF document</string>
+      <key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>LSHandlerRank</key><string>Alternate</string>
+      <key>LSItemContentTypes</key>
+      <array><string>com.adobe.pdf</string></array>
+    </dict>
+    <dict>
+      <key>CFBundleTypeName</key><string>Image</string>
+      <key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>LSHandlerRank</key><string>Alternate</string>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>public.svg-image</string>
+        <string>public.png</string>
+        <string>public.jpeg</string>
+        <string>com.compuserve.gif</string>
+        <string>org.webmproject.webp</string>
+      </array>
+    </dict>
+    <dict>
+      <key>CFBundleTypeName</key><string>Text</string>
+      <key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>LSHandlerRank</key><string>Alternate</string>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>public.plain-text</string>
+        <string>public.json</string>
+        <string>public.xml</string>
+      </array>
+    </dict>
+  </array>
+
+  <!-- Sites asking for these go through WebKit's per-site prompt. -->
+  <key>NSCameraUsageDescription</key>
+  <string>Websites you allow can use the camera, for video calls and the like.</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Websites you allow can use the microphone, for calls and recordings.</string>
+  <key>NSLocationUsageDescription</key>
+  <string>Websites you allow can see your approximate location.</string>
+</dict></plist>

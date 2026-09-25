@@ -1,0 +1,114 @@
+[package]
+name = "vamprowser"
+version = "0.4.0"
+edition = "2024"
+rust-version = "1.89"
+description = "A macOS browser with Vampir controls and WebKit"
+license = "MIT"
+
+[dependencies]
+vampir = { version = "0.1.5", default-features = false, features = ["app-icon"] }
+gpui = { package = "gpui-ce", version = "0.2.2", default-features = false }
+gpui_ce_platform = { version = "0.1.0", features = ["font-kit", "runtime_shaders"] }
+wry = { version = "0.57", default-features = false, features = ["devtools"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+url = "2"
+plist = "1"
+unicode-segmentation = "1"
+lyon_tessellation = "1"
+async-channel = "2"
+block2 = "0.6"
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = [
+    "NSEvent",
+    "block2",
+    "NSMenu",
+    "NSMenuItem",
+    "NSApplication",
+    "NSWindow",
+    "NSView",
+    "NSResponder",
+    "NSAlert",
+    "NSTextField",
+    "NSControl",
+    "NSImage",
+    "NSImageRep",
+    "NSBitmapImageRep",
+    "NSCell",
+    "NSGraphics",
+    "NSGraphicsContext",
+    "NSOpenPanel",
+    "NSSavePanel",
+    "NSPanel",
+    "NSBox",
+    "NSColor",
+    "NSFont",
+    "NSWorkspace",
+    "objc2-core-graphics",
+] }
+objc2-foundation = { version = "0.3", features = [
+    "NSArray",
+    "NSBundle",
+    "NSCalendar",
+    "NSData",
+    "NSDate",
+    "NSDateFormatter",
+    "NSDictionary",
+    "NSEnumerator",
+    "NSError",
+    "NSFormatter",
+    "NSGeometry",
+    "NSObject",
+    "NSSet",
+    "NSString",
+    "NSURL",
+    "NSURLRequest",
+    "NSUUID",
+    "NSTimer",
+    "NSNotification",
+    "NSOperation",
+    "NSUserActivity",
+    "NSURLResponse",
+    "NSURLAuthenticationChallenge",
+    "NSURLProtectionSpace",
+    "NSURLCredential",
+] }
+objc2-web-kit = { version = "0.3", features = [
+    "block2",
+    "objc2-app-kit",
+    "WKWebView",
+    "WKWebViewConfiguration",
+    "WKUserContentController",
+    "WKContentRuleList",
+    "WKContentRuleListStore",
+    "WKSnapshotConfiguration",
+    "WKFindConfiguration",
+    "WKFindResult",
+    "WKWebsiteDataStore",
+    "WKWebsiteDataRecord",
+    "WKNavigation",
+    "WKNavigationResponse",
+    "WKNavigationDelegate",
+    "WKUIDelegate",
+    "objc2-core-foundation",
+    "WKWebExtension",
+    "WKWebExtensionAction",
+    "WKWebExtensionContext",
+    "WKWebExtensionController",
+    "WKWebExtensionControllerConfiguration",
+    "WKWebExtensionControllerDelegate",
+    "WKWebExtensionMatchPattern",
+    "WKWebExtensionPermission",
+    "WKWebExtensionTab",
+    "WKWebExtensionTabConfiguration",
+    "WKWebExtensionWindow",
+    "WKWebExtensionWindowConfiguration",
+] }
+zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
+ureq = "3"
+image = { version = "0.25", default-features = false, features = ["png", "ico", "jpeg", "gif", "webp", "bmp"] }
+resvg = { version = "0.48", default-features = false }
+
+[profile.release]
+lto = "thin"

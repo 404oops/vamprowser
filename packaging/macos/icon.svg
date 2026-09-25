@@ -1,0 +1,74 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0.35" y2="1">
+      <stop offset="0" stop-color="#3A1F66"/>
+      <stop offset="0.55" stop-color="#5E1848"/>
+      <stop offset="1" stop-color="#8E1230"/>
+    </linearGradient>
+    <radialGradient id="moon" cx="0.38" cy="0.32" r="0.8">
+      <stop offset="0" stop-color="#FFF8E6"/>
+      <stop offset="0.6" stop-color="#FBE2B0"/>
+      <stop offset="1" stop-color="#EDB978"/>
+    </radialGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0.55" stop-color="#FFD9A0" stop-opacity="0.45"/>
+      <stop offset="1" stop-color="#FFD9A0" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="rim" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.35"/>
+      <stop offset="0.12" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+    <clipPath id="tile">
+      <rect x="100" y="100" width="824" height="824" rx="186"/>
+    </clipPath>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="12" stdDeviation="14" flood-color="#000" flood-opacity="0.35"/>
+    </filter>
+  </defs>
+
+  <!-- Tile -->
+  <rect x="100" y="100" width="824" height="824" rx="186" fill="url(#sky)" filter="url(#shadow)"/>
+  <g clip-path="url(#tile)">
+    <!-- Stars -->
+    <g fill="#FFFFFF">
+      <circle cx="232" cy="258" r="7" opacity="0.9"/>
+      <circle cx="318" cy="190" r="4" opacity="0.7"/>
+      <circle cx="790" cy="236" r="6" opacity="0.85"/>
+      <circle cx="846" cy="342" r="4" opacity="0.6"/>
+      <circle cx="196" cy="420" r="4" opacity="0.6"/>
+      <circle cx="724" cy="168" r="3.5" opacity="0.6"/>
+    </g>
+    <!-- Moon and its halo -->
+    <circle cx="512" cy="470" r="330" fill="url(#glow)"/>
+    <circle cx="512" cy="470" r="244" fill="url(#moon)"/>
+    <g fill="#E9B97C" opacity="0.35">
+      <circle cx="600" cy="400" r="34"/>
+      <circle cx="430" cy="560" r="22"/>
+      <circle cx="560" cy="600" r="16"/>
+    </g>
+    <!-- Bat, symmetric about x = 512 -->
+    <path fill="#1C0E2E" d="
+      M 512 468
+      Q 522 470 530 466 L 546 420 L 556 474
+      Q 572 480 584 494
+      Q 700 410 846 452
+      Q 800 488 790 548
+      Q 754 520 708 540
+      Q 680 560 690 606
+      Q 640 580 598 604
+      Q 572 620 560 656
+      Q 536 650 512 700
+      Q 488 650 464 656
+      Q 452 620 426 604
+      Q 384 580 334 606
+      Q 344 560 316 540
+      Q 270 520 234 548
+      Q 224 488 178 452
+      Q 324 410 440 494
+      Q 452 480 468 474
+      L 478 420 L 494 466
+      Q 502 470 512 468 Z"/>
+    <!-- Top-edge light -->
+    <rect x="100" y="100" width="824" height="824" rx="186" fill="url(#rim)"/>
+  </g>
+</svg>
