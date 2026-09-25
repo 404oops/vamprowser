@@ -87,6 +87,15 @@ use wry::{
     WebViewBuilder, WebViewBuilderExtMacos, WebViewExtMacOS, dpi,
 };
 
+/// Wry's `url()` unwraps WKWebView.URL(), which is nil before the first
+/// navigation commits. Read the optional WebKit property directly instead.
+fn webview_url(view: &WebView) -> Option<String> {
+    // SAFETY: a plain property read on a live web view, on the main thread.
+    unsafe { view.webview().URL() }
+        .and_then(|url| url.absoluteString())
+        .map(|url| url.to_string())
+}
+
 #[derive(Debug)]
 enum BrowserEvent {
     Address(String),
@@ -118,6 +127,8 @@ enum BrowserEvent {
     /// uBlock Origin's rules, from the build numbered here: WebKit rule
     /// lists, their fingerprints, and how many rules they hold.
     UblockRules(u64, Vec<String>, Vec<String>, usize),
+    /// The first page waited long enough for WebKit's content rules.
+    RulesTimedOut,
     /// A click landed in a page.
     PageClicked,
     /// A page began loading.
@@ -1263,8 +1274,12 @@ struct Common {
     bookmarks: RefCell<Bookmarks>,
     favicons: RefCell<Favicons>,
     rules: RefCell<ContentRules>,
-    /// `None` where WebKit has no extension support (before macOS 15.4).
+    /// `None` until a web page or extension settings need the controller, or
+    /// where WebKit has no extension support (before macOS 15.4).
     extensions: RefCell<Option<Extensions>>,
+    extension_events: Sender<ExtensionEvent>,
+    store_ready: Cell<bool>,
+    rules_started: Cell<bool>,
     /// Every open window's browser, oldest first.
     windows: RefCell<Vec<gpui::WeakEntity<Browser>>>,
     /// Each tab's route for its page's events, by tab id.
@@ -1320,32 +1335,19 @@ impl Common {
     fn new(extension_events: Sender<ExtensionEvent>, anywhere: Sender<BrowserEvent>) -> Rc<Self> {
         let saved = SavedState::load();
         let closed_windows = saved.closed_windows.clone();
-        // Old devices found in earlier runs, before anything uses the shared
-        // store: WebKit takes its proxies then, not later.
+        // Read the old hosts now; configure WebKit's store when a page first
+        // needs it, before WebKit can fix its proxy configuration.
         legacy_http::load_saved();
-        if let Some(mtm) = objc2::MainThreadMarker::new() {
-            // SAFETY: the shared store, on the main thread.
-            let store = unsafe { objc2_web_kit::WKWebsiteDataStore::defaultDataStore(mtm) };
-            legacy_http::route(&store);
-        }
-        // Before any tab exists: every tab's web view is made from the
-        // extension controller's configuration.
-        let extensions = Extensions::supported().then(|| {
-            let background = extension_events.clone();
-            Extensions::new(
-                move |event| {
-                    let _ = extension_events.try_send(event);
-                },
-                background,
-            )
-        });
         Rc::new(Self {
             history: RefCell::new(History::load()),
             downloads: RefCell::new(Downloads::load()),
             bookmarks: RefCell::new(Bookmarks::new(saved.bookmarks.clone())),
             favicons: RefCell::new(Favicons::new()),
             rules: RefCell::new(ContentRules::default()),
-            extensions: RefCell::new(extensions),
+            extensions: RefCell::new(None),
+            extension_events,
+            store_ready: Cell::new(false),
+            rules_started: Cell::new(false),
             windows: RefCell::new(Vec::new()),
             routes: RefCell::new(HashMap::new()),
             sessions: RefCell::new(Vec::new()),
@@ -1365,6 +1367,61 @@ impl Common {
             ublock_build: Cell::new(0),
             next_window: Cell::new(1),
         })
+    }
+
+    fn ensure_store(&self) {
+        let Some(mtm) = objc2::MainThreadMarker::new() else {
+            return;
+        };
+        if self.store_ready.replace(true) {
+            return;
+        }
+        // SAFETY: the shared store, before its first use, on the main thread.
+        let store = unsafe { objc2_web_kit::WKWebsiteDataStore::defaultDataStore(mtm) };
+        legacy_http::route(&store);
+    }
+
+    fn ensure_extensions(&self) {
+        if self.extensions.borrow().is_some() || !Extensions::supported() {
+            return;
+        }
+        self.ensure_store();
+        let events = self.extension_events.clone();
+        let background = events.clone();
+        *self.extensions.borrow_mut() = Some(Extensions::new(
+            move |event| { let _ = events.try_send(event); },
+            background,
+        ));
+        if self.rules_started.get() {
+            self.restore_ublock();
+        }
+    }
+
+    fn restore_ublock(&self) {
+        if !self.extensions.borrow().as_ref().is_some_and(|e| e.is_enabled(filters::UBLOCK_ID)) {
+            return;
+        }
+        let sender = self.anywhere.clone();
+        self.rules.borrow_mut().restore_ublock(filters::enforced(), move || {
+            let _ = sender.try_send(BrowserEvent::Command(Command::ApplyRules));
+        });
+    }
+
+    fn ensure_rules(&self, settings: &Settings) {
+        if self.rules_started.replace(true) {
+            return;
+        }
+        self.ensure_store();
+        self.restore_ublock();
+        let sender = self.anywhere.clone();
+        self.rules.borrow_mut().update(settings, move || {
+            let _ = sender.try_send(BrowserEvent::Command(Command::ApplyRules));
+        });
+        let sender = self.anywhere.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1500));
+            let _ = sender.try_send(BrowserEvent::RulesTimedOut);
+        });
     }
 
     /// Writes the state file with every ordinary window's tabs.
@@ -2069,32 +2126,8 @@ impl Browser {
             this.reset_address(cx);
             cx.notify();
         }));
-        // The content rules are shared: compiled once, for the first window.
-        // Pages wait for them (and uBlock Origin's from last time) before
-        // loading, so the first isn't loaded unfiltered; not for long.
-        if first_window {
-            let ublock_on = browser
-                .common
-                .extensions
-                .borrow()
-                .as_ref()
-                .is_some_and(|e| e.is_enabled(filters::UBLOCK_ID));
-            if ublock_on {
-                let sender = browser.common.anywhere.clone();
-                browser.rules().restore_ublock(filters::enforced(), move || {
-                    let _ = sender.try_send(BrowserEvent::Command(Command::ApplyRules));
-                });
-            }
-            browser.update_rules();
-            cx.spawn(async move |this, cx| {
-                cx.background_executor().timer(Duration::from_millis(1500)).await;
-                let _ = this.update(cx, |browser, _| {
-                    browser.rules().give_up_waiting();
-                    browser.release_waiting_loads();
-                });
-            })
-            .detach();
-        }
+        // The first web tab starts WebKit and its shared rules. Native pages
+        // can open without a WebKit process or extension backgrounds.
         // What the settings say to start with applies at launch; a window
         // reopened, or opened for links, has exactly its tabs.
         let startup = if launch { browser.settings.startup } else { Startup::Restore };
@@ -2195,6 +2228,10 @@ impl Browser {
         window: &Window,
     ) -> Result<Rc<WebView>, wry::Error> {
         let settings = &self.settings;
+        if !private {
+            self.common.ensure_extensions();
+        }
+        self.common.ensure_rules(settings);
         // The page's events go to whichever window holds the tab, which
         // changes when it's dragged to another.
         let route = self.route(id);
@@ -2885,6 +2922,9 @@ impl Browser {
     /// Recompiles the content rules after a privacy setting changes, then
     /// applies them to every tab.
     fn update_rules(&mut self) {
+        if !self.common.rules_started.get() {
+            return;
+        }
         let sender = self.common.anywhere.clone();
         self.rules().update(&self.settings, move || {
             let _ = sender.try_send(BrowserEvent::Command(Command::ApplyRules));
@@ -3451,7 +3491,7 @@ impl Browser {
                 BrowserEvent::UrlChanged(id) => {
                     if let Some(index) = self.web_index_of(id)
                         && let Some(view) = &self.tabs[index].view
-                        && let Ok(url) = view.url()
+                        && let Some(url) = webview_url(view)
                         && !url.is_empty()
                         && self.tabs[index].url != url
                     {
@@ -3548,6 +3588,10 @@ impl Browser {
                 }
                 BrowserEvent::Snapshot(tab, jpeg) => self.palette_snapshot(tab, jpeg, cx),
                 BrowserEvent::Extension(event) => self.extension_event(event, window, cx),
+                BrowserEvent::RulesTimedOut => {
+                    self.rules().give_up_waiting();
+                    self.release_waiting_loads();
+                }
                 BrowserEvent::SaveField(field) => self.save_field(field, window, cx),
                 BrowserEvent::LoadStarted(id) => {
                     if let Some(index) = self.web_index_of(id) {
@@ -3780,7 +3824,7 @@ impl Browser {
                         if tab.page == Page::Web {
                             tab.view
                                 .as_ref()
-                                .and_then(|view| view.url().ok())
+                                .and_then(|view| webview_url(view))
                                 .filter(|url| {
                                     !url.is_empty()
                                         && (url != "about:blank" || tab.url == "about:blank")
@@ -3872,6 +3916,7 @@ impl Browser {
     /// Removes every cookie, cache and bit of site storage from the shared
     /// store, whichever tabs are open, and the profile's copy of the jar.
     fn clear_website_data(&mut self, cx: &mut Context<Self>) {
+        self.common.ensure_store();
         let Some(mtm) = objc2::MainThreadMarker::new() else {
             return;
         };
@@ -6428,17 +6473,27 @@ fn main() {
             let mut wait = Duration::from_secs(90);
             loop {
                 cx.background_executor().timer(wait).await;
-                wait = Duration::from_secs(60 * 60);
                 let common = updating.clone();
                 cx.update(|cx| {
                     if let Some(browser) = common.browsers().first() {
                         browser.update(cx, |browser, cx| {
-                            if browser.settings.auto_update_extensions && updates::due() {
+                            if common.extensions.borrow().is_some()
+                                && browser.settings.auto_update_extensions
+                                && updates::due()
+                            {
                                 browser.check_extension_updates(false, cx);
                             }
                         });
                     }
                 });
+                // A Start Page session has no extension controller yet.
+                // Check soon after a web tab starts it, without waking
+                // WebKit just to check for updates.
+                wait = if updating.extensions.borrow().is_some() {
+                    Duration::from_secs(60 * 60)
+                } else {
+                    Duration::from_secs(5 * 60)
+                };
             }
         })
         .detach();

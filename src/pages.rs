@@ -386,6 +386,7 @@ impl Browser {
     /// name. Downloading, unpacking and patching happen off the main
     /// thread and come back as an `ExtensionPrepared` event.
     pub(crate) fn install_extension(&mut self, source: String, cx: &mut Context<Self>) {
+        self.common.ensure_extensions();
         if self.common.extensions.borrow().is_none() {
             self.notice = Some("Extensions need macOS 15.4 or later.".into());
             cx.notify();
@@ -1761,6 +1762,7 @@ impl Browser {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        self.common.ensure_extensions();
         let field = self.field(Field::ExtensionSource, palette, window, cx);
         let auto_update = self.toggle(
             "auto-update-extensions",
