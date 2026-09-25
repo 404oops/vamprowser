@@ -14,7 +14,7 @@ use gpui::{
 use vampir::{ButtonVariant, Palette, TextInput, WidgetContext, color, lighting};
 
 use crate::{
-    Browser, Chrome, Page, SettingsInputs,
+    Browser, Chrome, Page, SettingsInputs, WithHint,
     commands::{Command, Place, Section},
     downloads::DownloadState,
     history::Visit,
@@ -22,8 +22,8 @@ use crate::{
     interop,
     native::{self, MenuEntry},
     settings::{
-        self, NewTabPage, PopupPolicy, Protection, SchemeChoice, Settings, SitePermission, Startup,
-        TabPlacement, TintMode, ToolbarItem, UserAgent,
+        self, NewTabPage, PopupPolicy, Protection, SchemeChoice, Settings, SitePermission,
+        StartSection, Startup, TabPlacement, TintMode, ToolbarItem, UserAgent,
     },
     site_icon, site_name,
     state::now_secs,
@@ -458,9 +458,11 @@ impl Browser {
             _ => "Hello, night owl",
         };
         let private = self.current().private;
+        let sections = self.settings.start_page_sections.clone();
         let mut column = div()
             .w_full()
             .max_w(px(880.0))
+            .flex_none()
             .flex()
             .flex_col()
             .gap(px(34.0))
@@ -470,22 +472,59 @@ impl Browser {
             .child(
                 div()
                     .flex()
-                    .flex_col()
-                    .gap(px(6.0))
+                    .items_start()
+                    .gap(px(16.0))
                     .child(
                         div()
-                            .text_size(px(30.0))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(if private { "Private browsing" } else { greeting }),
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .flex()
+                            .flex_col()
+                            .gap(px(6.0))
+                            .child(
+                                div()
+                                    .text_size(px(30.0))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(if private { "Private browsing" } else { greeting }),
+                            )
+                            .child(
+                                div()
+                                    .text_color(palette.text_secondary)
+                                    .child(if private {
+                                        "Nothing from this tab is saved: no history, cookies or cache, and it won't come back after quitting.".into()
+                                    } else {
+                                        long_date()
+                                    }),
+                            ),
                     )
                     .child(
                         div()
+                            .id("start-customize")
+                            .size(px(32.0))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(8.0))
+                            .cursor_pointer()
+                            .text_size(px(20.0))
                             .text_color(palette.text_secondary)
-                            .child(if private {
-                                "Nothing from this tab is saved: no history, cookies or cache, and it won't come back after quitting.".into()
-                            } else {
-                                long_date()
-                            }),
+                            .hover(move |s| s.bg(chrome.wash))
+                            .on_click(cx.listener(|this, event: &gpui::ClickEvent, window, cx| {
+                                let items = StartSection::ALL
+                                    .into_iter()
+                                    .map(|section| (
+                                        MenuEntry::checked(
+                                            section.label(),
+                                            this.settings.start_page_sections.shown(section),
+                                        ),
+                                        Some(Command::ToggleStartSection(section)),
+                                    ))
+                                    .collect();
+                                this.context_menu(event.position(), items, window, cx);
+                            }))
+                            .child("•••")
+                            .with_hint("Customize start page".into(), crate::hint::Side::Below, cx),
                     ),
             );
         let tile = |id: (&'static str, usize),
@@ -539,7 +578,7 @@ impl Browser {
             // bookmark manager.
             let favorites: Vec<&crate::bookmarks::Node> =
                 bookmarks.root().iter().filter(|node| !node.is_folder()).take(16).collect();
-            if !favorites.is_empty() {
+            if sections.favorites && !favorites.is_empty() {
                 let mut grid = div().flex().flex_wrap().gap(px(18.0));
                 for bookmark in &favorites {
                     let id = bookmark.id;
@@ -557,12 +596,16 @@ impl Browser {
                 }
                 column = column.child(section("Favorites", 14.0, palette).child(grid));
             }
-            !favorites.is_empty()
+            sections.favorites && !favorites.is_empty()
         };
         let mut has_frequent = false;
         if !private {
             let history = self.history();
-            let frequent = history.frequent(8);
+            let frequent = if sections.frequent {
+                history.frequent(8)
+            } else {
+                Vec::new()
+            };
             has_frequent = !frequent.is_empty();
             if has_frequent {
                 let mut grid = div().flex().flex_wrap().gap(px(18.0));
@@ -586,7 +629,7 @@ impl Browser {
                 column = column.child(section("Frequently visited", 14.0, palette).child(grid));
             }
             let recent = history.recent(8);
-            if !recent.is_empty() {
+            if sections.recent && !recent.is_empty() {
                 let mut list = card(palette).py(px(4.0));
                 for (index, visit) in recent.iter().enumerate() {
                     list = list.child(self.history_row(
@@ -609,7 +652,7 @@ impl Browser {
             .map(|c| c.url.clone())
             .take(5)
             .collect();
-        if !closed.is_empty() {
+        if sections.closed && !closed.is_empty() {
             let mut list = card(palette).py(px(4.0));
             for (index, url) in closed.iter().enumerate() {
                 list = list.child(self.history_row(
@@ -645,7 +688,7 @@ impl Browser {
                     .child(list),
             );
         }
-        if !has_bookmarks && !has_frequent && !private {
+        if !has_bookmarks && !has_frequent && !private && sections.favorites && sections.frequent {
             column = column.child(
                 div()
                     .text_color(palette.text_secondary)

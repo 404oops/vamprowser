@@ -52,6 +52,69 @@ pub enum NewTabPage {
     Blank,
 }
 
+/// Sections shown on the start page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StartSection {
+    Favorites,
+    Frequent,
+    Recent,
+    Closed,
+}
+
+impl StartSection {
+    pub const ALL: [Self; 4] = [Self::Favorites, Self::Frequent, Self::Recent, Self::Closed];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Favorites => "Favorites",
+            Self::Frequent => "Frequently visited",
+            Self::Recent => "Recently visited",
+            Self::Closed => "Recently closed",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StartPageSections {
+    pub favorites: bool,
+    pub frequent: bool,
+    pub recent: bool,
+    pub closed: bool,
+}
+
+impl Default for StartPageSections {
+    fn default() -> Self {
+        Self {
+            favorites: true,
+            frequent: true,
+            recent: true,
+            closed: true,
+        }
+    }
+}
+
+impl StartPageSections {
+    pub fn shown(&self, section: StartSection) -> bool {
+        match section {
+            StartSection::Favorites => self.favorites,
+            StartSection::Frequent => self.frequent,
+            StartSection::Recent => self.recent,
+            StartSection::Closed => self.closed,
+        }
+    }
+
+    pub fn toggle(&mut self, section: StartSection) {
+        let shown = match section {
+            StartSection::Favorites => &mut self.favorites,
+            StartSection::Frequent => &mut self.frequent,
+            StartSection::Recent => &mut self.recent,
+            StartSection::Closed => &mut self.closed,
+        };
+        *shown = !*shown;
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TabPlacement {
@@ -274,6 +337,7 @@ pub struct Settings {
     pub legacy_startup: Option<Startup>,
     pub home_page: String,
     pub new_tab_page: NewTabPage,
+    pub start_page_sections: StartPageSections,
     pub tab_placement: TabPlacement,
     /// Minutes a background tab can go unused before its page is unloaded
     /// to save memory (it reloads when shown); 0 keeps every page loaded.
@@ -328,6 +392,7 @@ impl Default for Settings {
             legacy_startup: None,
             home_page: HOME.into(),
             new_tab_page: NewTabPage::StartPage,
+            start_page_sections: StartPageSections::default(),
             tab_placement: TabPlacement::End,
             sleep_tabs_after: 60,
             popups: PopupPolicy::NewTab,
@@ -975,5 +1040,18 @@ mod tests {
         let settings: Settings = serde_json::from_str(r#"{"https_only":true}"#).unwrap();
         assert!(settings.https_only);
         assert_eq!(settings.search_engine, "duckduckgo");
+        assert!(StartSection::ALL
+            .into_iter()
+            .all(|section| settings.start_page_sections.shown(section)));
+    }
+
+    #[test]
+    fn start_page_sections_round_trip() {
+        let mut settings = Settings::default();
+        settings.start_page_sections.toggle(StartSection::Recent);
+        let restored: Settings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert!(!restored.start_page_sections.shown(StartSection::Recent));
+        assert!(restored.start_page_sections.shown(StartSection::Frequent));
     }
 }

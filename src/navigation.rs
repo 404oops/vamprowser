@@ -276,6 +276,23 @@ pub fn forget_private_auth(scope: u64) {
     AUTH_SESSION.with(|session| session.borrow_mut().retain(|space, _| space.scope != scope));
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum AuthAction {
+    ValidateServerTrust,
+    BrowserLogin,
+    Cancel,
+}
+
+fn auth_action(method: &str, proxy: bool) -> AuthAction {
+    if method == "NSURLAuthenticationMethodServerTrust" {
+        AuthAction::ValidateServerTrust
+    } else if !proxy && matches!(method, "NSURLAuthenticationMethodHTTPBasic" | "NSURLAuthenticationMethodHTTPDigest") {
+        AuthAction::BrowserLogin
+    } else {
+        AuthAction::Cancel
+    }
+}
+
 unsafe extern "C-unwind" fn did_receive_auth(
     _this: &AnyObject, _cmd: Sel, webview: &WKWebView,
     challenge: &NSURLAuthenticationChallenge,
@@ -283,9 +300,19 @@ unsafe extern "C-unwind" fn did_receive_auth(
 ) {
     let space = challenge.protectionSpace();
     let method = space.authenticationMethod().to_string();
-    if space.isProxy() || (method != "NSURLAuthenticationMethodHTTPBasic" && method != "NSURLAuthenticationMethodHTTPDigest") {
-        handler.call((1, std::ptr::null_mut()));
-        return;
+    match auth_action(&method, space.isProxy()) {
+        AuthAction::ValidateServerTrust => {
+            // Let WebKit validate the TLS server certificate normally.
+            handler.call((1, std::ptr::null_mut()));
+            return;
+        }
+        AuthAction::Cancel => {
+            // Client certificates, proxy credentials, and other methods may
+            // consult Keychain under WebKit's default handling.
+            handler.call((2, std::ptr::null_mut()));
+            return;
+        }
+        AuthAction::BrowserLogin => {}
     }
     let key = webview as *const WKWebView as usize;
     let scope = AUTH_HANDLERS.with(|handlers| handlers.borrow().get(&key).map(|entry| entry.scope));
@@ -506,6 +533,16 @@ pub fn install() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_server_trust_uses_webkit_default_auth_handling() {
+        assert_eq!(auth_action("NSURLAuthenticationMethodServerTrust", false), AuthAction::ValidateServerTrust);
+        assert_eq!(auth_action("NSURLAuthenticationMethodHTTPBasic", false), AuthAction::BrowserLogin);
+        assert_eq!(auth_action("NSURLAuthenticationMethodHTTPDigest", false), AuthAction::BrowserLogin);
+        assert_eq!(auth_action("NSURLAuthenticationMethodHTTPBasic", true), AuthAction::Cancel);
+        assert_eq!(auth_action("NSURLAuthenticationMethodClientCertificate", false), AuthAction::Cancel);
+        assert_eq!(auth_action("NSURLAuthenticationMethodNTLM", false), AuthAction::Cancel);
+    }
 
     #[test]
     fn http_credentials_stay_in_their_protection_space_and_expire_on_failure() {

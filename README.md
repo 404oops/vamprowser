@@ -29,6 +29,7 @@ A macOS browser built in Rust: Apple's WebKit (through Wry's `WKWebView`) for pa
   - history, downloads, a customisable toolbar, extensions and more.
 - **Extensions**: Firefox add-ons from addons.mozilla.org (by link or name), or a `.xpi`, `.zip` or unpacked folder, run by WebKit's WebExtension support (macOS 15.4+).
   - HTTP Basic and Digest sign-ins open a browser form with standard fields for password managers such as Proton Pass. Credentials are reused for the current app session and are never saved to Keychain; private windows keep separate credentials until they close.
+  - The app does not enable Apple's browser passkeys. Client certificate and proxy authentication are disabled rather than handed to Keychain.
   - A compatibility layer papers over where WebKit differs from Firefox.
   - Add-ons update themselves from addons.mozilla.org daily.
   - uBlock Origin's filter lists are compiled into WebKit content rules, since WebKit won't let extensions block requests. They follow what you set in uBlock Origin — its filter lists (including lists imported by address), your own filters, your dynamic rules, per-site switches (no pop-ups, no scripting, no remote fonts) and trusted sites — within seconds of a change, and refresh on their own.

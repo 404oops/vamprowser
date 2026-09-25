@@ -6,7 +6,7 @@
 //! key, or switching to another app closes it; that click does nothing
 //! else.
 
-use std::{cell::Cell, cell::RefCell, ptr::NonNull, rc::Rc};
+use std::{cell::Cell, cell::RefCell, ptr::NonNull, rc::Rc, sync::OnceLock};
 
 use async_channel::{Receiver, Sender};
 use block2::RcBlock;
@@ -14,8 +14,11 @@ use gpui::{
     App, Bounds, Context, Point, Render, Task, Window, WindowBounds, WindowKind, WindowOptions,
     div, prelude::*, px, size,
 };
-use objc2::{rc::Retained, runtime::{AnyObject, ProtocolObject}};
-use objc2_app_kit::{NSApplication, NSEvent, NSEventMask, NSEventType, NSWindow};
+use objc2::{
+    rc::Retained,
+    runtime::{AnyClass, AnyObject, Bool, ClassBuilder, ProtocolObject, Sel},
+};
+use objc2_app_kit::{NSEvent, NSEventMask, NSEventType};
 use objc2_foundation::{NSNotificationCenter, NSObjectProtocol};
 use vampir::{ControlHost, ControlState, Palette, ui_font};
 
@@ -64,8 +67,6 @@ struct Menu {
     depth: Rc<Cell<usize>>,
     answer: Sender<Option<usize>>,
     ns_window: usize,
-    /// The browser window it's for, which keeps the keyboard.
-    parent: Option<Retained<NSWindow>>,
     watch: Option<Watch>,
     done: bool,
     _dismiss: Option<Task<()>>,
@@ -98,6 +99,36 @@ fn height_of(entries: &[MenuEntry], nested: bool) -> f32 {
         .sum();
     let back = if nested { ROW_HEIGHT } else { 0.0 };
     (rows + back + 2.0 * PADDING).min(MAX_HEIGHT)
+}
+
+/// GPUI's panel class allows itself to become key and main on a mouse press.
+/// A menu has no text input; taking either role blurs the browser's WebView
+/// or address field, even when the panel gives the keyboard back on close.
+fn keep_browser_focused(panel: &objc2_app_kit::NSPanel) {
+    static CLASS: OnceLock<&'static AnyClass> = OnceLock::new();
+    extern "C" fn no(_this: &AnyObject, _cmd: Sel) -> Bool {
+        Bool::NO
+    }
+    let class = CLASS.get_or_init(|| {
+        let mut builder = ClassBuilder::new(c"VamprowserMenuPanel", panel.class())
+            .expect("menu panel class is registered only once");
+        // SAFETY: Both inherited selectors return Objective-C BOOL and the
+        // subclass adds no ivars, so an existing GPUI panel can use it.
+        unsafe {
+            builder.add_method(
+                objc2::sel!(canBecomeKeyWindow),
+                no as extern "C" fn(_, _) -> _,
+            );
+            builder.add_method(
+                objc2::sel!(canBecomeMainWindow),
+                no as extern "C" fn(_, _) -> _,
+            );
+        }
+        builder.register()
+    });
+    // SAFETY: This is a subclass of the panel's original class with the
+    // same instance layout. Only this menu's panel changes class.
+    unsafe { AnyObject::set_class(panel, class) };
 }
 
 /// Takes the menu window off the screen at once, before GPUI gets round to
@@ -208,15 +239,6 @@ impl Menu {
             }
         });
         hide(ns_window);
-        // A press on the menu can give it the keyboard; the window it's for
-        // takes it back.
-        if let (Some(parent), Some(mtm)) = (&self.parent, objc2::MainThreadMarker::new())
-            && NSApplication::sharedApplication(mtm).isActive()
-            && parent.isVisible()
-            && !parent.isKeyWindow()
-        {
-            parent.makeKeyWindow();
-        }
         window.remove_window();
     }
 
@@ -402,10 +424,6 @@ pub(crate) fn open(
 ) -> Receiver<Option<usize>> {
     // One menu at a time.
     dismiss_open();
-    let (parent, _) = crate::ns_window_of(window);
-    // SAFETY: the browser's live window; retained, so the menu can hand it
-    // the keyboard back even if it closes meanwhile.
-    let parent = unsafe { Retained::retain(parent as *mut NSWindow) };
     let (sender, receiver) = async_channel::bounded(1);
     let height = height_of(&entries, false);
     let mut origin = window.bounds().origin + position;
@@ -437,11 +455,9 @@ pub(crate) fn open(
     let _ = cx.open_window(options, move |window, cx| {
         let (ns_window, _) = crate::ns_window_of(window);
         if ns_window != 0 {
-            // A press on it doesn't give it the keyboard either: keys go on
-            // to the window it's for.
             // SAFETY: GPUI makes pop-ups as NSPanels; the window is live.
             let panel = unsafe { &*(ns_window as *const objc2_app_kit::NSPanel) };
-            panel.setBecomesKeyOnlyIfNeeded(true);
+            keep_browser_focused(panel);
         }
         let (dismiss, signals) = async_channel::unbounded();
         let dismissed = Rc::new(Cell::new(false));
@@ -461,7 +477,6 @@ pub(crate) fn open(
             depth,
             answer: sender,
             ns_window,
-            parent,
             watch: Some(watch),
             done: false,
             _dismiss: None,

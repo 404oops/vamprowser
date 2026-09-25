@@ -7,7 +7,7 @@ use gpui::{ClipboardItem, Context, Pixels, Point, Window};
 use crate::{
     Browser, Page, PingTarget, TabTarget,
     native::MenuEntry,
-    settings::ToolbarItem,
+    settings::{StartSection, ToolbarItem},
 };
 
 /// A settings section, for opening settings where something lives.
@@ -131,6 +131,7 @@ pub enum Command {
     BookmarkPage,
     BookmarkTab(u64),
     ToggleBookmarksBar,
+    ToggleStartSection(StartSection),
     ToggleVerticalTabs,
     ToggleMinimalMode,
     ToggleReaderMode,
@@ -444,6 +445,10 @@ impl Browser {
         }
         match command {
             Command::NewTab => self.new_tab(false, window, cx),
+            Command::ToggleStartSection(section) => {
+                self.settings.start_page_sections.toggle(section);
+                self.save_settings(cx);
+            }
             Command::NewWindow => self.open_window(false, cx),
             Command::NewPrivateWindow => self.open_window(true, cx),
             Command::CloseWindow => window.remove_window(),

@@ -18,13 +18,10 @@ cp "target/$mode/vamprowser" "$app/Contents/MacOS/vamprowser"
 cp packaging/macos/Info.plist "$app/Contents/Info.plist"
 cp packaging/macos/AppIcon.icns "$app/Contents/Resources/AppIcon.icns"
 
-# Passkeys (WebAuthn) need Apple's web-browser credential entitlement, which
-# only a Developer ID build with a provisioning profile granting it can carry;
-# WebKit withholds passkeys and security keys from the page otherwise. Set
+# A Developer ID build can be signed with a provisioning profile. Set
 #   VAMPROWSER_SIGN_IDENTITY="Developer ID Application: … (TEAMID)"
 #   VAMPROWSER_PROFILE=path/to/Vamprowser.provisionprofile
-# to sign that way. Without them the bundle is ad-hoc signed, with no
-# entitlements: an ad-hoc app claiming a restricted one wouldn't launch.
+# to sign that way. Without them the bundle is ad-hoc signed.
 if [[ -n "${VAMPROWSER_SIGN_IDENTITY:-}" && -n "${VAMPROWSER_PROFILE:-}" ]]; then
   cp "$VAMPROWSER_PROFILE" "$app/Contents/embedded.provisionprofile"
   profile_plist=$(mktemp)
@@ -37,9 +34,6 @@ if [[ -n "${VAMPROWSER_SIGN_IDENTITY:-}" && -n "${VAMPROWSER_PROFILE:-}" ]]; the
     value=$(/usr/libexec/PlistBuddy -c "Print :Entitlements:$key" "$profile_plist")
     /usr/libexec/PlistBuddy -c "Add :$key string $value" "$entitlements"
   done
-  if ! /usr/libexec/PlistBuddy -c "Print :Entitlements:com.apple.developer.web-browser.public-key-credential" "$profile_plist" >/dev/null 2>&1; then
-    print -u2 "warning: the profile doesn't grant com.apple.developer.web-browser.public-key-credential; passkeys won't work"
-  fi
   codesign --force --deep --options runtime --timestamp \
     --entitlements "$entitlements" --sign "$VAMPROWSER_SIGN_IDENTITY" "$app"
   rm -f "$profile_plist" "$entitlements"
