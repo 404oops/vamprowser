@@ -18,12 +18,14 @@ use std::{
 
 use block2::{Block, RcBlock};
 use objc2::{
+    ClassType,
     ffi, msg_send,
     rc::Retained,
     runtime::{AnyClass, AnyObject, Imp, Sel},
     sel,
 };
 use objc2_foundation::{NSHTTPURLResponse, NSString, NSURLResponse, NSURLAuthenticationChallenge, NSURLCredential, NSURLCredentialPersistence};
+use objc2_security::SecTrust;
 use objc2_web_kit::{WKNavigationResponse, WKNavigationResponsePolicy, WKWebView};
 
 /// What to do with `response`.
@@ -85,6 +87,7 @@ pub struct LoadFailure {
     pub domain: String,
     pub code: isize,
     pub description: String,
+    pub certificate: Option<crate::certificate::Presented>,
 }
 
 type FailureHandler = Box<dyn Fn(LoadFailure)>;
@@ -129,6 +132,7 @@ thread_local! {
     static FAILURES: RefCell<HashMap<usize, FailureHandler>> = RefCell::default();
     static AUTH_HANDLERS: RefCell<HashMap<usize, AuthRegistration>> = RefCell::default();
     static AUTH_PENDING: RefCell<HashMap<usize, PendingAuth>> = RefCell::default();
+    static CERT_PRESENTED: RefCell<HashMap<usize, crate::certificate::Presented>> = RefCell::default();
     /// Browser-owned credentials, never written to Keychain or session files.
     static AUTH_SESSION: RefCell<HashMap<AuthSpace, (String, String)>> = RefCell::default();
     /// Whether the navigation wry is asking its handler about is the
@@ -302,7 +306,30 @@ unsafe extern "C-unwind" fn did_receive_auth(
     let method = space.authenticationMethod().to_string();
     match auth_action(&method, space.isProxy()) {
         AuthAction::ValidateServerTrust => {
-            // Let WebKit validate the TLS server certificate normally.
+            // Only the exact certificate explicitly trusted for this host
+            // and port gets a credential. Everything else uses WebKit's
+            // normal validation and, on failure, the browser warning.
+            let key = webview as *const WKWebView as usize;
+            let scope = AUTH_HANDLERS.with(|handlers| handlers.borrow().get(&key).map(|entry| entry.scope)).unwrap_or(0);
+            // SAFETY: serverTrust is the trust object supplied by this server
+            // authentication challenge (nil for malformed challenges).
+            let trust: Option<Retained<SecTrust>> = unsafe { msg_send![&*space, serverTrust] };
+            if let Some(trust) = trust
+                && let Some(cert) = crate::certificate::presented(&trust, &space.host().to_string(), space.port())
+            {
+                CERT_PRESENTED.with(|presented| { presented.borrow_mut().insert(key, cert.clone()); });
+                if crate::certificate::is_trusted(&cert, scope) {
+                    // SAFETY: the server-trust credential is used only for
+                    // the matching challenge; persistence is handled by us.
+                    let credential: Option<Retained<NSURLCredential>> = unsafe {
+                        msg_send![NSURLCredential::class(), credentialForTrust: &*trust]
+                    };
+                    if let Some(credential) = credential {
+                        handler.call((0, Retained::as_ptr(&credential) as *mut AnyObject));
+                        return;
+                    }
+                }
+            }
             handler.call((1, std::ptr::null_mut()));
             return;
         }
@@ -359,6 +386,7 @@ pub fn forget(webview: &WKWebView) {
     OPENERS.with(|openers| openers.borrow_mut().remove(&key));
     FAILURES.with(|failures| failures.borrow_mut().remove(&key));
     AUTH_HANDLERS.with(|handlers| handlers.borrow_mut().remove(&key));
+    CERT_PRESENTED.with(|presented| presented.borrow_mut().remove(&key));
     cancel_auth(webview);
 }
 
@@ -380,10 +408,15 @@ unsafe extern "C-unwind" fn did_fail(
         url.and_then(|url| url.absoluteString()).map(|s| s.to_string()).unwrap_or_default()
     };
     let failure = LoadFailure {
-        url,
+        url: url.clone(),
         domain: error.domain().to_string(),
         code: error.code(),
         description: error.localizedDescription().to_string(),
+        certificate: if error.domain().to_string() == "NSURLErrorDomain" && (-1206..=-1200).contains(&error.code()) {
+            CERT_PRESENTED.with(|presented| presented.borrow().get(&key).cloned()).filter(|cert| {
+                url::Url::parse(&url).ok().is_some_and(|parsed| parsed.host_str().is_some_and(|host| host.eq_ignore_ascii_case(&cert.host)) && parsed.port_or_known_default() == u16::try_from(cert.port).ok())
+            })
+        } else { None },
     };
     FAILURES.with(|failures| {
         if let Some(failed) = failures.borrow().get(&key) {

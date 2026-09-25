@@ -68,6 +68,7 @@ objc2-foundation = { version = "0.3", features = [
     "NSTimer",
     "NSNotification",
     "NSOperation",
+    "NSKeyValueObserving",
     "NSUserActivity",
     "NSURLResponse",
     "NSURLAuthenticationChallenge",
@@ -109,6 +110,10 @@ zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
 ureq = "3"
 image = { version = "0.25", default-features = false, features = ["png", "ico", "jpeg", "gif", "webp", "bmp"] }
 resvg = { version = "0.48", default-features = false }
+objc2-security = { version = "0.3", default-features = false, features = ["SecTrust", "SecCertificate", "SecBase", "objc2"] }
+sha2 = "0.10"
+x509-parser = "0.18"
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["CFData"] }
 
 [profile.release]
 lto = "thin"

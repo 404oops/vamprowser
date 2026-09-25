@@ -7,6 +7,7 @@ mod audio;
 mod bookmarks_view;
 mod bookmark_menu;
 mod cache;
+mod certificate;
 mod commands;
 mod downloads;
 mod extensions;
@@ -121,8 +122,10 @@ enum BrowserEvent {
     PageClicked,
     /// A page began loading.
     LoadStarted(u64),
+    AudioChanged(u64, usize, bool),
     /// A page couldn't load.
     LoadFailed(u64, navigation::LoadFailure),
+    TrustCertificate(u64, String),
     AuthChallenge(u64, navigation::AuthChallenge),
     AuthSubmitted(u64, String, String),
     /// A page's text field took the keyboard, or gave it up.
@@ -132,6 +135,7 @@ enum BrowserEvent {
     /// An add-on fetched from addons.mozilla.org, ready to install.
     ExtensionPrepared(Result<extensions::Prepared, String>),
     /// A still of the page, for behind a bookmarks folder's menu.
+    BookmarkSnapshot(u64, std::time::Instant, Option<Vec<u8>>),
     /// A background tab went unused long enough to unload.
     SleepTab(u64),
     /// A check for extension updates finished.
@@ -166,13 +170,15 @@ impl BrowserEvent {
             | BrowserEvent::Loaded(id, _)
             | BrowserEvent::UrlChanged(id)
             | BrowserEvent::LoadStarted(id)
+            | BrowserEvent::AudioChanged(id, ..)
             | BrowserEvent::PageEditing(id, _)
             | BrowserEvent::Popup(id, _)
             | BrowserEvent::LinkInNewTab(id, ..)
             | BrowserEvent::Upgrade(id, _)
             | BrowserEvent::Icons(id, _)
             | BrowserEvent::SleepTab(id)
-            | BrowserEvent::LoadFailed(id, _) => Some(*id),
+            | BrowserEvent::LoadFailed(id, _)
+            | BrowserEvent::TrustCertificate(id, _) => Some(*id),
             BrowserEvent::AuthChallenge(id, _) | BrowserEvent::AuthSubmitted(id, ..) => Some(*id),
             _ => None,
         }
@@ -1059,12 +1065,31 @@ fn parse_internal(url: &str) -> Option<(Page, Option<Section>)> {
 
 /// What a tab shows when its page couldn't load: what went wrong, where, and
 /// a way to try again.
-fn error_page(failure: &navigation::LoadFailure) -> String {
+fn error_page(failure: &navigation::LoadFailure, token: Option<&str>, private: bool) -> String {
     let escape = |text: &str| {
         text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
     };
     let site = site_name(&failure.url);
     let place = if site.is_empty() { failure.url.clone() } else { site };
+    if let (Some(cert), Some(token)) = (&failure.certificate, token) {
+        let names = if cert.names.is_empty() { "None listed".to_owned() } else { cert.names.join(", ") };
+        let trust_label = if private { "Trust for this private window" } else { "Trust certificate for future visits" };
+        let trust_duration = if private { "This choice lasts until the private window closes." } else { "The choice is saved for future visits." };
+        return format!(r#"<!doctype html><html><head><meta charset="utf-8"><title>Certificate warning for {place}</title>
+<meta name="color-scheme" content="light dark"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'">
+<style>body{{font:14px -apple-system,system-ui,sans-serif;margin:0;min-height:100vh;display:grid;place-items:center;background:Canvas;color:CanvasText}}main{{box-sizing:border-box;width:min(640px,100%);padding:36px}}h1{{font-size:25px;margin:0 0 10px}}p{{line-height:1.5;color:color-mix(in srgb,CanvasText 75%,transparent)}}.warning{{font-weight:600;color:#e58b59}}dl{{display:grid;grid-template-columns:130px 1fr;gap:10px 14px;padding:20px;border:1px solid color-mix(in srgb,CanvasText 25%,transparent);border-radius:12px;margin:22px 0}}dt{{color:GrayText}}dd{{margin:0;overflow-wrap:anywhere}}code{{font:12px ui-monospace,monospace}}.actions{{display:flex;gap:10px;flex-wrap:wrap;align-items:center}}.actions a{{font:inherit;cursor:pointer;border-radius:8px;padding:9px 15px;text-decoration:none;border:1px solid GrayText;color:CanvasText}}.actions a.trust{{border:0;background:AccentColor;color:AccentColorText;font-weight:600}}small{{display:block;margin-top:14px;color:GrayText;line-height:1.5}}</style></head><body><main>
+<h1>Your connection to {place} is not private</h1><p class="warning">The certificate could not be verified: {reason}</p>
+<p>Check these details before deciding whether you recognize this server.</p>
+<dl><dt>Address</dt><dd><code>{url}</code></dd><dt>Subject</dt><dd>{subject}</dd><dt>Issuer</dt><dd>{issuer}</dd><dt>Valid from</dt><dd>{from}</dd><dt>Valid until</dt><dd>{until}</dd><dt>Names</dt><dd>{names}</dd><dt>SHA-256 fingerprint</dt><dd><code>{fingerprint}</code></dd></dl>
+<div class="actions"><a href="about:blank">Don’t trust — leave site</a><a href="{url}">Try Again</a><a class="trust" id="trust" href="vamp://trust-certificate/{token}">{trust_label}</a></div>
+<small>Trust applies only to this exact certificate at this host and port. {trust_duration} A changed certificate will show this warning again. Only continue if you can verify the fingerprint with the site owner.</small>
+</main><script>document.getElementById('trust').addEventListener('click',function(event){{event.preventDefault();window.ipc.postMessage('cert-trust:{token}')}})</script></body></html>"#,
+            place=escape(&place), reason=escape(&failure.description), url=escape(&failure.url),
+            subject=escape(&cert.subject), issuer=escape(&cert.issuer), from=escape(&cert.valid_from),
+            until=escape(&cert.valid_until), names=escape(&names), fingerprint=escape(&cert.fingerprint),
+            token=escape(token), trust_label=trust_label, trust_duration=trust_duration);
+    }
     format!(
         r#"<!doctype html><html><head><meta charset="utf-8"><title>Can’t open {place}</title>
 <meta name="color-scheme" content="light dark"><style>
@@ -1142,6 +1167,7 @@ struct BrowserTab {
     /// Created when the tab first shows a web page; `None` for a web tab
     /// restored but not yet shown, or unloaded after going unused.
     view: Option<Rc<WebView>>,
+    audio_observer: Option<Retained<audio::AudioObserver>>,
     /// Whether WebKit currently reports audible media in this page.
     playing_audio: bool,
     /// The tab's requested mute state, kept while its web view is asleep.
@@ -1472,6 +1498,7 @@ struct Browser {
     tabs: Vec<BrowserTab>,
     /// Sign-in form tab id -> tab whose HTTP challenge is waiting.
     auth_forms: HashMap<u64, u64>,
+    certificate_offers: HashMap<u64, (String, certificate::Presented, String)>,
     auth_tabs: HashSet<u64>,
     selected: usize,
     selection_generation: u64,
@@ -1604,6 +1631,7 @@ impl Drop for Browser {
     fn drop(&mut self) {
         if self.private {
             navigation::forget_private_auth(self.serial);
+            certificate::forget_private(self.serial);
         }
         // A window closed by hand leaves the session for the closed ones,
         // to reopen; any closed by quitting is restored next launch.
@@ -1912,6 +1940,7 @@ impl Browser {
             closing: Vec::new(),
             tabs: Vec::new(),
             auth_forms: HashMap::new(),
+            certificate_offers: HashMap::new(),
             auth_tabs: HashSet::new(),
             selected: 0,
             selection_generation: 0,
@@ -2018,16 +2047,6 @@ impl Browser {
                 }
             }
         }));
-        // WebKit's audio state changes without a navigation or page event.
-        cx.spawn_in(window, async move |this, cx| {
-            loop {
-                cx.background_executor().timer(Duration::from_millis(500)).await;
-                if this.update(cx, |browser, cx| browser.refresh_tab_audio(cx)).is_err() {
-                    break;
-                }
-            }
-        })
-        .detach();
         // Once a minute, unload background tabs that have gone unused.
         cx.spawn_in(window, async move |this, cx| {
             loop {
@@ -2183,6 +2202,7 @@ impl Browser {
         let load_sender = route.clone();
         let popup_sender = route.clone();
         let upgrade_sender = route.clone();
+        let trust_sender = route.clone();
         let editing_sender = route.clone();
         let auth_sender = route.clone();
         // The HTTPS address last tried instead of an HTTP one, in this tab.
@@ -2249,6 +2269,8 @@ impl Browser {
                     && let Ok([user, password]) = serde_json::from_str::<[String; 2]>(payload)
                 {
                     editing_sender.send(BrowserEvent::AuthSubmitted(id, user, password));
+                } else if let Some(token) = request.body().strip_prefix("cert-trust:") {
+                    editing_sender.send(BrowserEvent::TrustCertificate(id, token.to_owned()));
                 } else if request.body() == "url-changed" {
                     editing_sender.send(BrowserEvent::UrlChanged(id));
                 }
@@ -2270,6 +2292,10 @@ impl Browser {
                 NewWindowResponse::Deny
             })
             .with_navigation_handler(move |url| {
+                if let Some(token) = url.strip_prefix("vamp://trust-certificate/") {
+                    trust_sender.send(BrowserEvent::TrustCertificate(id, token.to_owned()));
+                    return false;
+                }
                 if https_only.get() {
                     match navigation::https_only_action(
                         &url, navigation::main_frame_load(), navigation::page_load(),
@@ -2435,6 +2461,7 @@ impl Browser {
             TabPlacement::AfterCurrent if !self.tabs.is_empty() => self.selected + 1,
             _ => self.tabs.len(),
         };
+        let audio_observer = view.as_ref().map(|view| self.observe_tab_audio(id, view));
         self.tabs.insert(
             at,
             BrowserTab {
@@ -2446,6 +2473,7 @@ impl Browser {
                 zoom: self.settings.page_zoom,
                 loading: None,
                 view,
+                audio_observer,
                 playing_audio: false,
                 muted: false,
                 media_suspended: media_suspended && page == Page::Web,
@@ -2487,6 +2515,7 @@ impl Browser {
             zoom: self.settings.page_zoom,
             loading: None,
             view: None,
+            audio_observer: None,
             playing_audio: false,
             muted: false,
             media_suspended: false,
@@ -2512,7 +2541,9 @@ impl Browser {
                 self.report_opened(id, &view, private);
                 let _ = view.set_visible(!self.palette_open.get());
                 let _ = view.zoom(zoom);
+                let audio_observer = self.observe_tab_audio(id, &view);
                 let tab = &mut self.tabs[index];
+                tab.audio_observer = Some(audio_observer);
                 tab.view = Some(view);
                 tab.loading = Some((std::time::Instant::now(), None));
                 self.report_updated(index);
@@ -2548,19 +2579,13 @@ impl Browser {
         }
     }
 
-    fn refresh_tab_audio(&mut self, cx: &mut Context<Self>) {
-        let mut changed = false;
-        for tab in &mut self.tabs {
-            let playing = tab.page == Page::Web
-                && tab.view.as_ref().is_some_and(|view| audio::playing(&view.webview()));
-            if tab.playing_audio != playing {
-                tab.playing_audio = playing;
-                changed = true;
-            }
-        }
-        if changed {
-            cx.notify();
-        }
+    fn observe_tab_audio(&self, id: u64, view: &WebView) -> Retained<audio::AudioObserver> {
+        let route = self.route(id);
+        let webview = view.webview();
+        let identity = Retained::as_ptr(&webview) as usize;
+        audio::AudioObserver::new(&webview, move |playing| {
+            route.send(BrowserEvent::AudioChanged(id, identity, playing));
+        })
     }
 
     pub(crate) fn toggle_tab_mute(&mut self, id: u64, cx: &mut Context<Self>) {
@@ -2914,7 +2939,13 @@ impl Browser {
                 return;
             }
         }
-        let html = error_page(&failure);
+        let token = failure.certificate.as_ref().map(|cert| {
+            let token = objc2_foundation::NSUUID::UUID().UUIDString().to_string();
+            self.certificate_offers.insert(self.tabs[index].id, (failure.url.clone(), cert.clone(), token.clone()));
+            token
+        });
+        if token.is_none() { self.certificate_offers.remove(&self.tabs[index].id); }
+        let html = error_page(&failure, token.as_deref(), self.tabs[index].private);
         let webview = view.webview();
         // SAFETY: WebKit's own method, checked for; the page shows under the
         // address that failed, and Reload tries that address again.
@@ -3002,6 +3033,7 @@ impl Browser {
                 return;
             }
         };
+        self.tabs[index].audio_observer = None;
         if let Some(old) = self.tabs[index].view.replace(view.clone()) {
             let _ = old.set_visible(false);
             navigation::forget(&old.webview());
@@ -3009,9 +3041,11 @@ impl Browser {
                 extensions.tab_closed(id);
             }
         }
+        self.tabs[index].audio_observer = Some(self.observe_tab_audio(id, &view));
         let _ = view.zoom(zoom);
         let _ = view.set_visible(index == self.selected && !self.palette_open.get());
         self.tabs[index].loading = Some((std::time::Instant::now(), None));
+        self.tabs[index].playing_audio = false;
     }
 
     /// Loads the pages waiting for the content rules, once they're ready.
@@ -3123,6 +3157,7 @@ impl Browser {
         self.label_widths.borrow_mut().remove(&self.tabs[index].id);
         let width = self.strip_width_of(self.tabs[index].id);
         let tab = self.tabs.remove(index);
+        self.certificate_offers.remove(&tab.id);
         let auth_form = self.auth_tabs.remove(&tab.id);
         if let Some(original) = self.auth_forms.remove(&tab.id)
             && let Some(original_index) = self.web_index_of(original)
@@ -3231,12 +3266,14 @@ impl Browser {
     }
 
     fn load_in(&mut self, index: usize, url: &str, window: &Window, cx: &mut Context<Self>) {
+        self.certificate_offers.remove(&self.tabs[index].id);
         if let Some((page, section)) = parse_internal(url) {
             if let Some(section) = section {
                 self.settings_section = section;
             }
             let tab = &mut self.tabs[index];
             tab.page = page;
+            tab.playing_audio = false;
             tab.url = page.internal_url().to_owned();
             tab.title = page.title().to_owned();
             if let Some(view) = &tab.view {
@@ -3252,6 +3289,7 @@ impl Browser {
             match self.create_webview(id, url, private, false, window) {
                 Ok(view) => {
                     self.report_opened(id, &view, private);
+                    self.tabs[index].audio_observer = Some(self.observe_tab_audio(id, &view));
                     self.tabs[index].view = Some(view);
                 }
                 Err(err) => {
@@ -3319,11 +3357,24 @@ impl Browser {
                 continue;
             }
             match event {
+                BrowserEvent::AudioChanged(id, identity, playing) => {
+                    if let Some(index) = self.index_of(id)
+                        && self.tabs[index].view.as_ref().is_some_and(|view| {
+                            Retained::as_ptr(&view.webview()) as usize == identity
+                        })
+                        && self.tabs[index].page == Page::Web
+                        && self.tabs[index].playing_audio != playing
+                    {
+                        self.tabs[index].playing_audio = playing;
+                        cx.notify();
+                    }
+                }
                 BrowserEvent::AddressEdited(text) => self.address_edited(text, window, cx),
                 BrowserEvent::Suggestions(query, found) => {
                     self.remote_suggestions(query, found, window, cx)
                 }
                 BrowserEvent::SuggestSnapshot(tab, jpeg) => self.suggest_snapshot(tab, jpeg, cx),
+                BrowserEvent::BookmarkSnapshot(tab, opened, jpeg) => self.bookmark_snapshot(tab, opened, jpeg, cx),
                 BrowserEvent::Address(text) => {
                     let target = self.submitted_address(text);
                     self.close_suggestions(cx);
@@ -3511,6 +3562,19 @@ impl Browser {
                         self.load_failed(index, failure, window, cx);
                     }
                 }
+                BrowserEvent::TrustCertificate(id, token) => {
+                    if let Some((url, cert, expected)) = self.certificate_offers.get(&id).cloned()
+                        && token == expected
+                        && let Some(index) = self.web_index_of(id)
+                    {
+                        self.certificate_offers.remove(&id);
+                        let scope = if self.tabs[index].private { self.serial } else { 0 };
+                        match certificate::trust(&cert, scope) {
+                            Ok(()) => self.load_in(index, &url, window, cx),
+                            Err(error) => eprintln!("Could not save certificate trust: {error}"),
+                        }
+                    }
+                }
                 BrowserEvent::AuthChallenge(id, challenge) => {
                     self.show_auth_form(id, challenge, window, cx);
                 }
@@ -3560,8 +3624,9 @@ impl Browser {
                 BrowserEvent::SleepTab(id) => {
                     if let Some(index) = self.index_of(id)
                         && index != self.selected
-                        && let Some(view) = self.tabs[index].view.take()
                     {
+                        self.tabs[index].audio_observer = None;
+                        let Some(view) = self.tabs[index].view.take() else { continue };
                         let _ = view.set_visible(false);
                         navigation::forget(&view.webview());
                         if let Some(extensions) = self.common.extensions.borrow_mut().as_mut() {
@@ -5761,7 +5826,8 @@ impl Render for Browser {
                     .min_h(px(0.0))
                     .relative()
                     .child(content)
-                    .children(self.suggestion_backdrop()),
+                    .children(self.suggestion_backdrop())
+                    .children(self.bookmark_menu_backdrop()),
             );
         let mut body = div().flex_1().min_h(px(0.0)).flex();
         if sidebar_width > 0.5 {

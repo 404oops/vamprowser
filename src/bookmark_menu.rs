@@ -1,63 +1,33 @@
-//! A folder on the bookmarks bar opens over browser pages. On web pages it
-//! uses a separate popup window so the live WebView can keep rendering.
+//! Folders on the bookmarks bar open as menus over browser pages.
 
-use std::{cell::RefCell, collections::HashMap, rc::Rc};
+use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
 
 use gpui::{
-    AnyElement, Bounds, Context, MouseButton, Pixels, SharedString, Window, canvas,
-    div, prelude::*, px,
+    AnyElement, Bounds, Context, Image, ImageFormat, MouseButton, Pixels, SharedString, Window,
+    canvas, div, img, prelude::*, px,
 };
 use vampir::{Palette, color, lighting};
+use wry::WebViewExtMacOS;
 
 use crate::{
-    Browser, Chrome, Page,
+    Browser, BrowserEvent, Chrome, Page,
     bookmarks::Node,
     bookmarks_view::DraggedBookmark,
     commands::Place,
     icons::{Icon, icon},
-    native::MenuEntry, site_icon,
+    native, site_icon,
 };
 
 const WIDTH: f32 = 270.0;
 const ROW: f32 = 28.0;
 
-enum PopupChoice {
-    Link(String),
-    All(u64),
-}
-
-fn popup_entries(nodes: &[Node], folder: u64) -> (Vec<MenuEntry>, Vec<Option<PopupChoice>>) {
-    let mut entries = Vec::new();
-    let mut choices = Vec::new();
-    let mut has_links = false;
-    for node in nodes {
-        if node.is_folder() {
-            let (nested, nested_choices) = popup_entries(&node.children, node.id);
-            entries.push(MenuEntry::Submenu { label: node.title.clone(), entries: nested });
-            choices.push(None);
-            choices.extend(nested_choices);
-        } else if let Some(url) = &node.url {
-            has_links = true;
-            entries.push(MenuEntry::item(&node.title));
-            choices.push(Some(PopupChoice::Link(url.clone())));
-        }
-    }
-    if has_links {
-        entries.push(MenuEntry::Separator);
-        choices.push(None);
-        entries.push(MenuEntry::item("Open All in Tabs"));
-        choices.push(Some(PopupChoice::All(folder)));
-    }
-    if entries.is_empty() {
-        entries.push(MenuEntry::disabled("Empty"));
-        choices.push(None);
-    }
-    (entries, choices)
-}
-
 pub(crate) struct BookmarkMenu {
     /// The folders open, from the one on the bar to the innermost.
     path: Vec<u64>,
+    /// A still of the web page while the menu is drawn above it.
+    snapshot: Option<Arc<Image>>,
+    tab: u64,
+    opened: std::time::Instant,
 }
 
 /// Where each folder's row (or button on the bar) was drawn, by id, for
@@ -81,33 +51,46 @@ pub(crate) fn anchor(anchors: &Anchors, id: u64) -> impl IntoElement {
 
 impl Browser {
     /// Opens folder `id` from the bookmarks bar; open already, closes it.
-    pub(crate) fn toggle_bookmark_menu(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
-        if self.current().page == Page::Web {
-            let bookmarks = self.bookmarks();
-            let Some(folder) = bookmarks.get(id) else { return };
-            let (entries, choices) = popup_entries(&folder.children, id);
-            let Some(anchor) = self.menu_anchors.borrow().get(&id).copied() else { return };
-            let position = gpui::point(anchor.origin.x, anchor.origin.y + anchor.size.height + px(4.0));
-            let receiver = crate::app_menu::open(cx, window, position, entries, self.controls.palette());
-            cx.spawn_in(window, async move |this, cx| {
-                let Ok(Some(index)) = receiver.recv().await else { return };
-                let Some(Some(choice)) = choices.into_iter().nth(index) else { return };
-                let _ = cx.update(|window, app| {
-                    this.update(app, |browser, cx| match choice {
-                        PopupChoice::Link(url) => browser.open_link(&url, Place::Here, window, cx),
-                        PopupChoice::All(folder) => browser.run(crate::commands::Command::OpenBookmarkFolder(folder), window, cx),
-                    })
-                });
-            }).detach();
+    pub(crate) fn toggle_bookmark_menu(&mut self, id: u64, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.bookmarks().get(id).is_some_and(|node| node.is_folder()) {
             return;
         }
         if self.bookmark_menu.as_ref().is_some_and(|m| m.path.first() == Some(&id)) {
             self.close_bookmark_menu(cx);
             return;
         }
-        self.bookmark_menu = Some(BookmarkMenu { path: vec![id] });
+        self.close_suggestions(cx);
+        let tab = self.current();
+        let opened = std::time::Instant::now();
+        if tab.page == Page::Web && let Some(view) = &tab.view {
+            let sender = self.sender.clone();
+            let tab_id = tab.id;
+            native::snapshot(&view.webview(), move |jpeg| {
+                let _ = sender.try_send(BrowserEvent::BookmarkSnapshot(tab_id, opened, jpeg));
+            });
+        }
+        self.bookmark_menu = Some(BookmarkMenu { path: vec![id], snapshot: None, tab: tab.id, opened });
         self.bookmark_menu_open.set(true);
         cx.notify();
+    }
+
+    pub(crate) fn bookmark_snapshot(&mut self, tab: u64, opened: std::time::Instant, jpeg: Option<Vec<u8>>, cx: &mut Context<Self>) {
+        if self.current().id != tab { return }
+        let Some(menu) = &mut self.bookmark_menu else { return };
+        if menu.tab != tab || menu.opened != opened {
+            return;
+        }
+        let Some(jpeg) = jpeg else { return };
+        menu.snapshot = Some(Arc::new(Image::from_bytes(ImageFormat::Jpeg, jpeg)));
+        if let Some(view) = &self.current().view {
+            let _ = view.set_visible(false);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn bookmark_menu_backdrop(&self) -> Option<AnyElement> {
+        let snapshot = self.bookmark_menu.as_ref()?.snapshot.clone()?;
+        Some(img(snapshot).absolute().top_0().left_0().size_full().into_any_element())
     }
 
     pub(crate) fn close_bookmark_menu(&mut self, cx: &mut Context<Self>) {
@@ -282,7 +265,14 @@ impl Browser {
                         }),
                     )
                 }
-                None => row,
+                None => row.on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    if let Some(menu) = &mut this.bookmark_menu {
+                        menu.path.truncate(level + 1);
+                        menu.path.push(id);
+                        cx.notify();
+                    }
+                })),
             };
             list = list.child(row);
         }
@@ -371,24 +361,5 @@ impl Browser {
             self.persist();
             cx.notify();
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn popup_choices_follow_submenu_indices() {
-        let nodes = vec![
-            Node::folder("Folder", vec![Node::link("Nested", "https://nested.example")]),
-            Node::link("After", "https://after.example"),
-        ];
-        let (_, choices) = popup_entries(&nodes, 7);
-        assert!(choices[0].is_none());
-        assert!(matches!(&choices[1], Some(PopupChoice::Link(url)) if url == "https://nested.example"));
-        assert!(matches!(&choices[3], Some(PopupChoice::All(0))));
-        assert!(matches!(&choices[4], Some(PopupChoice::Link(url)) if url == "https://after.example"));
-        assert!(matches!(&choices[6], Some(PopupChoice::All(7))));
     }
 }
