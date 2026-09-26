@@ -26,6 +26,7 @@ pub enum Icon {
     Search,
     Link,
     Download,
+    Media,
     Gear,
     Puzzle,
     File,
@@ -273,6 +274,18 @@ fn paint(icon: Icon, bounds: Bounds<Pixels>, color: Rgba, window: &mut Window) {
                 &[(3.0, 11.0), (3.0, 13.5), (13.0, 13.5), (13.0, 11.0)],
             );
             paths.push(path);
+        }
+        Icon::Media => {
+            let mut play = stroke();
+            polyline(
+                &mut play,
+                &[(2.5, 3.0), (2.5, 11.5), (9.0, 7.25), (2.5, 3.0)],
+            );
+            paths.push(play);
+            let mut arrow = stroke();
+            polyline(&mut arrow, &[(12.0, 5.0), (12.0, 12.5)]);
+            polyline(&mut arrow, &[(9.5, 10.0), (12.0, 12.5), (14.5, 10.0)]);
+            paths.push(arrow);
         }
         Icon::Gear => {
             // Eight teeth around a ring.

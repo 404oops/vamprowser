@@ -38,6 +38,7 @@ A macOS browser built in Rust: Apple's WebKit (through Wry's `WKWebView`) for pa
   - It opens links and HTML/PDF/image/text files handed over by other apps.
   - Handoff offers the page in front to your other devices; this needs a Developer ID-signed build.
   - It has a Dock menu.
+- **Media downloads**: the toolbar's media button asks `yt-dlp` what the current page offers, then lists video and audio formats, subtitles, a description, and a folder bundle with all available parts. Individual choices save files directly in Downloads; only the bundle creates a folder. Install `yt-dlp` separately (`brew install yt-dlp`); some formats also need `ffmpeg` (`brew install ffmpeg`).
 
 Your data lives in `~/Library/Application Support/Vamprowser/`: settings, session, bookmarks, history, downloads, extensions, and `Site Data` — cookies and logins, site storage and extensions' storage. WebKit would keep site data under the app's identifier, which a development build and the installed app don't share; here both use the same, and it stays put across reinstalls. Site icons and filter lists are cached in `~/Library/Caches/Vamprowser/`.
 

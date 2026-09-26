@@ -101,7 +101,7 @@ fn look_up(path: PathBuf) {
         let (sender, receiver) = async_channel::unbounded::<PathBuf>();
         std::thread::spawn(move || {
             while let Ok(path) = receiver.recv_blocking() {
-                let size = fs::metadata(&path).ok().map(|m| m.len());
+                let size = size_on_disk(&path);
                 if let Ok(mut sizes) = sizes().lock() {
                     sizes.insert(path, Seen { looked: Some(Instant::now()), pending: false, size: Some(size) });
                 }
@@ -110,6 +110,24 @@ fn look_up(path: PathBuf) {
         sender
     });
     let _ = queue.try_send(path);
+}
+
+/// A bundle's shelf size is its contents, not the directory entry's size.
+fn size_on_disk(path: &Path) -> Option<u64> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if metadata.is_file() { return Some(metadata.len()); }
+    if !metadata.is_dir() { return None; }
+    let mut total = 0u64;
+    let mut directories = vec![path.to_path_buf()];
+    while let Some(directory) = directories.pop() {
+        for entry in fs::read_dir(directory).ok()? {
+            let entry = entry.ok()?;
+            let kind = entry.file_type().ok()?;
+            if kind.is_dir() { directories.push(entry.path()); }
+            else if kind.is_file() { total = total.saturating_add(entry.metadata().ok()?.len()); }
+        }
+    }
+    Some(total)
 }
 
 #[derive(Default)]
@@ -217,6 +235,19 @@ impl Downloads {
         self.save();
     }
 
+    /// Completes a yt-dlp job, whose final extension is known only after it runs.
+    pub fn finished_id(&mut self, id: u64, path: Option<PathBuf>, success: bool) {
+        if let Some(item) = self.items.iter_mut().find(|item| item.id == id && item.state == DownloadState::InProgress) {
+            if let Ok(mut sizes) = sizes().lock() {
+                sizes.remove(&item.path);
+                if let Some(path) = &path { sizes.remove(path); }
+            }
+            if let Some(path) = path { item.path = path; }
+            item.state = if success { DownloadState::Done } else { DownloadState::Failed };
+        }
+        self.save();
+    }
+
     pub fn all(&self) -> &[Download] {
         &self.items
     }
@@ -294,5 +325,26 @@ mod tests {
         let json = serde_json::to_string(&downloads.saved_items()).unwrap();
         assert!(json.contains("public.example"));
         assert!(!json.contains("private.example"));
+    }
+
+    #[test]
+    fn media_finish_uses_id_and_final_file_path() {
+        let mut downloads = Downloads::default();
+        let first = downloads.started("https://a/video".into(), "/tmp/first".into(), false);
+        let second = downloads.started("https://a/video".into(), "/tmp/second".into(), false);
+        downloads.finished_id(first, Some("/tmp/first.mp4".into()), true);
+        assert_eq!(downloads.get(first).unwrap().path, PathBuf::from("/tmp/first.mp4"));
+        assert_eq!(downloads.get(first).unwrap().state, DownloadState::Done);
+        assert_eq!(downloads.get(second).unwrap().state, DownloadState::InProgress);
+    }
+
+    #[test]
+    fn bundle_size_is_the_sum_of_its_files() {
+        let dir = std::env::temp_dir().join(format!("vamp-bundle-size-{}-{}", std::process::id(), now_secs()));
+        fs::create_dir_all(dir.join("subtitles")).unwrap();
+        fs::write(dir.join("video.mp4"), b"12345").unwrap();
+        fs::write(dir.join("subtitles/en.vtt"), b"123").unwrap();
+        assert_eq!(size_on_disk(&dir), Some(8));
+        fs::remove_dir_all(dir).unwrap();
     }
 }

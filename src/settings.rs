@@ -238,13 +238,14 @@ pub enum ToolbarItem {
     CommandPalette,
     CopyLink,
     Downloads,
+    Media,
     Extensions,
     Settings,
 }
 
 impl ToolbarItem {
     /// Every item, in the default order.
-    pub const ALL: [ToolbarItem; 14] = [
+    pub const ALL: [ToolbarItem; 15] = [
         ToolbarItem::Back,
         ToolbarItem::Forward,
         ToolbarItem::Reload,
@@ -258,6 +259,7 @@ impl ToolbarItem {
         ToolbarItem::CommandPalette,
         ToolbarItem::CopyLink,
         ToolbarItem::Downloads,
+        ToolbarItem::Media,
         ToolbarItem::Settings,
     ];
 
@@ -275,6 +277,7 @@ impl ToolbarItem {
             ToolbarItem::CommandPalette => "Switch tabs",
             ToolbarItem::CopyLink => "Copy link",
             ToolbarItem::Downloads => "Downloads",
+            ToolbarItem::Media => "Download media",
             ToolbarItem::Extensions => "Extension buttons",
             ToolbarItem::Settings => "Settings",
         }
@@ -290,6 +293,7 @@ impl ToolbarItem {
                 | ToolbarItem::Extensions
                 | ToolbarItem::BookmarksBar
                 | ToolbarItem::Sidebar
+                | ToolbarItem::Media
                 | ToolbarItem::Settings
         )
     }
@@ -464,7 +468,7 @@ impl Settings {
             if !seen.contains(&item) {
                 self.toolbar.push(ToolbarEntry {
                     item,
-                    shown: item == ToolbarItem::Address,
+                    shown: item == ToolbarItem::Address || item == ToolbarItem::Media,
                 });
             }
         }
@@ -987,11 +991,11 @@ mod tests {
         assert_eq!(settings.toolbar.len(), ToolbarItem::ALL.len());
         let (left, right) = settings.toolbar_sides();
         assert_eq!(left, [ToolbarItem::Reload]);
-        assert_eq!(right, [ToolbarItem::Settings]);
+        assert_eq!(right, [ToolbarItem::Settings, ToolbarItem::Media]);
         settings.move_toolbar_item(ToolbarItem::Settings, false);
         let (left, right) = settings.toolbar_sides();
         assert_eq!(left, [ToolbarItem::Reload, ToolbarItem::Settings]);
-        assert!(right.is_empty());
+        assert_eq!(right, [ToolbarItem::Media]);
     }
 
     #[test]

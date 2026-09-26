@@ -19,8 +19,10 @@ mod http_auth;
 mod icons;
 mod interop;
 mod legacy_http;
+mod media;
 mod native;
 mod navigation;
+mod url_observer;
 mod pages;
 mod page_cursor;
 mod pointer_lock;
@@ -119,6 +121,8 @@ enum BrowserEvent {
     /// A download began, from tab (first).
     DownloadStarted(String, PathBuf, bool),
     DownloadFinished(String, Option<PathBuf>, bool),
+    MediaInspected(u64, u64, String, gpui::Point<gpui::Pixels>, Result<media::Info, String>),
+    MediaFinished(u64, Result<PathBuf, String>),
     /// A still of the page, for behind the tab switcher.
     /// Each still says which tab it's of.
     Snapshot(u64, Option<Vec<u8>>),
@@ -1179,6 +1183,7 @@ struct BrowserTab {
     /// restored but not yet shown, or unloaded after going unused.
     view: Option<Rc<WebView>>,
     audio_observer: Option<Retained<audio::AudioObserver>>,
+    url_observer: Option<Retained<url_observer::UrlObserver>>,
     /// Whether WebKit currently reports audible media in this page.
     playing_audio: bool,
     /// The tab's requested mute state, kept while its web view is asleep.
@@ -1655,6 +1660,9 @@ struct Browser {
     is_default_browser: bool,
     /// The control that last acted, and a count that restarts its pulse.
     ping: (Option<PingTarget>, u64),
+    /// The latest yt-dlp metadata request for this window, while it runs.
+    media_inspection_serial: u64,
+    media_inspecting: Option<u64>,
     /// This frame's load progress and bar opacity; see `load_progress`.
     progress: Option<(f32, f32)>,
     /// Sites drawn this frame with no icon at hand, to look up after it:
@@ -2056,6 +2064,8 @@ impl Browser {
             is_default_browser: interop::is_default_browser(),
             _address_blur: None,
             ping: (None, 0),
+            media_inspection_serial: 0,
+            media_inspecting: None,
             progress: None,
             favicon_wants: Default::default(),
             caret_epoch: std::time::Instant::now(),
@@ -2499,6 +2509,7 @@ impl Browser {
             _ => self.tabs.len(),
         };
         let audio_observer = view.as_ref().map(|view| self.observe_tab_audio(id, view));
+        let url_observer = view.as_ref().map(|view| self.observe_tab_url(id, view));
         self.tabs.insert(
             at,
             BrowserTab {
@@ -2511,6 +2522,7 @@ impl Browser {
                 loading: None,
                 view,
                 audio_observer,
+                url_observer,
                 playing_audio: false,
                 muted: false,
                 media_suspended: media_suspended && page == Page::Web,
@@ -2553,6 +2565,7 @@ impl Browser {
             loading: None,
             view: None,
             audio_observer: None,
+            url_observer: None,
             playing_audio: false,
             muted: false,
             media_suspended: false,
@@ -2579,8 +2592,10 @@ impl Browser {
                 let _ = view.set_visible(!self.palette_open.get());
                 let _ = view.zoom(zoom);
                 let audio_observer = self.observe_tab_audio(id, &view);
+                let url_observer = self.observe_tab_url(id, &view);
                 let tab = &mut self.tabs[index];
                 tab.audio_observer = Some(audio_observer);
+                tab.url_observer = Some(url_observer);
                 tab.view = Some(view);
                 tab.loading = Some((std::time::Instant::now(), None));
                 self.report_updated(index);
@@ -2622,6 +2637,13 @@ impl Browser {
         let identity = Retained::as_ptr(&webview) as usize;
         audio::AudioObserver::new(&webview, move |playing| {
             route.send(BrowserEvent::AudioChanged(id, identity, playing));
+        })
+    }
+
+    fn observe_tab_url(&self, id: u64, view: &WebView) -> Retained<url_observer::UrlObserver> {
+        let route = self.route(id);
+        url_observer::UrlObserver::new(&view.webview(), move || {
+            route.send(BrowserEvent::UrlChanged(id));
         })
     }
 
@@ -3074,6 +3096,7 @@ impl Browser {
             }
         };
         self.tabs[index].audio_observer = None;
+        self.tabs[index].url_observer = None;
         if let Some(old) = self.tabs[index].view.replace(view.clone()) {
             let _ = old.set_visible(false);
             navigation::forget(&old.webview());
@@ -3082,6 +3105,7 @@ impl Browser {
             }
         }
         self.tabs[index].audio_observer = Some(self.observe_tab_audio(id, &view));
+        self.tabs[index].url_observer = Some(self.observe_tab_url(id, &view));
         let _ = view.zoom(zoom);
         let _ = view.set_visible(index == self.selected && !self.palette_open.get());
         self.tabs[index].loading = Some((std::time::Instant::now(), None));
@@ -3330,6 +3354,7 @@ impl Browser {
                 Ok(view) => {
                     self.report_opened(id, &view, private);
                     self.tabs[index].audio_observer = Some(self.observe_tab_audio(id, &view));
+                    self.tabs[index].url_observer = Some(self.observe_tab_url(id, &view));
                     self.tabs[index].view = Some(view);
                 }
                 Err(err) => {
@@ -3586,6 +3611,26 @@ impl Browser {
                     self.refresh_other_windows(cx);
                     cx.notify();
                 }
+                BrowserEvent::MediaInspected(serial, id, url, position, result) => {
+                    if self.media_inspecting != Some(serial) { continue; }
+                    self.media_inspecting = None;
+                    cx.notify();
+                    if self.current().id != id || self.current().url != url { continue; }
+                    match result {
+                        Ok(info) => self.context_menu(position, self.media_menu(&url, info), window, cx),
+                        Err(error) => {
+                            let _ = app_dialog::open(cx, self.controls.palette(), "Couldn't inspect media", error, "OK", app_dialog::Kind::Alert);
+                        }
+                    }
+                }
+                BrowserEvent::MediaFinished(id, result) => {
+                    self.downloads().finished_id(id, result.as_ref().ok().cloned(), result.is_ok());
+                    if let Err(error) = result {
+                        let _ = app_dialog::open(cx, self.controls.palette(), "Couldn't download media", error, "OK", app_dialog::Kind::Alert);
+                    }
+                    self.refresh_other_windows(cx);
+                    cx.notify();
+                }
                 BrowserEvent::Snapshot(tab, jpeg) => self.palette_snapshot(tab, jpeg, cx),
                 BrowserEvent::Extension(event) => self.extension_event(event, window, cx),
                 BrowserEvent::RulesTimedOut => {
@@ -3670,6 +3715,7 @@ impl Browser {
                         && index != self.selected
                     {
                         self.tabs[index].audio_observer = None;
+                        self.tabs[index].url_observer = None;
                         let Some(view) = self.tabs[index].view.take() else { continue };
                         let _ = view.set_visible(false);
                         navigation::forget(&view.webview());
@@ -4484,6 +4530,12 @@ impl Browser {
                 self.current().page == Page::Downloads,
                 Command::ShowDownloads,
             ),
+            ToolbarItem::Media => (
+                Icon::Media,
+                Hint::new("Download media with yt-dlp"),
+                false,
+                Command::InspectMedia,
+            ),
             ToolbarItem::Settings => (
                 Icon::Gear,
                 Hint::new("Settings").shortcut("⌘,"),
@@ -4493,7 +4545,7 @@ impl Browser {
         };
         let needs_page = matches!(
             item,
-            ToolbarItem::Back | ToolbarItem::Forward | ToolbarItem::Reload | ToolbarItem::CopyLink
+            ToolbarItem::Back | ToolbarItem::Forward | ToolbarItem::Reload | ToolbarItem::CopyLink | ToolbarItem::Media
         );
         // Back and forward only with somewhere to go.
         let history = self.current().view.as_ref().filter(|_| web).map(|view| {
@@ -4506,7 +4558,9 @@ impl Browser {
             ToolbarItem::Forward => history.is_some_and(|h| h.1),
             _ => web || !needs_page,
         };
-        let ink = if active {
+        let ink = if item == ToolbarItem::Media && self.media_inspecting.is_some() {
+            palette.accent
+        } else if active {
             palette.soft_label
         } else {
             palette.text_secondary
@@ -4537,6 +4591,34 @@ impl Browser {
                 }
             }),
         );
+        if item == ToolbarItem::Media && let Some(serial) = self.media_inspecting {
+            let accent = palette.accent;
+            return div()
+                .relative()
+                .size(px(BUTTON_SIZE))
+                .flex_none()
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                        .rounded(px(RADIUS))
+                        .with_animation(
+                            ("media-inspecting", serial),
+                            Animation::new(Duration::from_millis(1100)).repeat(),
+                            move |glow, t| {
+                                let pulse = (t * std::f32::consts::TAU).sin() * 0.5 + 0.5;
+                                glow.bg(color::with_alpha(accent, 0.12 + 0.14 * pulse))
+                                    .border_1()
+                                    .border_color(color::with_alpha(accent, 0.45 + 0.35 * pulse))
+                                    .shadow(vec![lighting::glow(accent, 0.22 + 0.2 * pulse, 6.0 + 5.0 * pulse)])
+                            },
+                        ),
+                )
+                .child(button)
+                .into_any_element();
+        }
         // A ping when it acts, from a click or the keyboard alike: a ring of
         // the accent that swells out and fades.
         let (pinged, generation) = self.ping;

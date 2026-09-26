@@ -6,7 +6,7 @@
 //! key, or switching to another app closes it; that click does nothing
 //! else.
 
-use std::{cell::Cell, cell::RefCell, ptr::NonNull, rc::Rc, sync::OnceLock};
+use std::{cell::Cell, cell::RefCell, ptr::NonNull, rc::Rc};
 
 use async_channel::{Receiver, Sender};
 use block2::RcBlock;
@@ -14,10 +14,7 @@ use gpui::{
     App, Bounds, Context, Point, Render, Task, Window, WindowBounds, WindowKind, WindowOptions,
     div, prelude::*, px, size,
 };
-use objc2::{
-    rc::Retained,
-    runtime::{AnyClass, AnyObject, Bool, ClassBuilder, ProtocolObject, Sel},
-};
+use objc2::{rc::Retained, runtime::{AnyObject, ProtocolObject}};
 use objc2_app_kit::{NSEvent, NSEventMask, NSEventType};
 use objc2_foundation::{NSNotificationCenter, NSObjectProtocol};
 use vampir::{ControlHost, ControlState, Palette, ui_font};
@@ -63,8 +60,6 @@ struct Menu {
     // Each level stores the first index after its parent row. Native menu
     // numbering included submenu rows and separators, so keep that scheme.
     levels: Vec<(Vec<MenuEntry>, usize)>,
-    /// How many levels are showing, for the watch's Escape.
-    depth: Rc<Cell<usize>>,
     answer: Sender<Option<usize>>,
     ns_window: usize,
     watch: Option<Watch>,
@@ -99,36 +94,6 @@ fn height_of(entries: &[MenuEntry], nested: bool) -> f32 {
         .sum();
     let back = if nested { ROW_HEIGHT } else { 0.0 };
     (rows + back + 2.0 * PADDING).min(MAX_HEIGHT)
-}
-
-/// GPUI's panel class allows itself to become key and main on a mouse press.
-/// A menu has no text input; taking either role blurs the browser's WebView
-/// or address field, even when the panel gives the keyboard back on close.
-fn keep_browser_focused(panel: &objc2_app_kit::NSPanel) {
-    static CLASS: OnceLock<&'static AnyClass> = OnceLock::new();
-    extern "C" fn no(_this: &AnyObject, _cmd: Sel) -> Bool {
-        Bool::NO
-    }
-    let class = CLASS.get_or_init(|| {
-        let mut builder = ClassBuilder::new(c"VamprowserMenuPanel", panel.class())
-            .expect("menu panel class is registered only once");
-        // SAFETY: Both inherited selectors return Objective-C BOOL and the
-        // subclass adds no ivars, so an existing GPUI panel can use it.
-        unsafe {
-            builder.add_method(
-                objc2::sel!(canBecomeKeyWindow),
-                no as extern "C" fn(_, _) -> _,
-            );
-            builder.add_method(
-                objc2::sel!(canBecomeMainWindow),
-                no as extern "C" fn(_, _) -> _,
-            );
-        }
-        builder.register()
-    });
-    // SAFETY: This is a subclass of the panel's original class with the
-    // same instance layout. Only this menu's panel changes class.
-    unsafe { AnyObject::set_class(panel, class) };
 }
 
 /// Takes the menu window off the screen at once, before GPUI gets round to
@@ -254,44 +219,44 @@ impl Menu {
         unsafe { NSNotificationCenter::defaultCenter().removeObserver(ProtocolObject::as_ref(&*watch.resign)) };
     }
 
-    /// Shows another level, the window taking its height with its top
-    /// where it was.
-    fn show_level(&mut self, entries: Vec<MenuEntry>, base: usize, cx: &mut Context<Self>) {
+    /// Opens a correctly sized popup for the next menu level.
+    fn show_level(
+        &mut self,
+        entries: Vec<MenuEntry>,
+        base: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.levels.push((entries, base));
-        self.depth.set(self.levels.len());
-        self.fit();
-        cx.notify();
+        self.reopen(window, cx);
     }
 
-    fn back(&mut self, cx: &mut Context<Self>) {
+    fn back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.levels.len() > 1 {
             self.levels.pop();
-            self.depth.set(self.levels.len());
-            self.fit();
-            cx.notify();
+            self.reopen(window, cx);
         }
     }
 
-    fn fit(&self) {
-        if self.ns_window == 0 {
-            return;
-        }
-        let Some((entries, _)) = self.levels.last() else {
-            return;
-        };
-        let height = f64::from(height_of(entries, self.levels.len() > 1));
-        // SAFETY: the menu's own window, open while the menu is.
-        let window = unsafe { &*(self.ns_window as *const objc2_app_kit::NSWindow) };
-        let mut frame = window.frame();
-        let top = frame.origin.y + frame.size.height;
-        frame.size.height = height;
-        frame.origin.y = top - height;
-        // Growing past the bottom of the screen, it moves up instead.
-        if let Some(screen) = window.screen() {
-            let visible = screen.visibleFrame();
-            frame.origin.y = frame.origin.y.max(visible.origin.y);
-        }
-        window.setFrame_display(frame, true);
+    fn reopen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let origin = window.bounds().origin;
+        let screen = window.display(cx).map(|display| display.bounds());
+        let levels = self.levels.clone();
+        let answer = self.answer.clone();
+        let palette = self.palette;
+        self.done = true;
+        self.stop_watching();
+        OPEN.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot.as_ref().is_some_and(|open| open.ns_window == self.ns_window) {
+                if let Some(open) = slot.take() {
+                    open.dismissed.set(true);
+                }
+            }
+        });
+        hide(self.ns_window);
+        window.remove_window();
+        cx.defer(move |cx| open_level(cx, origin, screen, levels, answer, palette));
     }
 }
 
@@ -365,8 +330,8 @@ impl Render for Menu {
                             .rounded(px(5.0))
                             .cursor_pointer()
                             .hover(move |style| style.bg(palette.soft_fill))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.show_level(entries.clone(), index + 1, cx);
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.show_level(entries.clone(), index + 1, window, cx);
                             }))
                             .child(div().w(px(14.0)))
                             .child(div().flex_1().min_w(px(0.0)).truncate().child(label))
@@ -389,7 +354,7 @@ impl Render for Menu {
             .on_action(
                 cx.listener(|this, _: &vampir::keyboard::Dismiss, window, cx| {
                     if this.levels.len() > 1 {
-                        this.back(cx);
+                        this.back(window, cx);
                     } else {
                         this.finish(None, window);
                     }
@@ -408,7 +373,7 @@ impl Render for Menu {
                         .cursor_pointer()
                         .hover(move |style| style.bg(palette.soft_fill))
                         .child("‹  Back")
-                        .on_click(cx.listener(|this, _, _, cx| this.back(cx))),
+                        .on_click(cx.listener(|this, _, window, cx| this.back(window, cx))),
                 )
             })
             .children(rows)
@@ -425,10 +390,29 @@ pub(crate) fn open(
     // One menu at a time.
     dismiss_open();
     let (sender, receiver) = async_channel::bounded(1);
-    let height = height_of(&entries, false);
-    let mut origin = window.bounds().origin + position;
-    if let Some(display) = window.display(cx) {
-        let screen = display.bounds();
+    open_level(
+        cx,
+        window.bounds().origin + position,
+        window.display(cx).map(|display| display.bounds()),
+        vec![(entries, 0)],
+        sender,
+        palette,
+    );
+    receiver
+}
+
+fn open_level(
+    cx: &mut App,
+    mut origin: Point<gpui::Pixels>,
+    screen: Option<Bounds<gpui::Pixels>>,
+    levels: Vec<(Vec<MenuEntry>, usize)>,
+    answer: Sender<Option<usize>>,
+    palette: Palette,
+) {
+    let height = levels
+        .last()
+        .map_or(2.0 * PADDING, |(entries, _)| height_of(entries, levels.len() > 1));
+    if let Some(screen) = screen {
         origin.x = origin
             .x
             .min(screen.origin.x + screen.size.width - px(WIDTH))
@@ -454,14 +438,9 @@ pub(crate) fn open(
     };
     let _ = cx.open_window(options, move |window, cx| {
         let (ns_window, _) = crate::ns_window_of(window);
-        if ns_window != 0 {
-            // SAFETY: GPUI makes pop-ups as NSPanels; the window is live.
-            let panel = unsafe { &*(ns_window as *const objc2_app_kit::NSPanel) };
-            keep_browser_focused(panel);
-        }
         let (dismiss, signals) = async_channel::unbounded();
         let dismissed = Rc::new(Cell::new(false));
-        let depth = Rc::new(Cell::new(1));
+        let depth = Rc::new(Cell::new(levels.len()));
         let watch = watch(ns_window, dismiss.clone(), dismissed.clone(), depth.clone());
         OPEN.with(|slot| {
             *slot.borrow_mut() = Some(OpenMenu {
@@ -473,9 +452,8 @@ pub(crate) fn open(
         let menu = cx.new(|_| Menu {
             controls: ControlState::default(),
             palette,
-            levels: vec![(entries, 0)],
-            depth,
-            answer: sender,
+            levels,
+            answer,
             ns_window,
             watch: Some(watch),
             done: false,
@@ -487,7 +465,7 @@ pub(crate) fn open(
                     let closing = matches!(signal, Signal::Close);
                     let _ = this.update_in(cx, |menu, window, cx| match signal {
                         Signal::Close => menu.finish(None, window),
-                        Signal::Back => menu.back(cx),
+                        Signal::Back => menu.back(window, cx),
                     });
                     if closing {
                         break;
@@ -497,7 +475,6 @@ pub(crate) fn open(
         });
         menu
     });
-    receiver
 }
 
 #[cfg(test)]

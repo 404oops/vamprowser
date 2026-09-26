@@ -5,7 +5,7 @@
 use gpui::{ClipboardItem, Context, Pixels, Point, Window};
 
 use crate::{
-    Browser, Page, PingTarget, TabTarget,
+    Browser, Page, PingTarget, TabTarget, media,
     native::MenuEntry,
     settings::{StartSection, ToolbarItem},
 };
@@ -60,7 +60,9 @@ impl Section {
     }
 
     pub fn from_slug(slug: &str) -> Option<Section> {
-        Section::ALL.into_iter().find(|s| s.slug().eq_ignore_ascii_case(slug))
+        Section::ALL
+            .into_iter()
+            .find(|s| s.slug().eq_ignore_ascii_case(slug))
     }
 
     pub fn label(self) -> &'static str {
@@ -183,6 +185,8 @@ pub enum Command {
     ExtensionAction(String),
     InstallExtension,
     ShowDownloads,
+    InspectMedia,
+    DownloadMedia(String, std::sync::Arc<media::Info>, media::Choice, bool),
     OpenDownload(u64),
     RevealDownload(u64),
     RemoveDownload(u64),
@@ -253,6 +257,7 @@ impl Command {
             Command::ZoomReset => "Actual Size",
             Command::Print => "Print…",
             Command::ShowDownloads => "Show Downloads",
+            Command::InspectMedia => "Download Media…",
             Command::Home => "Go Home",
             Command::MakeDefaultBrowser => "Make Vamprowser the Default Browser",
             _ => return None,
@@ -399,6 +404,7 @@ fn ping_for_command(command: &Command, web: bool) -> Option<PingTarget> {
         Command::ToggleVerticalTabs => Some(PingTarget::Toolbar(ToolbarItem::Sidebar)),
         Command::SwitchTabs => Some(PingTarget::Toolbar(ToolbarItem::CommandPalette)),
         Command::ShowDownloads => Some(PingTarget::Toolbar(ToolbarItem::Downloads)),
+        Command::InspectMedia => Some(PingTarget::Toolbar(ToolbarItem::Media)),
         Command::Settings(_) => Some(PingTarget::Toolbar(ToolbarItem::Settings)),
         Command::CopyLink if web => Some(PingTarget::CopyLink),
         Command::CopyCleanLink | Command::CopyMarkdownLink if web => Some(PingTarget::Omnibox),
@@ -435,8 +441,10 @@ impl Browser {
         if pinged.is_some() {
             self.ping = (pinged, self.ping.1 + 1);
             // The bar starts at once, before WebKit reports anything.
-            if matches!(command, Command::Back | Command::Forward | Command::Reload | Command::EraseCacheAndReload)
-                && self.current().page == Page::Web
+            if matches!(
+                command,
+                Command::Back | Command::Forward | Command::Reload | Command::EraseCacheAndReload
+            ) && self.current().page == Page::Web
             {
                 let index = self.selected;
                 self.tabs[index].loading = Some((std::time::Instant::now(), None));
@@ -708,6 +716,39 @@ impl Browser {
                 cx,
             ),
             Command::ShowDownloads => self.open_page(Page::Downloads, window, cx),
+            Command::InspectMedia => {
+                let tab = self.current();
+                if tab.page == Page::Web {
+                    let (id, url) = (tab.id, tab.url.clone());
+                    let position = window.mouse_position();
+                    let sender = self.sender.clone();
+                    self.media_inspection_serial += 1;
+                    let serial = self.media_inspection_serial;
+                    self.media_inspecting = Some(serial);
+                    cx.notify();
+                    std::thread::spawn(move || {
+                        let result = media::inspect(&url);
+                        let _ = sender.try_send(crate::BrowserEvent::MediaInspected(serial, id, url, position, result));
+                    });
+                }
+            }
+            Command::DownloadMedia(url, info, choice, private) => {
+                let destination = match media::destination(&self.settings.download_dir(), &info, &choice) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        let _ = crate::app_dialog::open(cx, self.controls.palette(), "Couldn't create download folder", error, "OK", crate::app_dialog::Kind::Alert);
+                        return;
+                    }
+                };
+                let id = self.downloads().started(url.clone(), destination.clone(), private);
+                self.refresh_other_windows(cx);
+                cx.notify();
+                let sender = self.sender.clone();
+                std::thread::spawn(move || {
+                    let result = media::download(&url, &destination, &choice);
+                    let _ = sender.try_send(crate::BrowserEvent::MediaFinished(id, result));
+                });
+            }
             Command::ApplyRules => {
                 self.apply_rules_everywhere(cx);
                 self.release_waiting_loads();
@@ -744,7 +785,8 @@ impl Browser {
         cx: &mut Context<Self>,
     ) {
         let entries: Vec<MenuEntry> = items.iter().map(|(entry, _)| entry.clone()).collect();
-        let receiver = crate::app_menu::open(cx, window, position, entries, self.controls.palette());
+        let receiver =
+            crate::app_menu::open(cx, window, position, entries, self.controls.palette());
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Some(chosen)) = receiver.recv().await else {
                 return;
@@ -769,7 +811,11 @@ impl Browser {
         cx: &mut Context<Self>,
     ) {
         let receiver = crate::app_dialog::open(
-            cx, self.controls.palette(), title, message, "OK",
+            cx,
+            self.controls.palette(),
+            title,
+            message,
+            "OK",
             crate::app_dialog::Kind::Prompt(initial),
         );
         cx.spawn(async move |this, cx| {
@@ -911,8 +957,14 @@ impl Browser {
             ),
             (MenuEntry::Separator, None),
             match self.bookmarks().find_url(&tab.url) {
-                Some(id) => (entry("Delete Bookmark", web), Some(Command::DeleteBookmark(id))),
-                None => (entry("Bookmark This Page", web), Some(Command::BookmarkPage)),
+                Some(id) => (
+                    entry("Delete Bookmark", web),
+                    Some(Command::DeleteBookmark(id)),
+                ),
+                None => (
+                    entry("Bookmark This Page", web),
+                    Some(Command::BookmarkPage),
+                ),
             },
             (
                 MenuEntry::item("Settings: Search Engine…"),
@@ -923,12 +975,86 @@ impl Browser {
 
     /// What a toolbar button's own menu offers: only what that button
     /// does, and for most, nothing.
+    pub(crate) fn media_menu(
+        &self,
+        url: &str,
+        info: media::Info,
+    ) -> Vec<(MenuEntry, Option<Command>)> {
+        let info = std::sync::Arc::new(info);
+        let private = self.current().private;
+        let make = |label: String, choice: media::Choice| {
+            (
+                MenuEntry::item(label),
+                Some(Command::DownloadMedia(url.to_owned(), info.clone(), choice, private)),
+            )
+        };
+        let mut items = vec![make(
+            "Download bundle (folder)".into(),
+            media::Choice::Bundle,
+        )];
+        if info.description.is_some() {
+            items.push(make("Description only".into(), media::Choice::Description));
+        }
+        let videos: Vec<_> = info
+            .formats
+            .iter()
+            .filter(|format| format.is_video())
+            .map(|format| {
+                make(
+                    format.label(),
+                    media::Choice::Format(format.format_id.clone()),
+                )
+            })
+            .collect();
+        let audios: Vec<_> = info
+            .formats
+            .iter()
+            .filter(|format| format.is_audio())
+            .map(|format| {
+                make(
+                    format.label(),
+                    media::Choice::Format(format.format_id.clone()),
+                )
+            })
+            .collect();
+        if videos.is_empty() {
+            items.push((MenuEntry::disabled("No video formats"), None));
+        } else {
+            items.push(submenu("Video formats", videos));
+        }
+        if audios.is_empty() {
+            items.push((MenuEntry::disabled("No separate audio formats"), None));
+        } else {
+            items.push(submenu("Audio formats", audios));
+        }
+        let mut subtitles = Vec::new();
+        for lang in info.subtitles.keys() {
+            subtitles.push(make(
+                lang.clone(),
+                media::Choice::Subtitle(lang.clone(), false),
+            ));
+        }
+        for lang in info.automatic_captions.keys() {
+            subtitles.push(make(
+                format!("{lang} (automatic)"),
+                media::Choice::Subtitle(lang.clone(), true),
+            ));
+        }
+        if !subtitles.is_empty() {
+            items.push(submenu("Subtitles", subtitles));
+        }
+        items
+    }
+
     pub(crate) fn toolbar_item_menu(&self, item: ToolbarItem) -> Vec<(MenuEntry, Option<Command>)> {
         let web = self.current().page == Page::Web;
         match item {
             ToolbarItem::Reload => vec![
                 (entry("Reload Page", web), Some(Command::Reload)),
-                (entry("Erase Cache and Reload", web), Some(Command::EraseCacheAndReload)),
+                (
+                    entry("Erase Cache and Reload", web),
+                    Some(Command::EraseCacheAndReload),
+                ),
             ],
             _ => Vec::new(),
         }
@@ -989,11 +1115,23 @@ mod tests {
 
     #[test]
     fn commands_ping_the_matching_controls() {
-        assert_eq!(ping_for_command(&Command::Back, true), Some(PingTarget::Toolbar(ToolbarItem::Back)));
-        assert_eq!(ping_for_command(&Command::Forward, true), Some(PingTarget::Toolbar(ToolbarItem::Forward)));
-        assert_eq!(ping_for_command(&Command::BookmarkPage, true), Some(PingTarget::BookmarkPage));
+        assert_eq!(
+            ping_for_command(&Command::Back, true),
+            Some(PingTarget::Toolbar(ToolbarItem::Back))
+        );
+        assert_eq!(
+            ping_for_command(&Command::Forward, true),
+            Some(PingTarget::Toolbar(ToolbarItem::Forward))
+        );
+        assert_eq!(
+            ping_for_command(&Command::BookmarkPage, true),
+            Some(PingTarget::BookmarkPage)
+        );
         assert_eq!(ping_for_command(&Command::BookmarkPage, false), None);
-        assert_eq!(ping_for_command(&Command::CopyLink, true), Some(PingTarget::CopyLink));
+        assert_eq!(
+            ping_for_command(&Command::CopyLink, true),
+            Some(PingTarget::CopyLink)
+        );
         assert!(PingTarget::CopyLink.omnibox());
         assert!(PingTarget::CopyLink.toolbar(ToolbarItem::CopyLink));
         assert_eq!(ping_for_command(&Command::CopyLink, false), None);
@@ -1020,16 +1158,28 @@ pub(crate) fn open_entries(url: &str) -> Vec<(MenuEntry, Option<Command>)> {
     vec![
         (MenuEntry::item("Open"), open(Place::Here)),
         (MenuEntry::item("Open in New Tab"), open(Place::NewTab)),
-        (MenuEntry::item("Open in Background Tab"), open(Place::BackgroundTab)),
-        (MenuEntry::item("Open in Private Tab"), open(Place::PrivateTab)),
+        (
+            MenuEntry::item("Open in Background Tab"),
+            open(Place::BackgroundTab),
+        ),
+        (
+            MenuEntry::item("Open in Private Tab"),
+            open(Place::PrivateTab),
+        ),
         (MenuEntry::Separator, None),
-        (MenuEntry::item("Copy Link"), Some(Command::Copy(url.to_owned()))),
+        (
+            MenuEntry::item("Copy Link"),
+            Some(Command::Copy(url.to_owned())),
+        ),
     ]
 }
 
 /// A row that opens another menu of `items`. Its entries' commands ride
 /// along in [`Command::Submenu`], in the order the popup numbers them.
-pub(crate) fn submenu(label: impl Into<String>, items: Vec<(MenuEntry, Option<Command>)>) -> (MenuEntry, Option<Command>) {
+pub(crate) fn submenu(
+    label: impl Into<String>,
+    items: Vec<(MenuEntry, Option<Command>)>,
+) -> (MenuEntry, Option<Command>) {
     let entries = items.iter().map(|(entry, _)| entry.clone()).collect();
     (
         MenuEntry::Submenu {

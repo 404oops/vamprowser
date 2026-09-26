@@ -3,13 +3,15 @@
 //! bottom of the window, as old Chrome had it.
 
 use std::{
+    path::PathBuf,
     sync::{Arc, LazyLock, Mutex, PoisonError},
     time::Duration,
 };
 
 use gpui::{
-    Animation, AnimationExt, AnyElement, Context, Div, Entity, FontWeight, MouseButton,
-    MouseDownEvent, SharedString, Stateful, Window, div, img, prelude::*, px,
+    Animation, AnimationExt, AnyElement, Context, Div, Entity, ExternalDragPayload,
+    FileDragPaths, FontWeight, MouseButton, MouseDownEvent, Render, SharedString, Stateful, Window,
+    div, img, prelude::*, px,
 };
 use vampir::{ButtonVariant, Palette, TextInput, WidgetContext, color, lighting};
 
@@ -47,6 +49,27 @@ const INTENSITIES: [(f64, &str); 3] = [(0.6, "Subtle"), (1.0, "Normal"), (1.6, "
 const SWATCH_HUES: [f64; 12] = [
     0.0, 30.0, 60.0, 95.0, 130.0, 165.0, 200.0, 235.0, 268.0, 295.0, 325.0, 350.0,
 ];
+
+struct DraggedDownload {
+    name: SharedString,
+    palette: Palette,
+}
+
+impl Render for DraggedDownload {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px(px(10.0))
+            .py(px(5.0))
+            .rounded(px(7.0))
+            .bg(Chrome::new(self.palette).raised)
+            .border_1()
+            .border_color(self.palette.accent)
+            .shadow(lighting::raised(self.palette.is_dark))
+            .text_size(px(12.5))
+            .text_color(self.palette.text_primary)
+            .child(self.name.clone())
+    }
+}
 
 impl SettingsInputs {
     /// The text field behind a settings field.
@@ -2160,6 +2183,26 @@ impl Browser {
             .into_any_element()
     }
 
+    /// Offer a finished download to macOS as a file when its drag leaves
+    /// the window. Check the path then, since a file may have moved since
+    /// the download was drawn.
+    fn draggable_download(row: Stateful<Div>, path: PathBuf, palette: Palette) -> Stateful<Div> {
+        let name: SharedString = path.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string_lossy().into_owned())
+            .into();
+        row.on_drag(path, move |_, _, _, cx| {
+            cx.new(|_| DraggedDownload { name: name.clone(), palette })
+        })
+            .external_drag_payload(|path: &PathBuf, _, _| {
+                let metadata = std::fs::metadata(path).ok()?;
+                Some(ExternalDragPayload::Files(FileDragPaths::new([(
+                    path.clone(),
+                    metadata.is_dir(),
+                )])))
+            })
+    }
+
     /// The shelf along the bottom of the window, as old Chrome had it:
     /// recent downloads, newest first, with "Show all" and a close button.
     pub(crate) fn download_shelf(
@@ -2205,6 +2248,9 @@ impl Browser {
                     .border_color(color::with_alpha(chrome.line, 0.8))
                     .cursor_pointer()
                     .hover(move |s| s.bg(palette.soft_fill))
+                    .when(item.state == DownloadState::Done, |row| {
+                        Self::draggable_download(row, item.path.clone(), palette)
+                    })
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.run(Command::OpenDownload(id), window, cx)
                     }))
@@ -2392,6 +2438,9 @@ impl Browser {
                     .flex_row()
                     .items_center()
                     .gap(px(14.0))
+                    .when(item.state == DownloadState::Done, |row| {
+                        Self::draggable_download(row, item.path.clone(), palette)
+                    })
                     .on_mouse_down(
                         MouseButton::Right,
                         cx.listener(move |this, event: &MouseDownEvent, window, cx| {
