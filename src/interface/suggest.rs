@@ -92,12 +92,17 @@ fn field_score(word: &str, field: &str) -> Option<i32> {
     vampir::fuzzy_score(word, &field).map(|score| (35 + score).clamp(1, 65))
 }
 
-fn page_score(query: &str, title: &str, url: &str) -> Option<i32> {
+pub(crate) fn page_score(query: &str, title: &str, url: &str) -> Option<i32> {
     query.split_whitespace().try_fold(0, |total, word| {
         let title = field_score(word, title);
         let address = field_score(word, bare(url)).map(|score| score - 8);
         Some(total + title.into_iter().chain(address).max()?)
     })
+}
+
+/// Shared ordering for page matches in the address field and tab switcher.
+pub(crate) fn page_rank(score: i32, bookmark: bool, visits: u32, recent: u64) -> (i32, bool, u32, u64) {
+    (score, bookmark, visits, recent)
 }
 
 /// Byte ranges to emphasize in a suggestion. Prefer a whole substring; for
@@ -303,10 +308,7 @@ impl Browser {
                 }
             }
         }
-        found.sort_by(|a, b| b.score.cmp(&a.score)
-            .then(b.bookmark.cmp(&a.bookmark))
-            .then(b.visits.cmp(&a.visits))
-            .then(b.recent.cmp(&a.recent)));
+        found.sort_by_key(|item| std::cmp::Reverse(page_rank(item.score, item.bookmark, item.visits, item.recent)));
         let bookmarked = |url: &str| found.iter().any(|f| f.url == url && f.bookmark);
 
         // Completing: a single word the start of an address, finishing at

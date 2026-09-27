@@ -3,7 +3,10 @@
 //! page with a still of it, because GPUI can't draw over a live WebKit
 //! view; the live view comes back when the switcher closes.
 
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use gpui::{
     AnyElement, Context, Image, ImageFormat, MouseButton, SharedString, Window, div, img,
@@ -18,6 +21,7 @@ use crate::{
     history,
     icons::{Icon, icon},
     native, site_icon, text_input,
+    suggest::{page_rank, page_score},
 };
 
 /// What a row does when chosen.
@@ -37,6 +41,14 @@ struct Row {
     /// The address its icon comes from, if it has a site.
     url: Option<String>,
     glyph: Icon,
+}
+
+struct RankedPage {
+    row: Row,
+    score: i32,
+    bookmark: bool,
+    visits: u32,
+    recent: u64,
 }
 
 const MAX_ROWS: usize = 12;
@@ -246,41 +258,77 @@ impl Browser {
             });
         }
         if !query.is_empty() {
+            let mut pages: Vec<RankedPage> = Vec::new();
+            let mut at: HashMap<&str, usize> = HashMap::new();
             for (bookmark, path) in bookmarks.links_with_paths() {
                 let Some(url) = bookmark.url.as_deref() else {
                     continue;
                 };
-                if seen.contains(url) || !matches(&bookmark.title, url) {
+                let Some(score) = page_score(&lower, &bookmark.title, url) else {
+                    continue;
+                };
+                if seen.contains(url) || at.contains_key(url) {
                     continue;
                 }
-                seen.insert(url);
-                rows.push(Row {
-                    choice: Choice::Link(url.to_owned()),
-                    title: bookmark.title.clone(),
-                    // Where it's filed, if not on the bar.
-                    detail: if path.is_empty() { url.to_owned() } else { format!("{path} — {url}") },
-                    kind: "Bookmark",
-                    url: Some(url.to_owned()),
-                    glyph: Icon::Bookmark,
-                });
-            }
-            for visit in history.search(query, 8) {
-                if !seen.insert(&visit.url) {
-                    continue;
-                }
-                rows.push(Row {
-                    choice: Choice::Link(visit.url.clone()),
-                    title: if visit.title.is_empty() {
-                        visit.url.clone()
-                    } else {
-                        visit.title.clone()
+                at.insert(url, pages.len());
+                pages.push(RankedPage {
+                    row: Row {
+                        choice: Choice::Link(url.to_owned()),
+                        title: bookmark.title.clone(),
+                        // Where it's filed, if not on the bar.
+                        detail: if path.is_empty() { url.to_owned() } else { format!("{path} — {url}") },
+                        kind: "Bookmark",
+                        url: Some(url.to_owned()),
+                        glyph: Icon::Bookmark,
                     },
-                    detail: visit.url.clone(),
-                    kind: "History",
-                    url: Some(visit.url.clone()),
-                    glyph: Icon::File,
+                    score,
+                    bookmark: true,
+                    visits: 0,
+                    recent: 0,
                 });
             }
+            for visit in history.recent(usize::MAX) {
+                let Some(score) = page_score(&lower, &visit.title, &visit.url) else {
+                    continue;
+                };
+                if seen.contains(visit.url.as_str()) {
+                    continue;
+                }
+                if let Some(&index) = at.get(visit.url.as_str()) {
+                    let page = &mut pages[index];
+                    if score > page.score {
+                        page.score = score;
+                        page.row.title = visit.title.clone();
+                    }
+                    page.visits = visit.visits;
+                    page.recent = visit.last_visit;
+                } else {
+                    at.insert(&visit.url, pages.len());
+                    pages.push(RankedPage {
+                        row: Row {
+                            choice: Choice::Link(visit.url.clone()),
+                            title: if visit.title.is_empty() { visit.url.clone() } else { visit.title.clone() },
+                            detail: visit.url.clone(),
+                            kind: "History",
+                            url: Some(visit.url.clone()),
+                            glyph: Icon::File,
+                        },
+                        score,
+                        bookmark: false,
+                        visits: visit.visits,
+                        recent: visit.last_visit,
+                    });
+                }
+            }
+            pages.sort_by_key(|page| {
+                std::cmp::Reverse(page_rank(page.score, page.bookmark, page.visits, page.recent))
+            });
+            rows.extend(
+                pages
+                    .into_iter()
+                    .take((MAX_ROWS - 1).saturating_sub(rows.len()))
+                    .map(|page| page.row),
+            );
             for command in Command::palette() {
                 if let Some(label) = command.palette_label()
                     && history::matches_words(&label.to_lowercase(), &words)
