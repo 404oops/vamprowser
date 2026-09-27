@@ -1,11 +1,11 @@
 #!/bin/zsh
 # Builds a release Vamprowser.app and packs it into a drag-to-install disk
-# image: dist/Vamprowser-<version>.dmg.
+# image: dist/Vamprowser-<version>-macos-<architecture>.dmg.
 set -euo pipefail
 cd "${0:A:h:h:h}"
 packaging/macos/bundle.sh release
 version=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" packaging/macos/Info.plist)
-dmg="dist/Vamprowser-$version.dmg"
+dmg="dist/Vamprowser-$version-macos-$(uname -m).dmg"
 staging=$(mktemp -d)
 trap 'rm -rf "$staging"' EXIT
 cp -R dist/Vamprowser.app "$staging/"

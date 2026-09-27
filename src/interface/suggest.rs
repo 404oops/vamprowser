@@ -4,10 +4,10 @@
 //! searches: what you typed, and your search engine's suggestions. Like the tab switcher, the list covers the page with a still
 //! of it, because GPUI can't draw over a live WebKit view.
 
-use std::{collections::HashMap, ops::Range, sync::Arc};
+use std::{collections::HashMap, ops::Range, sync::Arc, time::Duration};
 
 use gpui::{
-    AnyElement, Bounds, Context, FontWeight, Image, ImageFormat, MouseButton, Pixels, SharedString, StyledText, Window,
+    Animation, AnimationExt, AnyElement, Bounds, Context, FontWeight, Image, ImageFormat, MouseButton, Pixels, SharedString, StyledText, Window,
     div, img, prelude::*, px,
 };
 use unicode_segmentation::UnicodeSegmentation;
@@ -811,7 +811,13 @@ impl Browser {
                         .border_color(color::with_alpha(palette.field_border_strong, 0.5))
                         .shadow(lighting::panel(palette.is_dark))
                         .overflow_hidden()
-                        .child(list),
+                        .child(list)
+                        .with_animation(
+                            "suggestions-enter",
+                            Animation::new(crate::slowed(Duration::from_millis(160)))
+                                .with_easing(|t: f32| 1.0 - (1.0 - t).powi(3)),
+                            |panel, t| panel.opacity(t).mt(px(5.0 * (1.0 - t))),
+                        ),
                 )
                 .into_any_element(),
         )

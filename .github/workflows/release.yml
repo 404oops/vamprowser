@@ -1,0 +1,73 @@
+name: macOS arm64
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    permissions:
+      contents: read
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Check version and architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          rustc -vV | grep -q 'host: aarch64-apple-darwin'
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          plist_version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' packaging/macos/Info.plist)
+          test "$version" = "$plist_version"
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            test "$GITHUB_REF_NAME" = "v$version"
+          fi
+      - name: Build app and DMG
+        run: packaging/macos/dmg.sh
+      - name: Verify arm64 binary and package assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(lipo -archs dist/Vamprowser.app/Contents/MacOS/vamprowser)" = arm64
+          codesign --verify --deep --strict dist/Vamprowser.app
+          version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' dist/Vamprowser.app/Contents/Info.plist)
+          ditto -c -k --keepParent dist/Vamprowser.app "dist/Vamprowser-${version}-macos-arm64.app.zip"
+          (cd dist && shasum -a 256 "Vamprowser-${version}-macos-arm64.dmg" "Vamprowser-${version}-macos-arm64.app.zip" > SHA256SUMS.txt)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vamprowser-macos-arm64
+          path: |
+            dist/*.dmg
+            dist/*.app.zip
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: vamprowser-macos-arm64
+          path: dist
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/*.dmg dist/*.app.zip dist/SHA256SUMS.txt \
+            --verify-tag --title "Vamprowser ${GITHUB_REF_NAME#v}" --generate-notes

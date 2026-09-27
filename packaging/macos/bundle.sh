@@ -7,9 +7,9 @@ if [[ "$mode" != release && "$mode" != debug ]]; then
   exit 2
 fi
 if [[ "$mode" == release ]]; then
-  cargo build --release
+  cargo build --release --locked
 else
-  cargo build
+  cargo build --locked
 fi
 app="dist/Vamprowser.app"
 rm -rf "$app"

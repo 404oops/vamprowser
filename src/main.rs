@@ -6134,6 +6134,10 @@ impl Render for Browser {
                     .w_full()
                     .flex_none()
                     .overflow_hidden()
+                    .flex()
+                    .flex_col()
+                    .justify_end()
+                    .opacity(shelf_height / SHELF_HEIGHT)
                     .child(self.download_shelf(palette, cx)),
             );
         }

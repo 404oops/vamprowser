@@ -1,9 +1,9 @@
 //! Folders on the bookmarks bar open as menus over browser pages.
 
-use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
+use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc, time::Duration};
 
 use gpui::{
-    AnyElement, Bounds, Context, Image, ImageFormat, MouseButton, Pixels, SharedString, Window,
+    Animation, AnimationExt, AnyElement, Bounds, Context, Image, ImageFormat, MouseButton, Pixels, SharedString, Window,
     canvas, div, img, prelude::*, px,
 };
 use vampir::{Palette, color, lighting};
@@ -315,7 +315,13 @@ impl Browser {
                     .border_color(color::with_alpha(palette.field_border_strong, 0.5))
                     .shadow(lighting::panel(palette.is_dark))
                     .text_size(px(13.0))
-                    .child(list),
+                    .child(list)
+                    .with_animation(
+                        ("bookmark-menu-enter", folder),
+                        Animation::new(crate::slowed(Duration::from_millis(160)))
+                            .with_easing(|t: f32| 1.0 - (1.0 - t).powi(3)),
+                        |panel, t| panel.opacity(t).mt(px(5.0 * (1.0 - t))),
+                    ),
             )
             .into_any_element()
     }

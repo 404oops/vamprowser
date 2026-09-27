@@ -6,12 +6,12 @@
 //! key, or switching to another app closes it; that click does nothing
 //! else.
 
-use std::{cell::Cell, cell::RefCell, ptr::NonNull, rc::Rc};
+use std::{cell::Cell, cell::RefCell, ptr::NonNull, rc::Rc, time::Duration};
 
 use async_channel::{Receiver, Sender};
 use block2::RcBlock;
 use gpui::{
-    App, Bounds, Context, DisplayId, Point, Render, Task, Window, WindowBounds, WindowKind,
+    Animation, AnimationExt, App, Bounds, Context, DisplayId, Point, Render, Task, Window, WindowBounds, WindowKind,
     WindowOptions, div, prelude::*, px, size,
 };
 use objc2::{rc::Retained, runtime::{AnyObject, ProtocolObject}};
@@ -377,6 +377,12 @@ impl Render for Menu {
                 )
             })
             .children(rows)
+            .with_animation(
+                ("menu-enter", self.levels.len()),
+                Animation::new(crate::slowed(Duration::from_millis(130)))
+                    .with_easing(|t: f32| 1.0 - (1.0 - t).powi(3)),
+                |menu, t| menu.opacity(t),
+            )
     }
 }
 

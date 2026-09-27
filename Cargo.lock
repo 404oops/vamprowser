@@ -6431,7 +6431,7 @@ dependencies = [
 
 [[package]]
 name = "vamprowser"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-channel",
  "block2 0.6.2",

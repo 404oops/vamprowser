@@ -16,7 +16,7 @@ use gpui::{
 use vampir::{ButtonVariant, Palette, TextInput, WidgetContext, color, lighting};
 
 use crate::{
-    Browser, Chrome, Page, SettingsInputs, WithHint,
+    Browser, Chrome, Page, SettingsInputs, WithHint, slowed,
     commands::{Command, Place, Section},
     downloads::DownloadState,
     history::Visit,
@@ -2176,7 +2176,7 @@ impl Browser {
                     .bg(palette.accent)
                     .with_animation(
                         id,
-                        Animation::new(Duration::from_millis(1100)).repeat(),
+                        Animation::new(slowed(Duration::from_millis(1100))).repeat(),
                         move |bar, t| bar.left(px(-width * 0.35 + t * width * 1.35)),
                     ),
             )
@@ -2240,7 +2240,7 @@ impl Browser {
                     .flex_none()
                     .flex()
                     .items_center()
-                    .gap(px(9.0))
+                    .gap(px(8.0))
                     .px(px(10.0))
                     .rounded(px(8.0))
                     .bg(chrome.raised)
@@ -2277,7 +2277,7 @@ impl Browser {
                             .flex()
                             .flex_col()
                             .justify_center()
-                            .gap(px(3.0))
+                            .gap(px(2.0))
                             .child(
                                 div()
                                     .truncate()
@@ -2287,21 +2287,53 @@ impl Browser {
                                     .child(SharedString::from(item.name())),
                             )
                             .child(if item.state == DownloadState::InProgress {
-                                Self::busy_bar(("shelf-busy", id), 150.0, palette)
+                                div()
+                                    .h(px(14.0))
+                                    .flex()
+                                    .items_center()
+                                    .child(Self::busy_bar(("shelf-busy", id), 150.0, palette))
+                                    .into_any_element()
                             } else {
                                 div()
+                                    .h(px(14.0))
                                     .text_size(px(11.0))
                                     .line_height(px(14.0))
                                     .text_color(palette.text_secondary)
                                     .child(status)
                                     .into_any_element()
                             }),
+                    )
+                    .child(
+                        div()
+                            .id(("shelf-item-menu", id))
+                            .w(px(20.0))
+                            .h(px(28.0))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(5.0))
+                            .cursor_pointer()
+                            .hover(move |button| button.bg(chrome.wash))
+                            .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                                cx.stop_propagation();
+                                let items = this.download_menu(id);
+                                this.context_menu(event.position(), items, window, cx);
+                            }))
+                            .child(icon(Icon::ChevronDown, 12.0, palette.text_secondary)),
+                    )
+                    .with_animation(
+                        ("shelf-item-enter", id),
+                        Animation::new(slowed(Duration::from_millis(220)))
+                            .with_easing(|t: f32| 1.0 - (1.0 - t).powi(3)),
+                        |row, t| row.opacity(t),
                     ),
             );
         }
         drop(downloads);
         div()
-            .size_full()
+            .w_full()
+            .h(px(crate::SHELF_HEIGHT))
             .flex()
             .items_center()
             .gap(px(10.0))
