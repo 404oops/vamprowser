@@ -5933,7 +5933,15 @@ impl Render for Browser {
         }
         let page_hold = self.page_hold.clone();
         let content: AnyElement = if self.palette.is_some() && self.current().page == Page::Web {
-            self.palette_overlay(palette, window, cx)
+            let snapshot = self.palette.as_ref().and_then(|state| state.snapshot.clone());
+            div()
+                .relative()
+                .size_full()
+                .bg(palette.backdrop)
+                .when_some(snapshot, |el, image| {
+                    el.child(img(image).absolute().top_0().left_0().size_full())
+                })
+                .into_any_element()
         } else {
             let page = match self.current().page {
                 Page::Web => {
@@ -5999,16 +6007,7 @@ impl Render for Browser {
                 Page::Downloads => self.downloads_page(palette, cx),
                 Page::Bookmarks => self.bookmarks_page(palette, cx),
             };
-            if self.palette.is_some() {
-                div()
-                    .relative()
-                    .size_full()
-                    .child(page)
-                    .child(self.palette_overlay(palette, window, cx))
-                    .into_any_element()
-            } else {
-                page
-            }
+            page
         };
         let progress = self.progress;
         // The find bar above the page, which gives it the room.
@@ -6140,6 +6139,9 @@ impl Render for Browser {
                     .opacity(shelf_height / SHELF_HEIGHT)
                     .child(self.download_shelf(palette, cx)),
             );
+        }
+        if self.palette.is_some() {
+            root = root.child(self.palette_overlay(palette, window, cx));
         }
         // The hue gliding to a new tab's colour, the scheme following the
         // desktop, the scroll fades and the tab animations all need frames

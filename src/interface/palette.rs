@@ -9,7 +9,7 @@ use std::{
 };
 
 use gpui::{
-    AnyElement, Context, Image, ImageFormat, MouseButton, SharedString, Window, div, img,
+    AnyElement, Context, Image, ImageFormat, MouseButton, SharedString, Window, div,
     prelude::*, px,
 };
 use vampir::{Palette, color, lighting};
@@ -392,7 +392,6 @@ impl Browser {
         };
         let presence = Self::palette_presence(state);
         let highlight = state.highlight.min(rows.len().saturating_sub(1));
-        let snapshot = state.snapshot.clone();
         let input = state.input.clone();
         let caret = self.caret_color(palette.accent);
         input.update(cx, |input, _| {
@@ -518,10 +517,6 @@ impl Browser {
             .size_full()
             .relative()
             .overflow_hidden()
-            .when(self.current().page == Page::Web, |el| el.bg(palette.backdrop))
-            .when_some(snapshot, |el, image| {
-                el.child(img(image).absolute().top_0().left_0().size_full())
-            })
             .child(
                 div()
                     .id("palette-scrim")
