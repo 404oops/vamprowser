@@ -11,8 +11,8 @@ use std::{cell::Cell, cell::RefCell, ptr::NonNull, rc::Rc};
 use async_channel::{Receiver, Sender};
 use block2::RcBlock;
 use gpui::{
-    App, Bounds, Context, Point, Render, Task, Window, WindowBounds, WindowKind, WindowOptions,
-    div, prelude::*, px, size,
+    App, Bounds, Context, DisplayId, Point, Render, Task, Window, WindowBounds, WindowKind,
+    WindowOptions, div, prelude::*, px, size,
 };
 use objc2::{rc::Retained, runtime::{AnyObject, ProtocolObject}};
 use objc2_app_kit::{NSEvent, NSEventMask, NSEventType};
@@ -240,7 +240,7 @@ impl Menu {
 
     fn reopen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let origin = window.bounds().origin;
-        let screen = window.display(cx).map(|display| display.bounds());
+        let display = window.display(cx).map(|display| (display.id(), display.bounds()));
         let levels = self.levels.clone();
         let answer = self.answer.clone();
         let palette = self.palette;
@@ -256,7 +256,7 @@ impl Menu {
         });
         hide(self.ns_window);
         window.remove_window();
-        cx.defer(move |cx| open_level(cx, origin, screen, levels, answer, palette));
+        cx.defer(move |cx| open_level(cx, origin, display, levels, answer, palette));
     }
 }
 
@@ -393,7 +393,9 @@ pub(crate) fn open(
     open_level(
         cx,
         window.bounds().origin + position,
-        window.display(cx).map(|display| display.bounds()),
+        window
+            .display(cx)
+            .map(|display| (display.id(), display.bounds())),
         vec![(entries, 0)],
         sender,
         palette,
@@ -404,7 +406,7 @@ pub(crate) fn open(
 fn open_level(
     cx: &mut App,
     mut origin: Point<gpui::Pixels>,
-    screen: Option<Bounds<gpui::Pixels>>,
+    display: Option<(DisplayId, Bounds<gpui::Pixels>)>,
     levels: Vec<(Vec<MenuEntry>, usize)>,
     answer: Sender<Option<usize>>,
     palette: Palette,
@@ -412,7 +414,7 @@ fn open_level(
     let height = levels
         .last()
         .map_or(2.0 * PADDING, |(entries, _)| height_of(entries, levels.len() > 1));
-    if let Some(screen) = screen {
+    if let Some((_, screen)) = display {
         origin.x = origin
             .x
             .min(screen.origin.x + screen.size.width - px(WIDTH))
@@ -423,6 +425,7 @@ fn open_level(
             .max(screen.origin.y);
     }
     let options = WindowOptions {
+        display_id: display.map(|(id, _)| id),
         window_bounds: Some(WindowBounds::Windowed(Bounds::new(
             origin,
             size(px(WIDTH), px(height)),

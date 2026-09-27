@@ -75,6 +75,8 @@ Vamprowser is licensed under the GNU General Public License version 3. See [LICE
 ```sh
 packaging/macos/bundle.sh          # dist/Vamprowser.app (release)
 packaging/macos/bundle.sh debug    # faster local build
+packaging/macos/install.sh          # build, replace /Applications/Vamprowser.app, launch
+packaging/macos/install.sh debug    # same with a debug build
 packaging/macos/dmg.sh             # dist/Vamprowser-<version>.dmg
 packaging/macos/icon.sh            # regenerate AppIcon.icns from icon.svg
 ```
