@@ -1,45 +1,97 @@
 #![cfg(target_os = "macos")]
 
-mod bookmarks;
-mod app_dialog;
-mod app_menu;
-mod audio;
-mod bookmarks_view;
+// Bookmarks
+#[path = "bookmarks/bookmark_menu.rs"]
 mod bookmark_menu;
-mod cache;
-mod certificate;
-mod commands;
+#[path = "bookmarks/bookmarks.rs"]
+mod bookmarks;
+#[path = "bookmarks/bookmarks_view.rs"]
+mod bookmarks_view;
+
+// Browser
+#[path = "browser/audio.rs"]
+mod audio;
+#[path = "browser/downloads.rs"]
 mod downloads;
-mod extensions;
+#[path = "browser/favicon.rs"]
 mod favicon;
+#[path = "browser/find.rs"]
 mod find;
-mod filters;
-mod history;
-mod http_auth;
-mod icons;
-mod interop;
-mod legacy_http;
-mod media;
-mod native;
-mod navigation;
-mod url_observer;
-mod pages;
-mod page_cursor;
-mod pointer_lock;
-mod palette;
-mod privacy;
-mod reader;
-mod settings;
-mod sitedata;
-mod state;
-mod suggest;
-mod tabdrag;
-mod minimal;
-mod marquee;
-mod updates;
-mod handoff;
+#[path = "browser/hint.rs"]
 mod hint;
+#[path = "browser/media.rs"]
+mod media;
+#[path = "browser/navigation.rs"]
+mod navigation;
+#[path = "browser/page_cursor.rs"]
+mod page_cursor;
+#[path = "browser/pointer_lock.rs"]
+mod pointer_lock;
+#[path = "browser/reader.rs"]
+mod reader;
+#[path = "browser/url_observer.rs"]
+mod url_observer;
+
+// Data
+#[path = "data/cache.rs"]
+mod cache;
+#[path = "data/history.rs"]
+mod history;
+#[path = "data/settings.rs"]
+mod settings;
+#[path = "data/sitedata.rs"]
+mod sitedata;
+#[path = "data/state.rs"]
+mod state;
+
+// Interface
+#[path = "interface/app_dialog.rs"]
+mod app_dialog;
+#[path = "interface/app_menu.rs"]
+mod app_menu;
+#[path = "interface/commands.rs"]
+mod commands;
+#[path = "interface/icons.rs"]
+mod icons;
+#[path = "interface/marquee.rs"]
+mod marquee;
+#[path = "interface/minimal.rs"]
+mod minimal;
+#[path = "interface/pages.rs"]
+mod pages;
+#[path = "interface/palette.rs"]
+mod palette;
+#[path = "interface/suggest.rs"]
+mod suggest;
+#[path = "interface/tabdrag.rs"]
+mod tabdrag;
+#[path = "interface/tint.rs"]
 mod tint;
+
+// Platform
+#[path = "platform/certificate.rs"]
+mod certificate;
+#[path = "platform/handoff.rs"]
+mod handoff;
+#[path = "platform/http_auth.rs"]
+mod http_auth;
+#[path = "platform/interop.rs"]
+mod interop;
+#[path = "platform/native.rs"]
+mod native;
+#[path = "platform/updates.rs"]
+mod updates;
+
+// Privacy
+#[path = "privacy/filters.rs"]
+mod filters;
+#[path = "privacy/legacy_http.rs"]
+mod legacy_http;
+#[path = "privacy/privacy.rs"]
+mod privacy;
+
+// Extensions
+mod extensions;
 
 use std::{
     cell::{Cell, RefCell},
@@ -124,8 +176,8 @@ enum BrowserEvent {
     MediaInspected(u64, u64, String, gpui::Point<gpui::Pixels>, Result<media::Info, String>),
     MediaFinished(u64, Result<PathBuf, String>),
     /// A still of the page, for behind the tab switcher.
-    /// Each still says which tab it's of.
-    Snapshot(u64, Option<Vec<u8>>),
+    /// Each still says which tab and switcher opening it's for.
+    Snapshot(u64, std::time::Instant, Option<Vec<u8>>),
     Extension(ExtensionEvent),
     /// uBlock Origin's network filters, compiled for WebKit.
     /// uBlock Origin's rules, from the build numbered here: WebKit rule
@@ -160,7 +212,7 @@ enum BrowserEvent {
     AddressEdited(String),
     /// The search engine's suggestions for what was typed.
     Suggestions(String, Vec<String>),
-    SuggestSnapshot(u64, Option<Vec<u8>>),
+    SuggestSnapshot(u64, std::time::Instant, Option<Vec<u8>>),
     /// Something to say on the settings pages.
     Notice(String),
     /// What's in the find bar changed.
@@ -1213,6 +1265,8 @@ struct PaletteState {
     /// A still of the page it covers; the live page is hidden meanwhile,
     /// as GPUI can't paint over it.
     snapshot: Option<Arc<gpui::Image>>,
+    /// Identifies the snapshot request, even when the opening animation restarts.
+    snapshot_request: std::time::Instant,
     /// When it opened and, once dismissed, when it started to fade out.
     opened: std::time::Instant,
     closing: Option<std::time::Instant>,
@@ -2589,7 +2643,6 @@ impl Browser {
         match self.create_webview(id, &url, private, false, window) {
             Ok(view) => {
                 self.report_opened(id, &view, private);
-                let _ = view.set_visible(!self.palette_open.get());
                 let _ = view.zoom(zoom);
                 let audio_observer = self.observe_tab_audio(id, &view);
                 let url_observer = self.observe_tab_url(id, &view);
@@ -2799,10 +2852,14 @@ impl Browser {
         }
         self.selection_generation += 1;
         self.reveal_selected = true;
-        let palette_open = self.palette_open.get();
         for (i, tab) in self.tabs.iter().enumerate() {
             if let Some(view) = &tab.view {
-                let _ = view.set_visible(i == index && tab.page == Page::Web && !palette_open);
+                // The selected view is shown by the page canvas after it
+                // receives its real bounds. A new WebView starts at Wry's
+                // default square otherwise, visible for one frame.
+                if i != index || tab.page != Page::Web {
+                    let _ = view.set_visible(false);
+                }
             }
         }
         self.close_suggestions(cx);
@@ -3107,7 +3164,7 @@ impl Browser {
         self.tabs[index].audio_observer = Some(self.observe_tab_audio(id, &view));
         self.tabs[index].url_observer = Some(self.observe_tab_url(id, &view));
         let _ = view.zoom(zoom);
-        let _ = view.set_visible(index == self.selected && !self.palette_open.get());
+        // The page canvas makes this visible after laying it out.
         self.tabs[index].loading = Some((std::time::Instant::now(), None));
         self.tabs[index].playing_audio = false;
     }
@@ -3438,7 +3495,9 @@ impl Browser {
                 BrowserEvent::Suggestions(query, found) => {
                     self.remote_suggestions(query, found, window, cx)
                 }
-                BrowserEvent::SuggestSnapshot(tab, jpeg) => self.suggest_snapshot(tab, jpeg, cx),
+                BrowserEvent::SuggestSnapshot(tab, request, jpeg) => {
+                    self.suggest_snapshot(tab, request, jpeg, cx)
+                }
                 BrowserEvent::BookmarkSnapshot(tab, opened, jpeg) => self.bookmark_snapshot(tab, opened, jpeg, cx),
                 BrowserEvent::Address(text) => {
                     let target = self.submitted_address(text);
@@ -3631,7 +3690,9 @@ impl Browser {
                     self.refresh_other_windows(cx);
                     cx.notify();
                 }
-                BrowserEvent::Snapshot(tab, jpeg) => self.palette_snapshot(tab, jpeg, cx),
+                BrowserEvent::Snapshot(tab, request, jpeg) => {
+                    self.palette_snapshot(tab, request, jpeg, cx)
+                }
                 BrowserEvent::Extension(event) => self.extension_event(event, window, cx),
                 BrowserEvent::RulesTimedOut => {
                     self.rules().give_up_waiting();
@@ -5871,13 +5932,14 @@ impl Render for Browser {
             self.page_hold.set(None);
         }
         let page_hold = self.page_hold.clone();
-        let content: AnyElement = if self.palette.is_some() {
+        let content: AnyElement = if self.palette.is_some() && self.current().page == Page::Web {
             self.palette_overlay(palette, window, cx)
         } else {
-            match self.current().page {
+            let page = match self.current().page {
                 Page::Web => {
                     let view = self.current().view.clone();
                     let minimal = self.minimal;
+                    let covered = self.suggest.is_some() || self.bookmark_menu.is_some();
                     canvas(
                         move |bounds, window, _| {
                             // In minimal mode the page keeps the size it has
@@ -5909,7 +5971,7 @@ impl Render for Browser {
                                 if unsafe { view.webview().fullscreenState() }
                                     == WKFullscreenState::NotInFullscreen
                                 {
-                                    let _ = view.set_bounds(Rect {
+                                    if view.set_bounds(Rect {
                                         position: dpi::Position::Logical(dpi::LogicalPosition::new(
                                             f64::from(bounds.origin.x),
                                             f64::from(bounds.origin.y),
@@ -5918,7 +5980,11 @@ impl Render for Browser {
                                             f64::from(size.width),
                                             f64::from(size.height),
                                         )),
-                                    });
+                                    }).is_ok() && !covered {
+                                        // Keep a new view hidden until its
+                                        // first real page bounds are applied.
+                                        let _ = view.set_visible(true);
+                                    }
                                 }
                             }
                         },
@@ -5932,6 +5998,16 @@ impl Render for Browser {
                 Page::Settings => self.settings_page(palette, window, cx),
                 Page::Downloads => self.downloads_page(palette, cx),
                 Page::Bookmarks => self.bookmarks_page(palette, cx),
+            };
+            if self.palette.is_some() {
+                div()
+                    .relative()
+                    .size_full()
+                    .child(page)
+                    .child(self.palette_overlay(palette, window, cx))
+                    .into_any_element()
+            } else {
+                page
             }
         };
         let progress = self.progress;

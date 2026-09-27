@@ -53,6 +53,8 @@ impl Browser {
     }
 
     fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_suggestions(cx);
+        self.close_bookmark_menu(cx);
         let input = text_input(
             cx,
             "Switch to a tab, find a bookmark or page, or run a command",
@@ -65,11 +67,13 @@ impl Browser {
             }
             cx.notify();
         });
+        let request = std::time::Instant::now();
         self.palette = Some(PaletteState {
             input: input.clone(),
             highlight: 0,
             snapshot: None,
-            opened: std::time::Instant::now(),
+            snapshot_request: request,
+            opened: request,
             closing: None,
             _changes: changes,
         });
@@ -82,7 +86,7 @@ impl Browser {
             let sender = self.sender.clone();
             let id = tab.id;
             native::snapshot(&view.webview(), move |jpeg| {
-                let _ = sender.try_send(BrowserEvent::Snapshot(id, jpeg));
+                let _ = sender.try_send(BrowserEvent::Snapshot(id, request, jpeg));
             });
         }
         let focus = input.read(cx).focus_handle.clone();
@@ -92,13 +96,13 @@ impl Browser {
 
     /// The page's still has arrived (or couldn't be taken): swap the live
     /// page out for it.
-    pub(crate) fn palette_snapshot(&mut self, tab: u64, jpeg: Option<Vec<u8>>, cx: &mut Context<Self>) {
+    pub(crate) fn palette_snapshot(&mut self, tab: u64, request: std::time::Instant, jpeg: Option<Vec<u8>>, cx: &mut Context<Self>) {
         // A still of a tab no longer in front (asked for before a switch) is
         // no use behind anything.
         if self.current().id != tab {
             return;
         }
-        let Some(palette) = self.palette.as_mut().filter(|p| p.closing.is_none()) else {
+        let Some(palette) = self.palette.as_mut().filter(|p| p.closing.is_none() && p.snapshot_request == request) else {
             return;
         };
         palette.snapshot = jpeg.map(|bytes| Arc::new(Image::from_bytes(ImageFormat::Jpeg, bytes)));
@@ -113,7 +117,7 @@ impl Browser {
     }
 
     /// Starts the switcher fading out; [`Self::finish_closing_palette`]
-    /// puts the live page back once it has.
+    /// schedules the page to be drawn again once it has.
     pub(crate) fn close_palette(&mut self, cx: &mut Context<Self>) {
         let Some(palette) = &mut self.palette else {
             return;
@@ -126,9 +130,10 @@ impl Browser {
         cx.notify();
     }
 
-    fn finish_closing_palette(&mut self) {
+    fn finish_closing_palette(&mut self, cx: &mut Context<Self>) {
         self.palette = None;
-        self.show_page_if_uncovered();
+        // The page canvas restores a web view after applying its bounds.
+        cx.notify();
     }
 
     /// How far the switcher is in, from 0 (gone) to 1 (fully open), as it
@@ -330,7 +335,7 @@ impl Browser {
             .and_then(|p| p.closing)
             .is_some_and(|at| at.elapsed() >= crate::slowed(CLOSE))
         {
-            self.finish_closing_palette();
+            self.finish_closing_palette(cx);
             return div().into_any_element();
         }
         let rows = self.palette_rows(cx);
@@ -459,10 +464,13 @@ impl Browser {
             );
         div()
             .id("palette-overlay")
+            .absolute()
+            .top_0()
+            .left_0()
             .size_full()
             .relative()
             .overflow_hidden()
-            .bg(palette.backdrop)
+            .when(self.current().page == Page::Web, |el| el.bg(palette.backdrop))
             .when_some(snapshot, |el, image| {
                 el.child(img(image).absolute().top_0().left_0().size_full())
             })

@@ -17,6 +17,7 @@ mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "target/$mode/vamprowser" "$app/Contents/MacOS/vamprowser"
 cp packaging/macos/Info.plist "$app/Contents/Info.plist"
 cp packaging/macos/AppIcon.icns "$app/Contents/Resources/AppIcon.icns"
+cp LICENSE "$app/Contents/Resources/LICENSE"
 
 # A Developer ID build can be signed with a provisioning profile. Set
 #   VAMPROWSER_SIGN_IDENTITY="Developer ID Application: … (TEAMID)"

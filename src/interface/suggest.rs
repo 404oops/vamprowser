@@ -54,7 +54,7 @@ pub(crate) struct SuggestState {
     picked: bool,
     /// A still of the page it covers, which is hidden meanwhile.
     snapshot: Option<Arc<Image>>,
-    snapshot_asked: bool,
+    snapshot_request: Option<std::time::Instant>,
     /// The page's still has come (or couldn't be had): the list can show
     /// without half of it hidden behind the live page.
     covered: bool,
@@ -444,7 +444,7 @@ impl Browser {
             highlight: None,
             picked: false,
             snapshot: None,
-            snapshot_asked: false,
+            snapshot_request: None,
             covered: false,
         });
         state.typed = text.clone();
@@ -547,27 +547,31 @@ impl Browser {
         let Some(state) = &mut self.suggest else {
             return;
         };
-        if state.snapshot_asked {
+        if state.snapshot_request.is_some() {
             return;
         }
-        state.snapshot_asked = true;
+        let request = std::time::Instant::now();
+        state.snapshot_request = Some(request);
         let tab = &self.tabs[self.selected];
         if let (Some(view), Page::Web) = (&tab.view, tab.page) {
             let sender = self.sender.clone();
             let id = tab.id;
             native::snapshot(&view.webview(), move |jpeg| {
-                let _ = sender.try_send(BrowserEvent::SuggestSnapshot(id, jpeg));
+                let _ = sender.try_send(BrowserEvent::SuggestSnapshot(id, request, jpeg));
             });
         }
     }
 
-    pub(crate) fn suggest_snapshot(&mut self, tab: u64, jpeg: Option<Vec<u8>>, cx: &mut Context<Self>) {
+    pub(crate) fn suggest_snapshot(&mut self, tab: u64, request: std::time::Instant, jpeg: Option<Vec<u8>>, cx: &mut Context<Self>) {
         if self.current().id != tab {
             return;
         }
         let Some(state) = &mut self.suggest else {
             return;
         };
+        if state.snapshot_request != Some(request) {
+            return;
+        }
         state.snapshot = jpeg.map(|bytes| Arc::new(Image::from_bytes(ImageFormat::Jpeg, bytes)));
         state.covered = true;
         if state.snapshot.is_some()

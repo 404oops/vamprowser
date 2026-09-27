@@ -52,6 +52,24 @@ Requires macOS, Xcode, and a recent Rust toolchain.
 cargo run
 ```
 
+## License
+
+Vamprowser is licensed under the GNU General Public License version 3. See [LICENSE](LICENSE) for the full terms.
+
+## Source layout
+
+`src/main.rs` assembles the browser. Its module declarations point to these feature directories while keeping the existing Rust module names:
+
+| Directory | Code |
+| --- | --- |
+| `bookmarks/` | Bookmark storage, menus, and manager |
+| `browser/` | Page navigation, WebView features, media, and downloads |
+| `data/` | Settings, history, cache, site data, and saved state |
+| `extensions/` | WebExtension integration and compatibility |
+| `interface/` | Native pages, menus, commands, and visual controls |
+| `platform/` | macOS integration, authentication, and updates |
+| `privacy/` | Content rules, filtering, and HTTPS handling |
+
 ## Package
 
 ```sh

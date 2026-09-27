@@ -4,7 +4,7 @@ version = "0.4.0"
 edition = "2024"
 rust-version = "1.89"
 description = "A macOS browser with Vampir controls and WebKit"
-license = "MIT"
+license = "GPL-3.0-only"
 
 [dependencies]
 vampir = { version = "0.1.5", default-features = false, features = ["app-icon"] }
