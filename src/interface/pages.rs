@@ -16,7 +16,7 @@ use gpui::{
 use vampir::{ButtonVariant, Palette, TextInput, WidgetContext, color, lighting};
 
 use crate::{
-    Browser, Chrome, Page, SettingsInputs, WithHint, slowed,
+    Browser, BrowserEvent, Chrome, Page, SettingsInputs, WithHint, slowed,
     commands::{Command, Place, Section},
     downloads::DownloadState,
     history::Visit,
@@ -2186,12 +2186,16 @@ impl Browser {
     /// Offer a finished download to macOS as a file when its drag leaves
     /// the window. Check the path then, since a file may have moved since
     /// the download was drawn.
-    fn draggable_download(row: Stateful<Div>, path: PathBuf, palette: Palette) -> Stateful<Div> {
+    fn draggable_download(
+        row: Stateful<Div>, path: PathBuf, palette: Palette,
+        sender: async_channel::Sender<BrowserEvent>,
+    ) -> Stateful<Div> {
         let name: SharedString = path.file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.to_string_lossy().into_owned())
             .into();
         row.on_drag(path, move |_, _, _, cx| {
+            let _ = sender.try_send(BrowserEvent::DownloadDragStarted);
             cx.new(|_| DraggedDownload { name: name.clone(), palette })
         })
             .external_drag_payload(|path: &PathBuf, _, _| {
@@ -2249,7 +2253,7 @@ impl Browser {
                     .cursor_pointer()
                     .hover(move |s| s.bg(palette.soft_fill))
                     .when(item.state == DownloadState::Done, |row| {
-                        Self::draggable_download(row, item.path.clone(), palette)
+                        Self::draggable_download(row, item.path.clone(), palette, self.sender.clone())
                     })
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.run(Command::OpenDownload(id), window, cx)
@@ -2471,7 +2475,7 @@ impl Browser {
                     .items_center()
                     .gap(px(14.0))
                     .when(item.state == DownloadState::Done, |row| {
-                        Self::draggable_download(row, item.path.clone(), palette)
+                        Self::draggable_download(row, item.path.clone(), palette, self.sender.clone())
                     })
                     .on_mouse_down(
                         MouseButton::Right,

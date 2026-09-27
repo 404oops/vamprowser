@@ -173,6 +173,8 @@ enum BrowserEvent {
     /// A download began, from tab (first).
     DownloadStarted(String, PathBuf, bool),
     DownloadFinished(String, Option<PathBuf>, bool),
+    DownloadDragStarted,
+    DownloadDragSnapshot(u64, std::time::Instant, Option<Vec<u8>>),
     MediaInspected(u64, u64, String, gpui::Point<gpui::Pixels>, Result<media::Info, String>),
     MediaFinished(u64, Result<PathBuf, String>),
     /// A still of the page, for behind the tab switcher.
@@ -1642,6 +1644,9 @@ struct Browser {
     serial: u64,
     /// A tab being pressed or dragged.
     tab_drag: Option<tabdrag::TabDrag>,
+    /// A still of WebKit while a download is being dragged across it, so
+    /// GPUI's drag label can be drawn above the page.
+    download_drag: Option<(u64, std::time::Instant, bool, Option<Arc<gpui::Image>>)>,
     /// Where each tab was drawn, for drags to find their place by.
     tab_bounds: tabdrag::TabBounds,
     /// Its last tab was dragged away: the window closes.
@@ -2076,6 +2081,7 @@ impl Browser {
             ns_view,
             serial,
             tab_drag: None,
+            download_drag: None,
             tab_bounds: Default::default(),
             close_when_drawn: false,
             drop_hint: None,
@@ -3386,6 +3392,51 @@ impl Browser {
         self.load_in(self.selected, &url, window, cx);
     }
 
+    /// Open a finished download in the tab it was dropped on. Its original
+    /// response may have requested a download; the saved file is a new,
+    /// ordinary file navigation and WebKit can render HTML from it.
+    fn open_dropped_download(
+        &mut self, path: &PathBuf, tab_id: u64, window: &Window, cx: &mut Context<Self>,
+    ) {
+        if !path.is_file() {
+            return;
+        }
+        let Ok(url) = url::Url::from_file_path(path) else {
+            return;
+        };
+        let Some(index) = self.tabs.iter().position(|tab| tab.id == tab_id) else {
+            return;
+        };
+        self.load_in(index, url.as_str(), window, cx);
+        self.select(index, cx);
+    }
+
+    fn begin_download_drag(&mut self) {
+        let tab = self.current();
+        let Some(view) = tab.view.as_ref().filter(|_| tab.page == Page::Web) else {
+            return;
+        };
+        let id = tab.id;
+        let request = std::time::Instant::now();
+        let sender = self.sender.clone();
+        native::snapshot(&view.webview(), move |jpeg| {
+            let _ = sender.try_send(BrowserEvent::DownloadDragSnapshot(id, request, jpeg));
+        });
+        self.download_drag = Some((id, request, false, None));
+    }
+
+    fn finish_download_drag(&mut self, cx: &mut Context<Self>) {
+        let Some((id, _, covered, _)) = self.download_drag.take() else {
+            return;
+        };
+        if covered && self.current().id == id && self.current().page == Page::Web
+            && let Some(view) = &self.current().view
+        {
+            let _ = view.set_visible(true);
+        }
+        cx.notify();
+    }
+
     fn load_in(&mut self, index: usize, url: &str, window: &Window, cx: &mut Context<Self>) {
         self.certificate_offers.remove(&self.tabs[index].id);
         if let Some((page, section)) = parse_internal(url) {
@@ -3668,6 +3719,24 @@ impl Browser {
                 BrowserEvent::DownloadFinished(url, path, success) => {
                     self.downloads().finished(&url, path, success);
                     self.refresh_other_windows(cx);
+                    cx.notify();
+                }
+                BrowserEvent::DownloadDragStarted => self.begin_download_drag(),
+                BrowserEvent::DownloadDragSnapshot(id, request, jpeg) => {
+                    if self.current().id != id {
+                        continue;
+                    }
+                    let Some((drag_id, drag_request, covered, image)) = self.download_drag.as_mut() else {
+                        continue;
+                    };
+                    if *drag_id != id || *drag_request != request {
+                        continue;
+                    }
+                    *image = jpeg.map(|bytes| Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Jpeg, bytes)));
+                    *covered = true;
+                    if let Some(view) = &self.current().view {
+                        let _ = view.set_visible(false);
+                    }
                     cx.notify();
                 }
                 BrowserEvent::MediaInspected(serial, id, url, position, result) => {
@@ -5243,6 +5312,10 @@ impl Browser {
                 }
             }
         }))
+        .drag_over::<PathBuf>(move |style, _, _, _| style.border_2().border_color(accent))
+        .on_drop(cx.listener(move |this, path: &PathBuf, window, cx| {
+            this.open_dropped_download(path, id, window, cx);
+        }))
     }
 
     /// What a tab list lays out: departing tabs still shrinking away, the
@@ -5932,8 +6005,12 @@ impl Render for Browser {
             self.page_hold.set(None);
         }
         let page_hold = self.page_hold.clone();
-        let content: AnyElement = if self.palette.is_some() && self.current().page == Page::Web {
-            let snapshot = self.palette.as_ref().and_then(|state| state.snapshot.clone());
+        let drag_cover = self.download_drag.as_ref().and_then(|(id, _, covered, image)| {
+            (self.current().id == *id && *covered).then(|| image.clone())
+        });
+        let content: AnyElement = if (self.palette.is_some() || drag_cover.is_some())
+            && self.current().page == Page::Web {
+            let snapshot = drag_cover.flatten().or_else(|| self.palette.as_ref().and_then(|state| state.snapshot.clone()));
             div()
                 .relative()
                 .size_full()
@@ -6021,6 +6098,13 @@ impl Render for Browser {
             .border_t_1()
             .when(sidebar_width > 0.5, |el| el.border_l_1())
             .border_color(chrome.line)
+            .drag_over::<PathBuf>(move |style, _, _, _| {
+                style.border_2().border_color(palette.accent)
+            })
+            .on_drop(cx.listener(|this, path: &PathBuf, window, cx| {
+                let id = this.current().id;
+                this.open_dropped_download(path, id, window, cx);
+            }))
             .children(find_bar)
             .child(
                 div()
@@ -6054,6 +6138,9 @@ impl Render for Browser {
             .text_size(px(13.0))
             .bg(chrome.ground)
             .text_color(palette.text_primary)
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                this.finish_download_drag(cx);
+            }))
             .children(self.minimal_bar(palette));
         root = if self.minimal {
             // Slides down from above rather than unrolling.
