@@ -26,8 +26,8 @@ jobs:
         run: |
           set -euo pipefail
           test "$(uname -m)" = arm64
-          rustc -vV | grep -q 'host: aarch64-apple-darwin'
-          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          [[ "$(rustc -vV)" == *'host: aarch64-apple-darwin'* ]]
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml)
           plist_version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' packaging/macos/Info.plist)
           test "$version" = "$plist_version"
           if [[ "$GITHUB_REF_TYPE" == tag ]]; then
