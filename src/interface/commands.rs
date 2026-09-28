@@ -759,7 +759,7 @@ impl Browser {
                         return;
                     }
                 };
-                let id = self.downloads().started(url.clone(), destination.clone(), private);
+                let id = self.downloads().started(url.clone(), destination.clone(), private, self.serial);
                 self.controls.scroll("download-shelf-items").set_offset(gpui::point(gpui::px(0.0), gpui::px(0.0)));
                 self.refresh_other_windows(cx);
                 cx.notify();
@@ -804,9 +804,33 @@ impl Browser {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.open_context_menu(position, items, false, window, cx);
+    }
+
+    pub(crate) fn context_menu_above(
+        &mut self,
+        position: Point<Pixels>,
+        items: Vec<(MenuEntry, Option<Command>)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_context_menu(position, items, true, window, cx);
+    }
+
+    fn open_context_menu(
+        &mut self,
+        position: Point<Pixels>,
+        items: Vec<(MenuEntry, Option<Command>)>,
+        above: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let entries: Vec<MenuEntry> = items.iter().map(|(entry, _)| entry.clone()).collect();
-        let receiver =
-            crate::app_menu::open(cx, window, position, entries, self.controls.palette());
+        let receiver = if above {
+            crate::app_menu::open_above(cx, window, position, entries, self.controls.palette())
+        } else {
+            crate::app_menu::open(cx, window, position, entries, self.controls.palette())
+        };
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Some(chosen)) = receiver.recv().await else {
                 return;

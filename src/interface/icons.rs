@@ -21,7 +21,7 @@ pub enum Icon {
     Close,
     ChevronLeft,
     ChevronRight,
-    ChevronDown,
+    ChevronUp,
     Home,
     Private,
     Search,
@@ -191,9 +191,9 @@ fn paint(icon: Icon, bounds: Bounds<Pixels>, color: Rgba, window: &mut Window) {
             );
             paths.push(path);
         }
-        Icon::ChevronDown => {
+        Icon::ChevronUp => {
             let mut path = stroke();
-            polyline(&mut path, &[(3.5, 6.0), (8.0, 10.5), (12.5, 6.0)]);
+            polyline(&mut path, &[(3.5, 10.0), (8.0, 5.5), (12.5, 10.0)]);
             paths.push(path);
         }
         Icon::Home => {

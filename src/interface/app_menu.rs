@@ -277,7 +277,7 @@ impl Menu {
         });
         hide(self.ns_window);
         window.remove_window();
-        cx.defer(move |cx| open_level(cx, origin, display, levels, answer, palette));
+        cx.defer(move |cx| open_level(cx, origin, display, levels, answer, palette, false));
     }
 }
 
@@ -408,6 +408,28 @@ pub(crate) fn open(
     entries: Vec<MenuEntry>,
     palette: Palette,
 ) -> Receiver<Option<usize>> {
+    open_at(cx, window, position, entries, palette, false)
+}
+
+/// Place a shelf menu with its bottom edge at the trigger, above the shelf.
+pub(crate) fn open_above(
+    cx: &mut App,
+    window: &Window,
+    position: Point<gpui::Pixels>,
+    entries: Vec<MenuEntry>,
+    palette: Palette,
+) -> Receiver<Option<usize>> {
+    open_at(cx, window, position, entries, palette, true)
+}
+
+fn open_at(
+    cx: &mut App,
+    window: &Window,
+    position: Point<gpui::Pixels>,
+    entries: Vec<MenuEntry>,
+    palette: Palette,
+    above: bool,
+) -> Receiver<Option<usize>> {
     // One menu at a time.
     dismiss_open();
     let (sender, receiver) = async_channel::bounded(1);
@@ -420,6 +442,7 @@ pub(crate) fn open(
         vec![(entries, 0)],
         sender,
         palette,
+        above,
     );
     receiver
 }
@@ -431,10 +454,14 @@ fn open_level(
     levels: Vec<(Vec<MenuEntry>, usize)>,
     answer: Sender<Option<usize>>,
     palette: Palette,
+    above: bool,
 ) {
     let height = levels.last().map_or(2.0 * PADDING, |(entries, _)| {
         height_of(entries, levels.len() > 1)
     });
+    if above {
+        origin.y -= px(height);
+    }
     if let Some((_, screen)) = display {
         origin.x = origin
             .x

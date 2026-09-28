@@ -198,8 +198,6 @@ enum BrowserEvent {
     RulesTimedOut,
     /// A click landed in a page.
     PageClicked,
-    /// Incremental magnification from a trackpad pinch over a page.
-    PageMagnified(f64),
     /// A page began loading.
     LoadStarted(u64),
     AudioChanged(u64, usize, bool),
@@ -569,41 +567,6 @@ fn install_page_click_monitor(
             &handler,
         )
     }
-}
-
-/// WebKit does not change Wry's page zoom for trackpad pinches. Route
-/// magnification over a page through the same per-tab zoom as the shortcuts.
-fn install_page_magnify_monitor(
-    sender: Sender<BrowserEvent>,
-    ns_window: usize,
-) -> Option<Retained<AnyObject>> {
-    let handler = RcBlock::new(move |event: NonNull<NSEvent>| -> *mut NSEvent {
-        // SAFETY: AppKit owns the event for the callback's duration.
-        let gesture = unsafe { event.as_ref() };
-        let Some(mtm) = objc2::MainThreadMarker::new() else {
-            return event.as_ptr();
-        };
-        if !event_in(gesture, ns_window) {
-            return event.as_ptr();
-        }
-        let in_page = gesture
-            .window(mtm)
-            .and_then(|window| window.contentView())
-            .and_then(|content| {
-                content.hitTest(content.convertPoint_fromView(gesture.locationInWindow(), None))
-            })
-            .is_some_and(in_web_view);
-        if !in_page {
-            return event.as_ptr();
-        }
-        let magnification = gesture.magnification() as f64;
-        if magnification.is_finite() && magnification != 0.0 {
-            let _ = sender.try_send(BrowserEvent::PageMagnified(magnification));
-        }
-        std::ptr::null_mut()
-    });
-    // SAFETY: the block returns the live event or consumes it, as AppKit requires.
-    unsafe { NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSEventMask::Magnify, &handler) }
 }
 
 /// Whether `view` is a web view or inside one.
@@ -1882,7 +1845,6 @@ struct Browser {
     sender: Sender<BrowserEvent>,
     shortcut_monitor: Option<Retained<AnyObject>>,
     click_monitor: Option<Retained<AnyObject>>,
-    magnify_monitor: Option<Retained<AnyObject>>,
     /// Lets pages set the pointer; see [`page_cursor`].
     cursor_monitor: Option<Retained<AnyObject>>,
     _poll: Task<()>,
@@ -1928,13 +1890,9 @@ impl Drop for Browser {
             }
             self.common.routes.borrow_mut().remove(&tab.id);
         }
-        for monitor in [
-            self.click_monitor.take(),
-            self.magnify_monitor.take(),
-            self.cursor_monitor.take(),
-        ]
-        .into_iter()
-        .flatten()
+        for monitor in [self.click_monitor.take(), self.cursor_monitor.take()]
+            .into_iter()
+            .flatten()
         {
             // SAFETY: this is the monitor token returned by AppKit.
             unsafe { NSEvent::removeMonitor(&monitor) };
@@ -2313,7 +2271,6 @@ impl Browser {
                 },
             ),
             click_monitor: install_page_click_monitor(sender.clone(), ns_window, typing),
-            magnify_monitor: install_page_magnify_monitor(sender.clone(), ns_window),
             cursor_monitor: page_cursor::watch(ns_window, ns_view),
             sender,
             _poll: poll,
@@ -2703,6 +2660,9 @@ impl Browser {
         }
         let view = Rc::new(builder.build_as_child(window)?);
         *weak_view.borrow_mut() = Rc::downgrade(&view);
+        // Let WebKit magnify the rendered page around the pinch. Changing
+        // pageZoom for every gesture event reflows the page as it moves.
+        unsafe { view.webview().setAllowsMagnification(true) };
         // Wry's classes exist from the first web view on.
         navigation::install();
         pointer_lock::enable(&view.webview());
@@ -3628,6 +3588,10 @@ impl Browser {
         };
         if let Some(view) = &tab.view {
             let _ = view.zoom(tab.zoom);
+            if factor == 0.0 {
+                // Pinch magnification is separate from page zoom.
+                unsafe { view.webview().setMagnification(1.0) };
+            }
         }
         cx.notify();
     }
@@ -4080,7 +4044,7 @@ impl Browser {
                     }
                 }
                 BrowserEvent::DownloadStarted(url, path, private) => {
-                    self.downloads().started(url, path, private);
+                    self.downloads().started(url, path, private, self.serial);
                     self.controls
                         .scroll("download-shelf-items")
                         .set_offset(point(px(0.0), px(0.0)));
@@ -4232,11 +4196,6 @@ impl Browser {
                         self.reset_address(cx);
                     }
                     cx.notify();
-                }
-                BrowserEvent::PageMagnified(magnification) => {
-                    if self.current().page == Page::Web {
-                        self.zoom_by((1.0 + magnification).max(0.01), cx);
-                    }
                 }
                 BrowserEvent::UblockRules(build, chunks, fingerprints, rules) => {
                     // Only if uBlock Origin is still running by the time the
@@ -6581,7 +6540,7 @@ impl Render for Browser {
             self.controls
                 .tween("bookmarks-height", bookmarks_target, LAYOUT_MOVE)
                 * reveal;
-        let shelf_target = if self.downloads().shelf().next().is_some() {
+        let shelf_target = if self.downloads().shelf(self.serial).next().is_some() {
             SHELF_HEIGHT
         } else {
             0.0
@@ -6928,7 +6887,7 @@ impl Render for Browser {
         // in this frame counts.
         let downloading = self
             .downloads()
-            .shelf()
+            .shelf(self.serial)
             .any(|d| d.state == downloads::DownloadState::InProgress);
         // Private tabs' sites stay off the network and out of the cache.
         let wants: Vec<String> = self.favicon_wants.borrow_mut().drain().collect();

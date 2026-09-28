@@ -37,6 +37,9 @@ pub struct Download {
     /// forgetting it.
     #[serde(skip)]
     pub on_shelf: bool,
+    /// The window whose shelf owns this download for this run.
+    #[serde(skip)]
+    pub shelf_window: u64,
 }
 
 impl Download {
@@ -191,7 +194,7 @@ impl Downloads {
             .collect()
     }
 
-    pub fn started(&mut self, url: String, path: PathBuf, private: bool) -> u64 {
+    pub fn started(&mut self, url: String, path: PathBuf, private: bool, window: u64) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
         self.items.insert(
@@ -204,6 +207,7 @@ impl Downloads {
                 started: now_secs(),
                 private,
                 on_shelf: true,
+                shelf_window: window,
             },
         );
         id
@@ -256,13 +260,15 @@ impl Downloads {
         self.items.iter().find(|d| d.id == id)
     }
 
-    pub fn shelf(&self) -> impl Iterator<Item = &Download> {
-        self.items.iter().filter(|d| d.on_shelf)
+    pub fn shelf(&self, window: u64) -> impl Iterator<Item = &Download> {
+        self.items.iter().filter(move |d| d.on_shelf && d.shelf_window == window)
     }
 
-    pub fn clear_shelf(&mut self) {
+    pub fn clear_shelf(&mut self, window: u64) {
         for item in &mut self.items {
-            item.on_shelf = false;
+            if item.shelf_window == window {
+                item.on_shelf = false;
+            }
         }
     }
 
@@ -305,21 +311,22 @@ mod tests {
     #[test]
     fn finishing_marks_the_newest_matching_download() {
         let mut downloads = Downloads::default();
-        downloads.started("https://a/x".into(), "/tmp/x".into(), false);
+        downloads.started("https://a/x".into(), "/tmp/x".into(), false, 1);
         downloads.items[0].state = DownloadState::Done;
-        downloads.started("https://a/x".into(), "/tmp/x 2".into(), false);
+        downloads.started("https://a/x".into(), "/tmp/x 2".into(), false, 2);
         downloads.finished("https://a/x", None, false);
         assert_eq!(downloads.all()[0].state, DownloadState::Failed);
         assert_eq!(downloads.all()[1].state, DownloadState::Done);
-        downloads.clear_shelf();
-        assert_eq!(downloads.shelf().count(), 0);
+        downloads.clear_shelf(2);
+        assert_eq!(downloads.shelf(2).count(), 0);
+        assert_eq!(downloads.shelf(1).count(), 1);
     }
 
     #[test]
     fn private_downloads_stay_out_of_saved_history() {
         let mut downloads = Downloads::default();
-        downloads.started("https://private.example/file".into(), "/tmp/private".into(), true);
-        downloads.started("https://public.example/file".into(), "/tmp/public".into(), false);
+        downloads.started("https://private.example/file".into(), "/tmp/private".into(), true, 1);
+        downloads.started("https://public.example/file".into(), "/tmp/public".into(), false, 1);
         downloads.finished("https://private.example/file", None, true);
         downloads.finished("https://public.example/file", None, true);
         let json = serde_json::to_string(&downloads.saved_items()).unwrap();
@@ -330,8 +337,8 @@ mod tests {
     #[test]
     fn media_finish_uses_id_and_final_file_path() {
         let mut downloads = Downloads::default();
-        let first = downloads.started("https://a/video".into(), "/tmp/first".into(), false);
-        let second = downloads.started("https://a/video".into(), "/tmp/second".into(), false);
+        let first = downloads.started("https://a/video".into(), "/tmp/first".into(), false, 1);
+        let second = downloads.started("https://a/video".into(), "/tmp/second".into(), false, 1);
         downloads.finished_id(first, Some("/tmp/first.mp4".into()), true);
         assert_eq!(downloads.get(first).unwrap().path, PathBuf::from("/tmp/first.mp4"));
         assert_eq!(downloads.get(first).unwrap().state, DownloadState::Done);

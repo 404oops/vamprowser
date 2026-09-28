@@ -2269,7 +2269,7 @@ impl Browser {
             .flex()
             .items_center()
             .gap(px(6.0));
-        for item in downloads.shelf().take(8) {
+        for item in downloads.shelf(self.serial).take(8) {
             let id = item.id;
             let status = match item.state {
                 DownloadState::InProgress => "Downloading…".to_owned(),
@@ -2305,18 +2305,13 @@ impl Browser {
                     MouseButton::Right,
                     cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                         let items = this.download_menu(id);
-                        this.context_menu(event.position, items, window, cx);
+                        this.context_menu_above(event.position, items, window, cx);
                     }),
                 )
-                .child(icon(
-                    Icon::File,
-                    18.0,
-                    if item.state == DownloadState::Failed {
-                        palette.danger_label
-                    } else {
-                        palette.text_secondary
-                    },
-                ))
+                .child(match interop::file_icon(&item.path) {
+                    Some(image) => img(image).size(px(22.0)).into_any_element(),
+                    None => icon(Icon::File, 18.0, palette.text_secondary).into_any_element(),
+                })
                 .child(
                     div()
                         .flex_1()
@@ -2366,10 +2361,10 @@ impl Browser {
                             cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
                                 cx.stop_propagation();
                                 let items = this.download_menu(id);
-                                this.context_menu(event.position(), items, window, cx);
+                                this.context_menu_above(event.position(), items, window, cx);
                             }),
                         )
-                        .child(icon(Icon::ChevronDown, 12.0, palette.text_secondary)),
+                        .child(icon(Icon::ChevronUp, 12.0, palette.text_secondary)),
                 );
             strip = strip.child(
                 div()
@@ -2440,7 +2435,7 @@ impl Browser {
                 palette,
                 cx,
                 |this, _, cx| {
-                    this.downloads().clear_shelf();
+                    this.downloads().clear_shelf(this.serial);
                     cx.notify();
                 },
             ))
@@ -2573,15 +2568,10 @@ impl Browser {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .child(icon(
-                                Icon::File,
-                                20.0,
-                                if item.state == DownloadState::Failed {
-                                    palette.danger_label
-                                } else {
-                                    palette.soft_label
-                                },
-                            )),
+                            .child(match interop::file_icon(&item.path) {
+                                Some(image) => img(image).size(px(30.0)).into_any_element(),
+                                None => icon(Icon::File, 20.0, palette.soft_label).into_any_element(),
+                            }),
                     )
                     .child(
                         div()

@@ -9,6 +9,7 @@ A macOS browser built in Rust: Apple's WebKit (through Wry's `WKWebView`) for pa
   - ⌘-click or middle-click a link to open it in a new tab behind (⌘⇧-click, in front).
   - Windows come back only when you ask: ⌘⇧T, once a window's own closed tabs run out, reopens the windows you closed, and after a relaunch the ones open when you quit, where you left them (Settings → General can restore them at launch instead). Closing the last window leaves the app running, and the Dock icon opens a new one.
 - **Minimal mode** (⌘⇧M) shows only the page, under a hairline. Point at the top of the window and the browser slides in over the page without it reflowing.
+- **Trackpad pinch** magnifies the page smoothly without reflowing its layout. ⌘0 resets both pinch magnification and page zoom.
 - **Links from other apps** open in a compact page window. Drag its title onto a browser window's tabs to move the live page there, or click **Expand** to turn it into a full browser window. Opening another tab expands it too.
 - **Address field**: suggestions as you type.
   - It completes the site you most likely mean.

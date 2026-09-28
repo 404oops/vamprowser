@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.4.5 — 2026-09-28
+
+- Each window now shows only its own new downloads on the download shelf. Clearing a shelf leaves other windows' shelves alone; the full Downloads page still shows the shared download history.
+- Download rows and shelf items use Finder's file icons. Shelf menus open upward, with an upward chevron to match.
+- Trackpad pinch now uses WebKit's native magnification, keeping the page from reflowing during the gesture. Resetting zoom also resets pinch magnification.
+- Certificate trust choices now work across threads, including private-window session choices.
+
 ## v0.4.4 — 2026-09-28
 
 - Links opened from other apps now appear in compact page windows. Drag the title into another browser window's tabs, click **Expand**, or open a second tab to get a full browser window. Compact windows no longer enter normal session restore or closed-window history until expanded.

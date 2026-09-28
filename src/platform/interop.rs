@@ -3,9 +3,38 @@
 //! by other apps arrives through GPUI's `on_open_urls`; the Info.plist
 //! declares the schemes and document types.
 
+use std::{collections::HashMap, path::{Path, PathBuf}, sync::{Arc, LazyLock, Mutex}};
+
 use objc2::MainThreadMarker;
-use objc2_app_kit::NSWorkspace;
-use objc2_foundation::{NSArray, NSBundle, NSString, NSURL};
+use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep, NSWorkspace};
+use objc2_foundation::{NSArray, NSBundle, NSDictionary, NSString, NSURL};
+
+/// The file icon Finder assigns to a downloaded path, cached across redraws.
+pub fn file_icon(path: &Path) -> Option<Arc<gpui::Image>> {
+    static ICONS: LazyLock<Mutex<HashMap<PathBuf, Option<Arc<gpui::Image>>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    if let Some(icon) = ICONS.lock().ok()?.get(path).cloned() {
+        return icon;
+    }
+    let image = NSWorkspace::sharedWorkspace()
+        .iconForFile(&NSString::from_str(&path.to_string_lossy()));
+    let icon = image.TIFFRepresentation().and_then(|tiff| {
+        let bitmap = NSBitmapImageRep::imageRepsWithData(&tiff)
+            .iter()
+            .filter_map(|rep| rep.downcast::<NSBitmapImageRep>().ok())
+            .max_by_key(|rep| rep.pixelsWide())?;
+        // SAFETY: an empty properties dictionary is valid for PNG output.
+        let png = unsafe {
+            bitmap.representationUsingType_properties(
+                NSBitmapImageFileType::PNG,
+                &NSDictionary::new(),
+            )
+        }?;
+        Some(Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, png.to_vec())))
+    });
+    ICONS.lock().ok()?.insert(path.to_path_buf(), icon.clone());
+    icon
+}
 
 /// This app's bundle, if it is running from one. An unbundled binary can't
 /// be registered with Launch Services.

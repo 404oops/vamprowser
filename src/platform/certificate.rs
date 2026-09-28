@@ -1,6 +1,9 @@
 //! Browser-owned, certificate-specific exceptions. Never changes system trust.
 
-use std::{cell::RefCell, collections::HashMap};
+use std::{
+    collections::HashMap,
+    sync::{Mutex, OnceLock},
+};
 
 use objc2_security::SecTrust;
 use serde::{Deserialize, Serialize};
@@ -26,12 +29,20 @@ struct Exception {
     fingerprint: String,
 }
 
-thread_local! {
-    static EXCEPTIONS: RefCell<Vec<Exception>> = RefCell::new(
-        crate::state::load_json(crate::state::data_path("certificate-exceptions.json"))
-            .unwrap_or_default()
-    );
-    static SESSION: RefCell<HashMap<u64, Vec<Exception>>> = RefCell::default();
+static EXCEPTIONS: OnceLock<Mutex<Vec<Exception>>> = OnceLock::new();
+static SESSION: OnceLock<Mutex<HashMap<u64, Vec<Exception>>>> = OnceLock::new();
+
+fn exceptions() -> &'static Mutex<Vec<Exception>> {
+    EXCEPTIONS.get_or_init(|| {
+        Mutex::new(
+            crate::state::load_json(crate::state::data_path("certificate-exceptions.json"))
+                .unwrap_or_default(),
+        )
+    })
+}
+
+fn session() -> &'static Mutex<HashMap<u64, Vec<Exception>>> {
+    SESSION.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 pub fn presented(trust: &SecTrust, host: &str, port: isize) -> Option<Presented> {
@@ -88,14 +99,13 @@ pub fn is_trusted(cert: &Presented, scope: u64) -> bool {
         entry.host == cert.host && entry.port == cert.port && entry.fingerprint == cert.fingerprint
     };
     if scope == 0 {
-        EXCEPTIONS.with(|entries| entries.borrow().iter().any(matches))
+        exceptions().lock().unwrap().iter().any(matches)
     } else {
-        SESSION.with(|entries| {
-            entries
-                .borrow()
-                .get(&scope)
-                .is_some_and(|entries| entries.iter().any(matches))
-        })
+        session()
+            .lock()
+            .unwrap()
+            .get(&scope)
+            .is_some_and(|entries| entries.iter().any(matches))
     }
 }
 
@@ -106,11 +116,16 @@ pub fn trust(cert: &Presented, scope: u64) -> std::io::Result<()> {
         fingerprint: cert.fingerprint.clone(),
     };
     if scope != 0 {
-        SESSION.with(|entries| entries.borrow_mut().entry(scope).or_default().push(entry));
+        session()
+            .lock()
+            .unwrap()
+            .entry(scope)
+            .or_default()
+            .push(entry);
         return Ok(());
     }
-    EXCEPTIONS.with(|entries| {
-        let mut entries = entries.borrow_mut();
+    {
+        let mut entries = exceptions().lock().unwrap();
         if !entries.iter().any(|saved| {
             saved.host == entry.host
                 && saved.port == entry.port
@@ -127,13 +142,11 @@ pub fn trust(cert: &Presented, scope: u64) -> std::io::Result<()> {
             }
         }
         Ok(())
-    })
+    }
 }
 
 pub fn forget_private(scope: u64) {
-    SESSION.with(|entries| {
-        entries.borrow_mut().remove(&scope);
-    });
+    session().lock().unwrap().remove(&scope);
 }
 
 #[cfg(test)]
@@ -155,6 +168,12 @@ mod tests {
         let scope = 987654321;
         trust(&cert, scope).unwrap();
         assert!(is_trusted(&cert, scope));
+        let other_thread = cert.clone();
+        assert!(
+            std::thread::spawn(move || is_trusted(&other_thread, scope))
+                .join()
+                .unwrap()
+        );
         assert!(!is_trusted(
             &Presented {
                 host: "other.local".into(),
