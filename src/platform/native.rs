@@ -13,6 +13,8 @@ use objc2_foundation::{
 };
 use objc2_web_kit::{WKSnapshotConfiguration, WKWebView};
 
+use crate::icons::Icon;
+
 /// WebKit's default media prompt forgets its answer when a view is rebuilt.
 /// Ask here so an explicit lasting choice can be stored for this host.
 pub fn ask_site_permission(
@@ -62,12 +64,15 @@ pub enum MenuEntry {
         label: String,
         enabled: bool,
         checked: bool,
+        /// Drawn ahead of the label, so a row can be found by its shape.
+        icon: Option<Icon>,
     },
     Separator,
     /// A row that opens another menu.
     Submenu {
         label: String,
         entries: Vec<MenuEntry>,
+        icon: Option<Icon>,
     },
 }
 
@@ -77,6 +82,7 @@ impl MenuEntry {
             label: label.into(),
             enabled: true,
             checked: false,
+            icon: None,
         }
     }
 
@@ -85,6 +91,7 @@ impl MenuEntry {
             label: label.into(),
             enabled: false,
             checked: false,
+            icon: None,
         }
     }
 
@@ -93,6 +100,23 @@ impl MenuEntry {
             label: label.into(),
             enabled: true,
             checked,
+            icon: None,
+        }
+    }
+
+    /// The same row with `icon` ahead of its label.
+    pub fn with_icon(mut self, with: Icon) -> Self {
+        match &mut self {
+            MenuEntry::Item { icon, .. } | MenuEntry::Submenu { icon, .. } => *icon = Some(with),
+            MenuEntry::Separator => {}
+        }
+        self
+    }
+
+    pub fn icon(&self) -> Option<Icon> {
+        match self {
+            MenuEntry::Item { icon, .. } | MenuEntry::Submenu { icon, .. } => *icon,
+            MenuEntry::Separator => None,
         }
     }
 }

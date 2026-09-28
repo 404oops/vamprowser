@@ -175,13 +175,13 @@ impl Browser {
         cx.notify();
         // Where it is, and where else it could go, from the star.
         let mut items: MenuItems = vec![
-            (MenuEntry::disabled(heading), None),
+            (MenuEntry::disabled(heading).with_icon(Icon::StarFilled), None),
             (MenuEntry::Separator, None),
             self.move_to_menu(id),
-            (MenuEntry::item("New Folder…"), Some(Command::FileInNewFolder(id))),
-            (MenuEntry::item("Rename…"), Some(Command::RenameBookmark(id))),
+            (MenuEntry::item("New Folder…").with_icon(Icon::Folder), Some(Command::FileInNewFolder(id))),
+            (MenuEntry::item("Rename…").with_icon(Icon::Pencil), Some(Command::RenameBookmark(id))),
             (MenuEntry::Separator, None),
-            (MenuEntry::item("Delete Bookmark"), Some(Command::DeleteBookmark(id))),
+            (MenuEntry::item("Delete Bookmark").with_icon(Icon::Trash), Some(Command::DeleteBookmark(id))),
         ];
         items.retain(|(entry, _)| !matches!(entry, MenuEntry::Submenu { entries, .. } if entries.is_empty()));
         let at = self
@@ -223,7 +223,7 @@ impl Browser {
                 Some(Command::MoveBookmarkTo(id, Some(folder))),
             ));
         }
-        submenu("Move to", items)
+        submenu(Icon::Forward, "Move to", items)
     }
 
     /// The right-click menu of what's selected in the manager, when it's
@@ -254,13 +254,17 @@ impl Browser {
                 crate::commands::entry(
                     &format!("Open {links} in Tabs"),
                     links > 0,
-                ),
+                )
+                .with_icon(Icon::Tabs),
                 Some(Command::OpenBookmarks(ids.clone())),
             ),
             (MenuEntry::Separator, None),
-            submenu(format!("Move {count} to"), moves),
+            submenu(Icon::Forward, format!("Move {count} to"), moves),
             (MenuEntry::Separator, None),
-            (MenuEntry::item(format!("Delete {count} Items")), Some(Command::DeleteBookmarks(ids))),
+            (
+                MenuEntry::item(format!("Delete {count} Items")).with_icon(Icon::Trash),
+                Some(Command::DeleteBookmarks(ids)),
+            ),
         ]
     }
 
@@ -284,28 +288,41 @@ impl Browser {
             Some(url) => crate::commands::open_entries(url),
             None => vec![
                 (
-                    crate::commands::entry("Open All in Tabs", children > 0),
+                    crate::commands::entry("Open All in Tabs", children > 0).with_icon(Icon::Tabs),
                     Some(Command::OpenBookmarkFolder(id)),
                 ),
-                (MenuEntry::item("New Folder Inside…"), Some(Command::NewBookmarkFolder(Some(id)))),
+                (
+                    MenuEntry::item("New Folder Inside…").with_icon(Icon::Folder),
+                    Some(Command::NewBookmarkFolder(Some(id))),
+                ),
                 (MenuEntry::Separator, None),
             ],
         };
-        items.push((MenuEntry::item("Rename…"), Some(Command::RenameBookmark(id))));
+        items.push((MenuEntry::item("Rename…").with_icon(Icon::Pencil), Some(Command::RenameBookmark(id))));
         if url.is_some() {
-            items.push((MenuEntry::item("Edit Address…"), Some(Command::EditBookmarkUrl(id))));
+            items.push((
+                MenuEntry::item("Edit Address…").with_icon(Icon::Link),
+                Some(Command::EditBookmarkUrl(id)),
+            ));
         }
         items.push(self.move_to_menu(id));
         // Reordering without dragging: along the bar, or up and down a folder.
-        let (earlier, later) = if on_bar { ("Move Left", "Move Right") } else { ("Move Up", "Move Down") };
-        items.push((crate::commands::entry(earlier, index > 0), Some(Command::MoveBookmark(id, -1))));
+        let ((earlier, before), (later, after)) = if on_bar {
+            (("Move Left", Icon::Back), ("Move Right", Icon::Forward))
+        } else {
+            (("Move Up", Icon::ArrowUp), ("Move Down", Icon::ArrowDown))
+        };
         items.push((
-            crate::commands::entry(later, index + 1 < siblings),
+            crate::commands::entry(earlier, index > 0).with_icon(before),
+            Some(Command::MoveBookmark(id, -1)),
+        ));
+        items.push((
+            crate::commands::entry(later, index + 1 < siblings).with_icon(after),
             Some(Command::MoveBookmark(id, 1)),
         ));
         items.push((MenuEntry::Separator, None));
         items.push((
-            MenuEntry::item(if url.is_some() { "Delete Bookmark" } else { "Delete Folder" }),
+            MenuEntry::item(if url.is_some() { "Delete Bookmark" } else { "Delete Folder" }).with_icon(Icon::Trash),
             Some(Command::DeleteBookmark(id)),
         ));
         items
@@ -780,12 +797,20 @@ impl Browser {
                 let mut items: MenuItems = Source::ALL
                     .into_iter()
                     .filter(|s| s.available())
-                    .map(|s| (MenuEntry::item(format!("From {}", s.name())), Some(Command::ImportBookmarks(s))))
+                    .map(|s| {
+                        (
+                            MenuEntry::item(format!("From {}", s.name())).with_icon(Icon::Download),
+                            Some(Command::ImportBookmarks(s)),
+                        )
+                    })
                     .collect();
                 if !items.is_empty() {
                     items.push((MenuEntry::Separator, None));
                 }
-                items.push((MenuEntry::item("From an HTML File…"), Some(Command::ImportBookmarksFile)));
+                items.push((
+                    MenuEntry::item("From an HTML File…").with_icon(Icon::File),
+                    Some(Command::ImportBookmarksFile),
+                ));
                 let at = this.pointer_position(window);
                 this.context_menu(at, items, window, cx);
             }))

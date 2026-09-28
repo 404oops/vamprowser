@@ -2175,18 +2175,21 @@ impl Browser {
         let exists = item.exists();
         let done = item.state == DownloadState::Done && exists;
         vec![
-            (entry("Open", done), Some(Command::OpenDownload(item.id))),
             (
-                entry("Show in Finder", exists),
+                entry("Open", done).with_icon(Icon::Open),
+                Some(Command::OpenDownload(item.id)),
+            ),
+            (
+                entry("Show in Finder", exists).with_icon(Icon::Search),
                 Some(Command::RevealDownload(item.id)),
             ),
             (
-                MenuEntry::item("Copy Download Link"),
+                MenuEntry::item("Copy Download Link").with_icon(Icon::Link),
                 Some(Command::Copy(item.url.clone())),
             ),
             (MenuEntry::Separator, None),
             (
-                MenuEntry::item("Remove from List"),
+                MenuEntry::item("Remove from List").with_icon(Icon::Close),
                 Some(Command::RemoveDownload(item.id)),
             ),
         ]

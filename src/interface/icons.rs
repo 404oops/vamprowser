@@ -34,6 +34,30 @@ pub enum Icon {
     Folder,
     Sound,
     SoundMuted,
+    Check,
+    Duplicate,
+    Trash,
+    Pencil,
+    Undo,
+    ArrowUp,
+    ArrowDown,
+    CloseRight,
+    Tabs,
+    Open,
+    Paste,
+    Text,
+    Markdown,
+    Shield,
+    Cookie,
+    Camera,
+    Microphone,
+    Screen,
+    Database,
+    Hide,
+    Play,
+    Captions,
+    Globe,
+    Sliders,
 }
 
 /// `icon` drawn `size` points square in `color`.
@@ -162,7 +186,18 @@ fn paint(icon: Icon, bounds: Bounds<Pixels>, color: Rgba, window: &mut Window) {
         }
         Icon::Sound | Icon::SoundMuted => {
             let mut speaker = stroke();
-            polyline(&mut speaker, &[(2.0, 6.0), (4.5, 6.0), (8.0, 3.0), (8.0, 13.0), (4.5, 10.0), (2.0, 10.0), (2.0, 6.0)]);
+            polyline(
+                &mut speaker,
+                &[
+                    (2.0, 6.0),
+                    (4.5, 6.0),
+                    (8.0, 3.0),
+                    (8.0, 13.0),
+                    (4.5, 10.0),
+                    (2.0, 10.0),
+                    (2.0, 6.0),
+                ],
+            );
             paths.push(speaker);
             if icon == Icon::SoundMuted {
                 let mut slash = stroke();
@@ -356,12 +391,288 @@ fn paint(icon: Icon, bounds: Bounds<Pixels>, color: Rgba, window: &mut Window) {
             polyline(&mut path, &[(9.5, 2.5), (9.5, 5.5), (12.5, 5.5)]);
             paths.push(path);
         }
+        Icon::Check => {
+            let mut path = stroke();
+            polyline(&mut path, &[(3.25, 8.5), (6.5, 11.75), (12.75, 4.5)]);
+            paths.push(path);
+        }
+        Icon::Duplicate => {
+            // A sheet in front of another, a plus on the front one.
+            let mut front = stroke();
+            rounded_rect(&mut front, &at, (5.25, 5.25), (13.5, 13.5), 1.75);
+            polyline(&mut front, &[(9.4, 7.6), (9.4, 11.15)]);
+            polyline(&mut front, &[(7.6, 9.4), (11.15, 9.4)]);
+            paths.push(front);
+            let mut back = stroke();
+            back.move_to(at(10.75, 2.5));
+            back.line_to(at(4.25, 2.5));
+            back.curve_to(at(2.5, 4.25), at(2.5, 2.5));
+            back.line_to(at(2.5, 10.75));
+            paths.push(back);
+        }
+        Icon::Trash => {
+            let mut path = stroke();
+            polyline(&mut path, &[(2.5, 4.5), (13.5, 4.5)]);
+            polyline(
+                &mut path,
+                &[(6.0, 4.5), (6.0, 2.5), (10.0, 2.5), (10.0, 4.5)],
+            );
+            polyline(
+                &mut path,
+                &[(4.0, 4.5), (4.75, 13.5), (11.25, 13.5), (12.0, 4.5)],
+            );
+            polyline(&mut path, &[(6.75, 7.25), (6.75, 11.0)]);
+            polyline(&mut path, &[(9.25, 7.25), (9.25, 11.0)]);
+            paths.push(path);
+        }
+        Icon::Pencil => {
+            let mut path = stroke();
+            polyline(
+                &mut path,
+                &[
+                    (10.5, 2.75),
+                    (13.25, 5.5),
+                    (5.5, 13.25),
+                    (2.75, 13.25),
+                    (2.75, 10.5),
+                ],
+            );
+            path.close();
+            polyline(&mut path, &[(8.75, 4.5), (11.5, 7.25)]);
+            paths.push(path);
+        }
+        Icon::Undo => {
+            // A hook back to the left, as in "take that back".
+            let mut path = stroke();
+            path.move_to(at(2.75, 6.0));
+            path.line_to(at(9.5, 6.0));
+            path.curve_to(at(13.25, 9.5), at(13.25, 6.0));
+            path.curve_to(at(9.5, 13.0), at(13.25, 13.0));
+            path.line_to(at(5.5, 13.0));
+            polyline(&mut path, &[(5.75, 3.0), (2.75, 6.0), (5.75, 9.0)]);
+            paths.push(path);
+        }
+        Icon::ArrowUp | Icon::ArrowDown => {
+            let flip = |y: f32| if icon == Icon::ArrowUp { y } else { 16.0 - y };
+            let mut path = stroke();
+            polyline(&mut path, &[(8.0, flip(12.5)), (8.0, flip(3.5))]);
+            polyline(
+                &mut path,
+                &[(4.0, flip(7.5)), (8.0, flip(3.5)), (12.0, flip(7.5))],
+            );
+            paths.push(path);
+        }
+        Icon::CloseRight => {
+            // An arrow into a wall on the right.
+            let mut path = stroke();
+            polyline(&mut path, &[(13.5, 3.0), (13.5, 13.0)]);
+            polyline(&mut path, &[(2.5, 8.0), (10.5, 8.0)]);
+            polyline(&mut path, &[(7.0, 4.5), (10.5, 8.0), (7.0, 11.5)]);
+            paths.push(path);
+        }
+        Icon::Tabs => {
+            // A window with a strip of three tabs along its top.
+            let mut path = stroke();
+            rounded_rect(&mut path, &at, (1.75, 2.75), (14.25, 13.25), 2.0);
+            polyline(&mut path, &[(1.75, 6.25), (14.25, 6.25)]);
+            polyline(&mut path, &[(6.0, 2.75), (6.0, 6.25)]);
+            polyline(&mut path, &[(10.0, 2.75), (10.0, 6.25)]);
+            paths.push(path);
+        }
+        Icon::Open => {
+            // Out of the box, up and to the right.
+            let mut path = stroke();
+            polyline(
+                &mut path,
+                &[
+                    (7.0, 2.75),
+                    (2.75, 2.75),
+                    (2.75, 13.25),
+                    (13.25, 13.25),
+                    (13.25, 9.0),
+                ],
+            );
+            polyline(&mut path, &[(7.75, 8.25), (13.25, 2.75)]);
+            polyline(&mut path, &[(9.0, 2.75), (13.25, 2.75), (13.25, 7.0)]);
+            paths.push(path);
+        }
+        Icon::Paste => {
+            // A clipboard, its outline broken where the clip grips it.
+            let mut board = stroke();
+            board.move_to(at(5.5, 3.5));
+            board.line_to(at(5.0, 3.5));
+            board.curve_to(at(3.25, 5.25), at(3.25, 3.5));
+            board.line_to(at(3.25, 12.0));
+            board.curve_to(at(5.0, 13.75), at(3.25, 13.75));
+            board.line_to(at(11.0, 13.75));
+            board.curve_to(at(12.75, 12.0), at(12.75, 13.75));
+            board.line_to(at(12.75, 5.25));
+            board.curve_to(at(11.0, 3.5), at(12.75, 3.5));
+            board.line_to(at(10.5, 3.5));
+            paths.push(board);
+            let mut clip = stroke();
+            rounded_rect(&mut clip, &at, (6.25, 2.0), (9.75, 4.75), 1.0);
+            paths.push(clip);
+            let mut lines = stroke();
+            polyline(&mut lines, &[(5.75, 8.25), (10.25, 8.25)]);
+            polyline(&mut lines, &[(5.75, 11.0), (8.75, 11.0)]);
+            paths.push(lines);
+        }
+        Icon::Text => {
+            let mut path = stroke();
+            polyline(
+                &mut path,
+                &[(3.5, 4.5), (3.5, 3.0), (12.5, 3.0), (12.5, 4.5)],
+            );
+            polyline(&mut path, &[(8.0, 3.0), (8.0, 13.0)]);
+            polyline(&mut path, &[(6.0, 13.0), (10.0, 13.0)]);
+            paths.push(path);
+        }
+        Icon::Markdown => {
+            let mut path = stroke();
+            rounded_rect(&mut path, &at, (1.25, 3.75), (14.75, 12.25), 1.75);
+            polyline(
+                &mut path,
+                &[
+                    (3.75, 10.0),
+                    (3.75, 6.0),
+                    (5.75, 8.0),
+                    (7.75, 6.0),
+                    (7.75, 10.0),
+                ],
+            );
+            polyline(&mut path, &[(11.25, 6.0), (11.25, 10.0)]);
+            polyline(&mut path, &[(9.75, 8.5), (11.25, 10.0), (12.75, 8.5)]);
+            paths.push(path);
+        }
+        Icon::Shield => {
+            let mut path = stroke();
+            path.move_to(at(8.0, 2.25));
+            path.line_to(at(13.0, 4.0));
+            path.line_to(at(13.0, 7.75));
+            path.curve_to(at(8.0, 13.75), at(13.0, 12.0));
+            path.curve_to(at(3.0, 7.75), at(3.0, 12.0));
+            path.line_to(at(3.0, 4.0));
+            path.close();
+            paths.push(path);
+        }
+        Icon::Cookie => {
+            let mut path = stroke();
+            polyline(&mut path, &ring(8.0, 8.0, 5.75, 5.75));
+            paths.push(path);
+            for (x, y) in [(6.0, 6.25), (10.25, 7.0), (7.0, 10.5), (10.0, 10.5)] {
+                let mut chip = PathBuilder::fill();
+                polyline(&mut chip, &ring(x, y, 0.95, 0.95));
+                chip.close();
+                paths.push(chip);
+            }
+        }
+        Icon::Camera => {
+            let mut path = stroke();
+            rounded_rect(&mut path, &at, (1.75, 4.25), (10.5, 11.75), 1.75);
+            polyline(
+                &mut path,
+                &[(10.5, 7.0), (14.25, 4.75), (14.25, 11.25), (10.5, 9.0)],
+            );
+            paths.push(path);
+        }
+        Icon::Microphone => {
+            let mut capsule = stroke();
+            rounded_rect(&mut capsule, &at, (5.75, 1.75), (10.25, 9.5), 2.25);
+            paths.push(capsule);
+            let mut stand = stroke();
+            stand.move_to(at(3.5, 7.5));
+            stand.curve_to(at(8.0, 12.0), at(3.5, 12.0));
+            stand.curve_to(at(12.5, 7.5), at(12.5, 12.0));
+            polyline(&mut stand, &[(8.0, 12.0), (8.0, 14.25)]);
+            polyline(&mut stand, &[(5.75, 14.25), (10.25, 14.25)]);
+            paths.push(stand);
+        }
+        Icon::Screen => {
+            let mut path = stroke();
+            rounded_rect(&mut path, &at, (1.75, 2.75), (14.25, 10.75), 1.5);
+            polyline(&mut path, &[(8.0, 10.75), (8.0, 13.25)]);
+            polyline(&mut path, &[(5.0, 13.25), (11.0, 13.25)]);
+            paths.push(path);
+        }
+        Icon::Database => {
+            let mut path = stroke();
+            polyline(&mut path, &ring(8.0, 4.0, 5.0, 1.75));
+            // The lower halves of the rims further down.
+            for y in [8.0, 12.0] {
+                let rim: Vec<(f32, f32)> = (0..=12)
+                    .map(|i| {
+                        let a = (i as f32 * 15.0).to_radians();
+                        (8.0 + 5.0 * a.cos(), y + 1.75 * a.sin())
+                    })
+                    .collect();
+                polyline(&mut path, &rim);
+            }
+            polyline(&mut path, &[(3.0, 4.0), (3.0, 12.0)]);
+            polyline(&mut path, &[(13.0, 4.0), (13.0, 12.0)]);
+            paths.push(path);
+        }
+        Icon::Hide => {
+            // An eye, struck through.
+            let mut path = stroke();
+            path.move_to(at(1.75, 8.0));
+            path.curve_to(at(14.25, 8.0), at(8.0, 1.5));
+            path.curve_to(at(1.75, 8.0), at(8.0, 14.5));
+            path.close();
+            polyline(&mut path, &ring(8.0, 8.0, 2.0, 2.0));
+            paths.push(path);
+            let mut slash = stroke();
+            polyline(&mut slash, &[(3.0, 13.0), (13.0, 3.0)]);
+            paths.push(slash);
+        }
+        Icon::Play => {
+            let mut path = stroke();
+            rounded_rect(&mut path, &at, (1.75, 3.0), (14.25, 13.0), 2.0);
+            polyline(&mut path, &[(6.5, 5.75), (10.75, 8.0), (6.5, 10.25)]);
+            path.close();
+            paths.push(path);
+        }
+        Icon::Captions => {
+            let mut path = stroke();
+            rounded_rect(&mut path, &at, (1.75, 3.25), (14.25, 12.75), 2.0);
+            polyline(&mut path, &[(4.5, 8.0), (7.5, 8.0)]);
+            polyline(&mut path, &[(9.25, 8.0), (11.5, 8.0)]);
+            polyline(&mut path, &[(4.5, 10.25), (9.75, 10.25)]);
+            paths.push(path);
+        }
+        Icon::Globe => {
+            let mut path = stroke();
+            polyline(&mut path, &ring(8.0, 8.0, 6.0, 6.0));
+            polyline(&mut path, &ring(8.0, 8.0, 2.6, 6.0));
+            polyline(&mut path, &[(2.0, 8.0), (14.0, 8.0)]);
+            paths.push(path);
+        }
+        Icon::Sliders => {
+            let mut path = stroke();
+            polyline(&mut path, &[(2.25, 5.0), (8.0, 5.0)]);
+            polyline(&mut path, &[(12.0, 5.0), (13.75, 5.0)]);
+            polyline(&mut path, &ring(10.0, 5.0, 2.0, 2.0));
+            polyline(&mut path, &[(2.25, 11.0), (4.0, 11.0)]);
+            polyline(&mut path, &[(8.0, 11.0), (13.75, 11.0)]);
+            polyline(&mut path, &ring(6.0, 11.0, 2.0, 2.0));
+            paths.push(path);
+        }
     }
     for path in paths {
         if let Ok(path) = path.build() {
             window.paint_path(path, color);
         }
     }
+}
+
+/// Points around an ellipse, closed back at the first.
+fn ring(cx: f32, cy: f32, rx: f32, ry: f32) -> Vec<(f32, f32)> {
+    (0..=32)
+        .map(|i| {
+            let a = (i as f32 * 11.25).to_radians();
+            (cx + rx * a.cos(), cy + ry * a.sin())
+        })
+        .collect()
 }
 
 fn rounded_rect(

@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.4.7 — 2026-09-28
+
+- Right-click menus were redesigned. Each menu is as wide as its longest label (184–340 pt) instead of a fixed width, with rounded corners, a hairline border, a native shadow, larger 13 pt text, and more room around rows and separators. Menus only reserve space for icons, checkmarks, or submenu chevrons when they have some; checkmarks now sit on the right in the accent colour.
+- Menus sweep in. Opening, the panel unrolls from the pointer (upward for shelf menus) while its rows settle in one after another; entering a submenu sweeps its rows in from the right, and going back sweeps them in from the left. The stagger stops after eight rows so long menus are ready at once, and `VAMPIR_SLOW_MOTION` slows it like the other animations.
+- Menu rows now have icons: tab, tab strip, toolbar, reload button, address bar, bookmarks bar, bookmark and folder, bookmark star, bookmark import, site controls, media download, start page and history link, download, and extension menus. The row under the pointer is highlighted and its icon takes the accent colour. Submenus are headed by the row that opened them (“‹ Tracking protection”) instead of “Back”.
+- 25 new icons were added in the toolbar's style, including checkmark, trash, pencil, undo, tabs, clipboard, shield, cookie, camera, microphone, screen, database, and globe.
+
 ## v0.4.6 — 2026-09-28
 
 - The signed macOS app now allows WebKit to load sites outside App Transport Security's app defaults. Explicitly trusted self-signed certificates work in the installed browser; sites without a saved trust choice still show a certificate warning. The exception applies to web content, not the app's other network requests.

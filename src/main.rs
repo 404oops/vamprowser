@@ -3277,12 +3277,13 @@ impl Browser {
             .expect("site controls")
             .get(&host);
         let mut items = vec![
-            (native::MenuEntry::disabled(&host), None),
+            (native::MenuEntry::disabled(&host).with_icon(Icon::Globe), None),
             (native::MenuEntry::Separator, None),
         ];
         if private {
             items.push((
-                native::MenuEntry::disabled("Private tab: permissions are temporary"),
+                native::MenuEntry::disabled("Private tab: permissions are temporary")
+                    .with_icon(Icon::Private),
                 None,
             ));
         } else {
@@ -3300,7 +3301,7 @@ impl Browser {
                 )
             })
             .collect();
-            items.push(submenu("Tracking protection", protection));
+            items.push(submenu(Icon::Shield, "Tracking protection", protection));
             let cookies = [
                 ("Use browser setting", None),
                 ("Block third-party cookies", Some(true)),
@@ -3314,9 +3315,13 @@ impl Browser {
                 )
             })
             .collect();
-            items.push(submenu("Third-party cookies", cookies));
+            items.push(submenu(Icon::Cookie, "Third-party cookies", cookies));
             items.push((native::MenuEntry::Separator, None));
-            for (label, slot) in [("Camera", 0), ("Microphone", 1), ("Screen capture", 2)] {
+            for (glyph, label, slot) in [
+                (Icon::Camera, "Camera", 0),
+                (Icon::Microphone, "Microphone", 1),
+                (Icon::Screen, "Screen capture", 2),
+            ] {
                 let choices = std::iter::once(("Use browser setting", None))
                     .chain(SitePermission::ALL.into_iter().map(|choice| (choice.label(), Some(choice))))
                     .map(|(label, choice)| {
@@ -3326,29 +3331,31 @@ impl Browser {
                         )
                     })
                     .collect();
-                items.push(submenu(label, choices));
+                items.push(submenu(glyph, label, choices));
             }
         }
         items.push((native::MenuEntry::Separator, None));
         items.push(submenu(
+            Icon::Database,
             "Site data",
             vec![
                 (
-                    native::MenuEntry::item("Clear cookies"),
+                    native::MenuEntry::item("Clear cookies").with_icon(Icon::Cookie),
                     Some(Command::ClearSiteData(
                         host.clone(),
                         cache::SiteDataKind::Cookies,
                     )),
                 ),
                 (
-                    native::MenuEntry::item("Clear local storage and databases"),
+                    native::MenuEntry::item("Clear local storage and databases")
+                        .with_icon(Icon::Database),
                     Some(Command::ClearSiteData(
                         host.clone(),
                         cache::SiteDataKind::Storage,
                     )),
                 ),
                 (
-                    native::MenuEntry::item("Clear all data for this site"),
+                    native::MenuEntry::item("Clear all data for this site").with_icon(Icon::Trash),
                     Some(Command::ClearSiteData(host, cache::SiteDataKind::All)),
                 ),
             ],
@@ -5333,7 +5340,8 @@ impl Browser {
                         cx.listener(|this, event: &MouseDownEvent, window, cx| {
                             cx.stop_propagation();
                             let items = vec![(
-                                native::MenuEntry::item("Manage Extensions…"),
+                                native::MenuEntry::item("Manage Extensions…")
+                                    .with_icon(Icon::Puzzle),
                                 Some(Command::Settings(Section::Extensions)),
                             )];
                             this.context_menu(event.position, items, window, cx);

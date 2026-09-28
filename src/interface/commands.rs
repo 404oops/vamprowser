@@ -6,7 +6,9 @@ use gpui::{ClipboardItem, Context, Pixels, Point, Window};
 use wry::WebViewExtMacOS;
 
 use crate::{
-    Browser, Page, PingTarget, TabTarget, media,
+    Browser, Page, PingTarget, TabTarget,
+    icons::Icon,
+    media,
     native::MenuEntry,
     settings::{Protection, SitePermission, StartSection, ToolbarItem},
 };
@@ -878,57 +880,74 @@ impl Browser {
         let web = tab.page == Page::Web;
         let bookmarked = web && self.bookmarks().find_url(&tab.url).is_some();
         vec![
-            (MenuEntry::item("New Tab"), Some(Command::NewTab)),
             (
-                MenuEntry::item("New Private Tab"),
+                MenuEntry::item("New Tab").with_icon(Icon::Plus),
+                Some(Command::NewTab),
+            ),
+            (
+                MenuEntry::item("New Private Tab").with_icon(Icon::Private),
                 Some(Command::NewPrivateTab),
             ),
             (MenuEntry::Separator, None),
-            (entry("Reload Tab", web), Some(Command::ReloadTab(id))),
             (
-                entry(if tab.muted { "Unmute Tab" } else { "Mute Tab" }, web),
-                Some(Command::ToggleTabMute(id)),
+                entry("Reload Tab", web).with_icon(Icon::Reload),
+                Some(Command::ReloadTab(id)),
             ),
+            if tab.muted {
+                (
+                    entry("Unmute Tab", web).with_icon(Icon::Sound),
+                    Some(Command::ToggleTabMute(id)),
+                )
+            } else {
+                (
+                    entry("Mute Tab", web).with_icon(Icon::SoundMuted),
+                    Some(Command::ToggleTabMute(id)),
+                )
+            },
             (
-                MenuEntry::item("Duplicate Tab"),
+                MenuEntry::item("Duplicate Tab").with_icon(Icon::Duplicate),
                 Some(Command::DuplicateTab(id)),
             ),
+            if bookmarked {
+                (
+                    entry("Bookmarked", false).with_icon(Icon::StarFilled),
+                    Some(Command::BookmarkTab(id)),
+                )
+            } else {
+                (
+                    entry("Bookmark Tab", web).with_icon(Icon::Star),
+                    Some(Command::BookmarkTab(id)),
+                )
+            },
             (
-                entry(
-                    if bookmarked {
-                        "Bookmarked"
-                    } else {
-                        "Bookmark Tab"
-                    },
-                    web && !bookmarked,
-                ),
-                Some(Command::BookmarkTab(id)),
-            ),
-            (
-                entry("Copy Link", web),
+                entry("Copy Link", web).with_icon(Icon::Link),
                 Some(Command::Copy(tab.url.clone())),
             ),
             (
-                entry("Copy Link Without Tracking", web),
+                entry("Copy Link Without Tracking", web).with_icon(Icon::Shield),
                 Some(Command::Copy(clean_link(&tab.url))),
             ),
             (MenuEntry::Separator, None),
-            (MenuEntry::item("Close Tab"), Some(Command::CloseTabId(id))),
             (
-                entry("Close Other Tabs", self.tabs.len() > 1),
+                MenuEntry::item("Close Tab").with_icon(Icon::Close),
+                Some(Command::CloseTabId(id)),
+            ),
+            (
+                entry("Close Other Tabs", self.tabs.len() > 1).with_icon(Icon::Tabs),
                 Some(Command::CloseOtherTabs(id)),
             ),
             (
-                entry("Close Tabs to the Right", index + 1 < self.tabs.len()),
+                entry("Close Tabs to the Right", index + 1 < self.tabs.len())
+                    .with_icon(Icon::CloseRight),
                 Some(Command::CloseTabsToRight(id)),
             ),
             (MenuEntry::Separator, None),
             (
-                entry("Reopen Closed Tab", !self.recently_closed.is_empty()),
+                entry("Reopen Closed Tab", !self.recently_closed.is_empty()).with_icon(Icon::Undo),
                 Some(Command::ReopenClosedTab),
             ),
             (
-                MenuEntry::checked("Vertical Tabs", self.vertical_tabs),
+                MenuEntry::checked("Vertical Tabs", self.vertical_tabs).with_icon(Icon::Sidebar),
                 Some(Command::ToggleVerticalTabs),
             ),
         ]
@@ -936,22 +955,25 @@ impl Browser {
 
     pub(crate) fn tab_strip_menu(&self) -> Vec<(MenuEntry, Option<Command>)> {
         vec![
-            (MenuEntry::item("New Tab"), Some(Command::NewTab)),
             (
-                MenuEntry::item("New Private Tab"),
+                MenuEntry::item("New Tab").with_icon(Icon::Plus),
+                Some(Command::NewTab),
+            ),
+            (
+                MenuEntry::item("New Private Tab").with_icon(Icon::Private),
                 Some(Command::NewPrivateTab),
             ),
             (
-                entry("Reopen Closed Tab", !self.recently_closed.is_empty()),
+                entry("Reopen Closed Tab", !self.recently_closed.is_empty()).with_icon(Icon::Undo),
                 Some(Command::ReopenClosedTab),
             ),
             (MenuEntry::Separator, None),
             (
-                MenuEntry::checked("Vertical Tabs", self.vertical_tabs),
+                MenuEntry::checked("Vertical Tabs", self.vertical_tabs).with_icon(Icon::Sidebar),
                 Some(Command::ToggleVerticalTabs),
             ),
             (
-                MenuEntry::checked("Bookmarks Bar", self.bookmarks_bar),
+                MenuEntry::checked("Bookmarks Bar", self.bookmarks_bar).with_icon(Icon::Bookmark),
                 Some(Command::ToggleBookmarksBar),
             ),
         ]
@@ -961,20 +983,20 @@ impl Browser {
         let web = self.current().page == Page::Web;
         vec![
             (
-                entry("Bookmark This Page", web && !self.bookmarked()),
+                entry("Bookmark This Page", web && !self.bookmarked()).with_icon(Icon::Star),
                 Some(Command::BookmarkPage),
             ),
             (
-                MenuEntry::item("New Folder…"),
+                MenuEntry::item("New Folder…").with_icon(Icon::Folder),
                 Some(Command::NewBookmarkFolder(None)),
             ),
             (MenuEntry::Separator, None),
             (
-                MenuEntry::item("Manage Bookmarks…"),
+                MenuEntry::item("Manage Bookmarks…").with_icon(Icon::Bookmark),
                 Some(Command::ShowBookmarks),
             ),
             (
-                MenuEntry::item("Hide Bookmarks Bar"),
+                MenuEntry::item("Hide Bookmarks Bar").with_icon(Icon::Hide),
                 Some(Command::ToggleBookmarksBar),
             ),
         ]
@@ -984,34 +1006,40 @@ impl Browser {
         let tab = self.current();
         let web = tab.page == Page::Web;
         vec![
-            (entry("Paste and Go", clipboard), Some(Command::PasteAndGo)),
-            (MenuEntry::Separator, None),
-            (entry("Copy Link", web), Some(Command::CopyLink)),
             (
-                entry("Copy Link Without Tracking", web),
+                entry("Paste and Go", clipboard).with_icon(Icon::Paste),
+                Some(Command::PasteAndGo),
+            ),
+            (MenuEntry::Separator, None),
+            (
+                entry("Copy Link", web).with_icon(Icon::Link),
+                Some(Command::CopyLink),
+            ),
+            (
+                entry("Copy Link Without Tracking", web).with_icon(Icon::Shield),
                 Some(Command::CopyCleanLink),
             ),
             (
-                entry("Copy Link as Markdown", web),
+                entry("Copy Link as Markdown", web).with_icon(Icon::Markdown),
                 Some(Command::CopyMarkdownLink),
             ),
             (
-                entry("Copy Page Title", web),
+                entry("Copy Page Title", web).with_icon(Icon::Text),
                 Some(Command::Copy(tab.title.clone())),
             ),
             (MenuEntry::Separator, None),
             match self.bookmarks().find_url(&tab.url) {
                 Some(id) => (
-                    entry("Delete Bookmark", web),
+                    entry("Delete Bookmark", web).with_icon(Icon::Trash),
                     Some(Command::DeleteBookmark(id)),
                 ),
                 None => (
-                    entry("Bookmark This Page", web),
+                    entry("Bookmark This Page", web).with_icon(Icon::Star),
                     Some(Command::BookmarkPage),
                 ),
             },
             (
-                MenuEntry::item("Settings: Search Engine…"),
+                MenuEntry::item("Settings: Search Engine…").with_icon(Icon::Search),
                 Some(Command::Settings(Section::Search)),
             ),
         ]
@@ -1028,7 +1056,12 @@ impl Browser {
         let private = self.current().private;
         let make = |label: String, choice: media::Choice| {
             (
-                MenuEntry::item(label),
+                MenuEntry::item(label).with_icon(match choice {
+                    media::Choice::Bundle => Icon::Folder,
+                    media::Choice::Description => Icon::File,
+                    media::Choice::Format(_) => Icon::Download,
+                    media::Choice::Subtitle(..) => Icon::Captions,
+                }),
                 Some(Command::DownloadMedia(
                     url.to_owned(),
                     info.clone(),
@@ -1067,14 +1100,20 @@ impl Browser {
             })
             .collect();
         if videos.is_empty() {
-            items.push((MenuEntry::disabled("No video formats"), None));
+            items.push((
+                MenuEntry::disabled("No video formats").with_icon(Icon::Play),
+                None,
+            ));
         } else {
-            items.push(submenu("Video formats", videos));
+            items.push(submenu(Icon::Play, "Video formats", videos));
         }
         if audios.is_empty() {
-            items.push((MenuEntry::disabled("No separate audio formats"), None));
+            items.push((
+                MenuEntry::disabled("No separate audio formats").with_icon(Icon::Sound),
+                None,
+            ));
         } else {
-            items.push(submenu("Audio formats", audios));
+            items.push(submenu(Icon::Sound, "Audio formats", audios));
         }
         let mut subtitles = Vec::new();
         for lang in info.subtitles.keys() {
@@ -1090,7 +1129,7 @@ impl Browser {
             ));
         }
         if !subtitles.is_empty() {
-            items.push(submenu("Subtitles", subtitles));
+            items.push(submenu(Icon::Captions, "Subtitles", subtitles));
         }
         items
     }
@@ -1099,9 +1138,12 @@ impl Browser {
         let web = self.current().page == Page::Web;
         match item {
             ToolbarItem::Reload => vec![
-                (entry("Reload Page", web), Some(Command::Reload)),
                 (
-                    entry("Erase Cache and Reload", web),
+                    entry("Reload Page", web).with_icon(Icon::Reload),
+                    Some(Command::Reload),
+                ),
+                (
+                    entry("Erase Cache and Reload", web).with_icon(Icon::Trash),
                     Some(Command::EraseCacheAndReload),
                 ),
             ],
@@ -1113,20 +1155,20 @@ impl Browser {
     pub(crate) fn toolbar_menu(&self) -> Vec<(MenuEntry, Option<Command>)> {
         let mut items = Vec::new();
         items.push((
-            MenuEntry::item("Customize Toolbar…"),
+            MenuEntry::item("Customize Toolbar…").with_icon(Icon::Sliders),
             Some(Command::Settings(Section::Toolbar)),
         ));
         items.push((
-            MenuEntry::item("Reset Toolbar"),
+            MenuEntry::item("Reset Toolbar").with_icon(Icon::Undo),
             Some(Command::ResetToolbar),
         ));
         items.push((MenuEntry::Separator, None));
         items.push((
-            MenuEntry::checked("Bookmarks Bar", self.bookmarks_bar),
+            MenuEntry::checked("Bookmarks Bar", self.bookmarks_bar).with_icon(Icon::Bookmark),
             Some(Command::ToggleBookmarksBar),
         ));
         items.push((
-            MenuEntry::checked("Vertical Tabs", self.vertical_tabs),
+            MenuEntry::checked("Vertical Tabs", self.vertical_tabs).with_icon(Icon::Sidebar),
             Some(Command::ToggleVerticalTabs),
         ));
         items
@@ -1142,7 +1184,7 @@ impl Browser {
         let mut items = open_entries(&url);
         if in_history {
             items.push((
-                MenuEntry::item("Remove Page from History"),
+                MenuEntry::item("Remove Page from History").with_icon(Icon::Trash),
                 Some(Command::ForgetPage(url)),
             ));
         }
@@ -1205,19 +1247,25 @@ mod tests {
 pub(crate) fn open_entries(url: &str) -> Vec<(MenuEntry, Option<Command>)> {
     let open = |place| Some(Command::Open(url.to_owned(), place));
     vec![
-        (MenuEntry::item("Open"), open(Place::Here)),
-        (MenuEntry::item("Open in New Tab"), open(Place::NewTab)),
         (
-            MenuEntry::item("Open in Background Tab"),
+            MenuEntry::item("Open").with_icon(Icon::Open),
+            open(Place::Here),
+        ),
+        (
+            MenuEntry::item("Open in New Tab").with_icon(Icon::Plus),
+            open(Place::NewTab),
+        ),
+        (
+            MenuEntry::item("Open in Background Tab").with_icon(Icon::Tabs),
             open(Place::BackgroundTab),
         ),
         (
-            MenuEntry::item("Open in Private Tab"),
+            MenuEntry::item("Open in Private Tab").with_icon(Icon::Private),
             open(Place::PrivateTab),
         ),
         (MenuEntry::Separator, None),
         (
-            MenuEntry::item("Copy Link"),
+            MenuEntry::item("Copy Link").with_icon(Icon::Link),
             Some(Command::Copy(url.to_owned())),
         ),
     ]
@@ -1226,6 +1274,7 @@ pub(crate) fn open_entries(url: &str) -> Vec<(MenuEntry, Option<Command>)> {
 /// A row that opens another menu of `items`. Its entries' commands ride
 /// along in [`Command::Submenu`], in the order the popup numbers them.
 pub(crate) fn submenu(
+    icon: Icon,
     label: impl Into<String>,
     items: Vec<(MenuEntry, Option<Command>)>,
 ) -> (MenuEntry, Option<Command>) {
@@ -1234,6 +1283,7 @@ pub(crate) fn submenu(
         MenuEntry::Submenu {
             label: label.into(),
             entries,
+            icon: Some(icon),
         },
         Some(Command::Submenu(flatten(items))),
     )
