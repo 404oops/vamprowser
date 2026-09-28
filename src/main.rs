@@ -39,6 +39,8 @@ mod cache;
 mod history;
 #[path = "data/settings.rs"]
 mod settings;
+#[path = "data/site_controls.rs"]
+mod site_controls;
 #[path = "data/sitedata.rs"]
 mod sitedata;
 #[path = "data/state.rs"]
@@ -108,6 +110,7 @@ use std::{
 
 use async_channel::{Receiver, Sender};
 use block2::RcBlock;
+use bookmarks::Bookmarks;
 use commands::{Command, Place, Section};
 use downloads::Downloads;
 use extensions::{ExtensionEvent, Extensions};
@@ -129,7 +132,7 @@ use settings::{
     NewTabPage, PopupPolicy, SchemeChoice, Settings, SitePermission, Startup, TabPlacement,
     TintMode, ToolbarItem,
 };
-use bookmarks::Bookmarks;
+use site_controls::{SharedSiteControls, SiteControls};
 use state::SavedState;
 use tint::Tint;
 use vampir::{
@@ -175,7 +178,13 @@ enum BrowserEvent {
     DownloadFinished(String, Option<PathBuf>, bool),
     DownloadDragStarted,
     DownloadDragSnapshot(u64, std::time::Instant, Option<Vec<u8>>),
-    MediaInspected(u64, u64, String, gpui::Point<gpui::Pixels>, Result<media::Info, String>),
+    MediaInspected(
+        u64,
+        u64,
+        String,
+        gpui::Point<gpui::Pixels>,
+        Result<media::Info, String>,
+    ),
     MediaFinished(u64, Result<PathBuf, String>),
     /// A still of the page, for behind the tab switcher.
     /// Each still says which tab and switcher opening it's for.
@@ -189,6 +198,8 @@ enum BrowserEvent {
     RulesTimedOut,
     /// A click landed in a page.
     PageClicked,
+    /// Incremental magnification from a trackpad pinch over a page.
+    PageMagnified(f64),
     /// A page began loading.
     LoadStarted(u64),
     AudioChanged(u64, usize, bool),
@@ -521,7 +532,10 @@ fn install_page_click_monitor(
         if !event_in(mouse, ns_window) {
             return event.as_ptr();
         }
-        if matches!(mouse.r#type(), NSEventType::OtherMouseDown | NSEventType::OtherMouseUp) {
+        if matches!(
+            mouse.r#type(),
+            NSEventType::OtherMouseDown | NSEventType::OtherMouseUp
+        ) {
             if let Some(command) = mouse_navigation(mouse.buttonNumber()) {
                 if mouse.r#type() == NSEventType::OtherMouseDown {
                     let _ = sender.try_send(BrowserEvent::Command(command));
@@ -557,12 +571,50 @@ fn install_page_click_monitor(
     }
 }
 
+/// WebKit does not change Wry's page zoom for trackpad pinches. Route
+/// magnification over a page through the same per-tab zoom as the shortcuts.
+fn install_page_magnify_monitor(
+    sender: Sender<BrowserEvent>,
+    ns_window: usize,
+) -> Option<Retained<AnyObject>> {
+    let handler = RcBlock::new(move |event: NonNull<NSEvent>| -> *mut NSEvent {
+        // SAFETY: AppKit owns the event for the callback's duration.
+        let gesture = unsafe { event.as_ref() };
+        let Some(mtm) = objc2::MainThreadMarker::new() else {
+            return event.as_ptr();
+        };
+        if !event_in(gesture, ns_window) {
+            return event.as_ptr();
+        }
+        let in_page = gesture
+            .window(mtm)
+            .and_then(|window| window.contentView())
+            .and_then(|content| {
+                content.hitTest(content.convertPoint_fromView(gesture.locationInWindow(), None))
+            })
+            .is_some_and(in_web_view);
+        if !in_page {
+            return event.as_ptr();
+        }
+        let magnification = gesture.magnification() as f64;
+        if magnification.is_finite() && magnification != 0.0 {
+            let _ = sender.try_send(BrowserEvent::PageMagnified(magnification));
+        }
+        std::ptr::null_mut()
+    });
+    // SAFETY: the block returns the live event or consumes it, as AppKit requires.
+    unsafe { NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSEventMask::Magnify, &handler) }
+}
+
 /// Whether `view` is a web view or inside one.
 fn in_web_view(view: Retained<objc2_app_kit::NSView>) -> bool {
     let mut view = Some(view);
     while let Some(current) = view {
         let name = current.class().name();
-        if name.to_str().is_ok_and(|n| n.contains("WKWebView") || n.contains("WryWebView")) {
+        if name
+            .to_str()
+            .is_ok_and(|n| n.contains("WKWebView") || n.contains("WryWebView"))
+        {
             return true;
         }
         // SAFETY: walking up a live view hierarchy on the main thread.
@@ -666,7 +718,11 @@ fn install_shortcut_monitor(
             removable: removable.get(),
             menu_open: menu_open.get(),
             finding: finding.get(),
-            editing: if in_page { page_editing.get() } else { typing.get() },
+            editing: if in_page {
+                page_editing.get()
+            } else {
+                typing.get()
+            },
         };
         match shortcut(&key, key_event.keyCode(), key_event.modifierFlags(), state) {
             Some(command) => {
@@ -876,10 +932,26 @@ fn address_label(url: &str, palette: Palette) -> AnyElement {
         .whitespace_nowrap()
         .text_size(px(14.0))
         .when(!scheme.is_empty(), |el| {
-            el.child(div().flex_none().text_color(dim).child(format!("{scheme}://")))
+            el.child(
+                div()
+                    .flex_none()
+                    .text_color(dim)
+                    .child(format!("{scheme}://")),
+            )
         })
-        .child(div().flex_none().text_color(palette.text_primary).child(host.to_owned()))
-        .child(div().min_w(px(0.0)).truncate().text_color(dim).child(path.to_owned()))
+        .child(
+            div()
+                .flex_none()
+                .text_color(palette.text_primary)
+                .child(host.to_owned()),
+        )
+        .child(
+            div()
+                .min_w(px(0.0))
+                .truncate()
+                .text_color(dim)
+                .child(path.to_owned()),
+        )
         .into_any_element()
 }
 
@@ -901,7 +973,9 @@ fn tool_button(
     } else {
         palette.text_secondary
     };
-    tool_button_inked(id, glyph, ink, label, size, active, true, palette, cx, on_click)
+    tool_button_inked(
+        id, glyph, ink, label, size, active, true, palette, cx, on_click,
+    )
 }
 
 /// [`tool_button`] with its icon in a colour of the caller's choosing.
@@ -946,17 +1020,19 @@ fn tool_button_inked(
             el.on_click(cx.listener(move |this, _, window, cx| on_click(this, window, cx)))
         })
         .child(icon(glyph, 16.0, ink))
-        .when(enabled, |el| el.child(
-            vampir::ring("ring", RADIUS, palette).on_key_down(cx.listener(
-                move |this, event: &KeyDownEvent, window, cx| {
-                    if vampir::key(event) == Some(Key::Activate) {
-                        cx.stop_propagation();
-                        pressed(this, window, cx);
-                        cx.notify();
-                    }
-                },
-            )),
-        ))
+        .when(enabled, |el| {
+            el.child(
+                vampir::ring("ring", RADIUS, palette).on_key_down(cx.listener(
+                    move |this, event: &KeyDownEvent, window, cx| {
+                        if vampir::key(event) == Some(Key::Activate) {
+                            cx.stop_propagation();
+                            pressed(this, window, cx);
+                            cx.notify();
+                        }
+                    },
+                )),
+            )
+        })
         .with_hint(label.into(), hint::Side::Below, cx)
 }
 
@@ -1050,12 +1126,20 @@ fn tab_sound_button(
         .rounded(px(5.0))
         .hover(move |style| style.bg(palette.row_hover))
         .cursor_pointer()
-        .child(icon(if muted { Icon::SoundMuted } else { Icon::Sound }, 14.0, palette.text_secondary))
+        .child(icon(
+            if muted { Icon::SoundMuted } else { Icon::Sound },
+            14.0,
+            palette.text_secondary,
+        ))
         .on_click(cx.listener(move |this, _, _, cx| {
             cx.stop_propagation();
             this.toggle_tab_mute(id, cx);
         }))
-        .with_hint(Hint::new(if muted { "Unmute tab" } else { "Mute tab" }), side, cx)
+        .with_hint(
+            Hint::new(if muted { "Unmute tab" } else { "Mute tab" }),
+            side,
+            cx,
+        )
 }
 
 /// A closed tab still shrinking out of the tab list.
@@ -1136,15 +1220,35 @@ fn parse_internal(url: &str) -> Option<(Page, Option<Section>)> {
 /// a way to try again.
 fn error_page(failure: &navigation::LoadFailure, token: Option<&str>, private: bool) -> String {
     let escape = |text: &str| {
-        text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+        text.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
     };
     let site = site_name(&failure.url);
-    let place = if site.is_empty() { failure.url.clone() } else { site };
+    let place = if site.is_empty() {
+        failure.url.clone()
+    } else {
+        site
+    };
     if let (Some(cert), Some(token)) = (&failure.certificate, token) {
-        let names = if cert.names.is_empty() { "None listed".to_owned() } else { cert.names.join(", ") };
-        let trust_label = if private { "Trust for this private window" } else { "Trust certificate for future visits" };
-        let trust_duration = if private { "This choice lasts until the private window closes." } else { "The choice is saved for future visits." };
-        return format!(r#"<!doctype html><html><head><meta charset="utf-8"><title>Certificate warning for {place}</title>
+        let names = if cert.names.is_empty() {
+            "None listed".to_owned()
+        } else {
+            cert.names.join(", ")
+        };
+        let trust_label = if private {
+            "Trust for this private window"
+        } else {
+            "Trust certificate for future visits"
+        };
+        let trust_duration = if private {
+            "This choice lasts until the private window closes."
+        } else {
+            "The choice is saved for future visits."
+        };
+        return format!(
+            r#"<!doctype html><html><head><meta charset="utf-8"><title>Certificate warning for {place}</title>
 <meta name="color-scheme" content="light dark"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'">
 <style>body{{font:14px -apple-system,system-ui,sans-serif;margin:0;min-height:100vh;display:grid;place-items:center;background:Canvas;color:CanvasText}}main{{box-sizing:border-box;width:min(640px,100%);padding:36px}}h1{{font-size:25px;margin:0 0 10px}}p{{line-height:1.5;color:color-mix(in srgb,CanvasText 75%,transparent)}}.warning{{font-weight:600;color:#e58b59}}dl{{display:grid;grid-template-columns:130px 1fr;gap:10px 14px;padding:20px;border:1px solid color-mix(in srgb,CanvasText 25%,transparent);border-radius:12px;margin:22px 0}}dt{{color:GrayText}}dd{{margin:0;overflow-wrap:anywhere}}code{{font:12px ui-monospace,monospace}}.actions{{display:flex;gap:10px;flex-wrap:wrap;align-items:center}}.actions a{{font:inherit;cursor:pointer;border-radius:8px;padding:9px 15px;text-decoration:none;border:1px solid GrayText;color:CanvasText}}.actions a.trust{{border:0;background:AccentColor;color:AccentColorText;font-weight:600}}small{{display:block;margin-top:14px;color:GrayText;line-height:1.5}}</style></head><body><main>
@@ -1154,10 +1258,19 @@ fn error_page(failure: &navigation::LoadFailure, token: Option<&str>, private: b
 <div class="actions"><a href="about:blank">Don’t trust — leave site</a><a href="{url}">Try Again</a><a class="trust" id="trust" href="vamp://trust-certificate/{token}">{trust_label}</a></div>
 <small>Trust applies only to this exact certificate at this host and port. {trust_duration} A changed certificate will show this warning again. Only continue if you can verify the fingerprint with the site owner.</small>
 </main><script>document.getElementById('trust').addEventListener('click',function(event){{event.preventDefault();window.ipc.postMessage('cert-trust:{token}')}})</script></body></html>"#,
-            place=escape(&place), reason=escape(&failure.description), url=escape(&failure.url),
-            subject=escape(&cert.subject), issuer=escape(&cert.issuer), from=escape(&cert.valid_from),
-            until=escape(&cert.valid_until), names=escape(&names), fingerprint=escape(&cert.fingerprint),
-            token=escape(token), trust_label=trust_label, trust_duration=trust_duration);
+            place = escape(&place),
+            reason = escape(&failure.description),
+            url = escape(&failure.url),
+            subject = escape(&cert.subject),
+            issuer = escape(&cert.issuer),
+            from = escape(&cert.valid_from),
+            until = escape(&cert.valid_until),
+            names = escape(&names),
+            fingerprint = escape(&cert.fingerprint),
+            token = escape(token),
+            trust_label = trust_label,
+            trust_duration = trust_duration
+        );
     }
     format!(
         r#"<!doctype html><html><head><meta charset="utf-8"><title>Can’t open {place}</title>
@@ -1300,7 +1413,9 @@ impl TabRoute {
 
     /// Whether it leads to the window receiving from `sender`'s channel.
     fn leads_to(&self, sender: &Sender<BrowserEvent>) -> bool {
-        self.0.lock().is_ok_and(|current| current.same_channel(sender))
+        self.0
+            .lock()
+            .is_ok_and(|current| current.same_channel(sender))
     }
 
     fn set(&self, sender: Sender<BrowserEvent>) {
@@ -1335,6 +1450,7 @@ struct Common {
     bookmarks: RefCell<Bookmarks>,
     favicons: RefCell<Favicons>,
     rules: RefCell<ContentRules>,
+    site_controls: SharedSiteControls,
     /// `None` until a web page or extension settings need the controller, or
     /// where WebKit has no extension support (before macOS 15.4).
     extensions: RefCell<Option<Extensions>>,
@@ -1405,6 +1521,7 @@ impl Common {
             bookmarks: RefCell::new(Bookmarks::new(saved.bookmarks.clone())),
             favicons: RefCell::new(Favicons::new()),
             rules: RefCell::new(ContentRules::default()),
+            site_controls: Arc::new(std::sync::RwLock::new(SiteControls::load())),
             extensions: RefCell::new(None),
             extension_events,
             store_ready: Cell::new(false),
@@ -1450,7 +1567,9 @@ impl Common {
         let events = self.extension_events.clone();
         let background = events.clone();
         *self.extensions.borrow_mut() = Some(Extensions::new(
-            move |event| { let _ = events.try_send(event); },
+            move |event| {
+                let _ = events.try_send(event);
+            },
             background,
         ));
         if self.rules_started.get() {
@@ -1459,13 +1578,20 @@ impl Common {
     }
 
     fn restore_ublock(&self) {
-        if !self.extensions.borrow().as_ref().is_some_and(|e| e.is_enabled(filters::UBLOCK_ID)) {
+        if !self
+            .extensions
+            .borrow()
+            .as_ref()
+            .is_some_and(|e| e.is_enabled(filters::UBLOCK_ID))
+        {
             return;
         }
         let sender = self.anywhere.clone();
-        self.rules.borrow_mut().restore_ublock(filters::enforced(), move || {
-            let _ = sender.try_send(BrowserEvent::Command(Command::ApplyRules));
-        });
+        self.rules
+            .borrow_mut()
+            .restore_ublock(filters::enforced(), move || {
+                let _ = sender.try_send(BrowserEvent::Command(Command::ApplyRules));
+            });
     }
 
     fn ensure_rules(&self, settings: &Settings) {
@@ -1475,9 +1601,12 @@ impl Common {
         self.ensure_store();
         self.restore_ublock();
         let sender = self.anywhere.clone();
-        self.rules.borrow_mut().update(settings, move || {
-            let _ = sender.try_send(BrowserEvent::Command(Command::ApplyRules));
-        });
+        let controls = self.site_controls.read().expect("site controls").clone();
+        self.rules
+            .borrow_mut()
+            .update(settings, &controls, move || {
+                let _ = sender.try_send(BrowserEvent::Command(Command::ApplyRules));
+            });
         let sender = self.anywhere.clone();
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(1500));
@@ -1489,13 +1618,17 @@ impl Common {
     fn save_state(&self) {
         let mut state = self.saved.borrow_mut();
         state.bookmarks = self.bookmarks.borrow().root().to_vec();
-        state.windows = self.sessions.borrow().iter().map(|(_, w)| w.clone()).collect();
+        state.windows = self
+            .sessions
+            .borrow()
+            .iter()
+            .map(|(_, w)| w.clone())
+            .collect();
         // Windows closed by hand come back only with ⌘⇧T, never at launch.
         state.closed_windows = self.closed_windows.borrow().clone();
-        let (tabs, selected) = state
-            .windows
-            .first()
-            .map_or((Vec::new(), 0), |first| (first.tabs.clone(), first.selected));
+        let (tabs, selected) = state.windows.first().map_or((Vec::new(), 0), |first| {
+            (first.tabs.clone(), first.selected)
+        });
         state.tabs = tabs;
         state.selected = selected;
         if let Err(err) = state.save() {
@@ -1614,10 +1747,9 @@ struct Browser {
     arriving: HashSet<u64>,
     closing: Vec<ClosingTab>,
     tabs: Vec<BrowserTab>,
-    /// Sign-in form tab id -> tab whose HTTP challenge is waiting.
-    auth_forms: HashMap<u64, u64>,
+    /// Tab id -> address to retry after its in-place sign-in form.
+    auth_forms: HashMap<u64, String>,
     certificate_offers: HashMap<u64, (String, certificate::Presented, String)>,
-    auth_tabs: HashSet<u64>,
     selected: usize,
     selection_generation: u64,
     /// The tab selection whose page was last offered keyboard focus.
@@ -1640,6 +1772,8 @@ struct Browser {
     ns_window: usize,
     /// GPUI's view in that window, which our own fields take keys through.
     ns_view: usize,
+    /// Clips the native WebKit view beneath minimal mode's revealed controls.
+    page_clip: Retained<objc2_app_kit::NSView>,
     /// Numbers windows in the order they opened, for the session.
     serial: u64,
     /// A tab being pressed or dragged.
@@ -1677,6 +1811,8 @@ struct Browser {
     bookmark_notice: Option<String>,
     /// Minimal mode: only the page, the browser showing on demand.
     minimal: bool,
+    /// A link opened by another app, in a small draggable page window.
+    compact: bool,
     chrome_revealed: bool,
     /// When the pointer left the revealed browser, to fold it away after.
     pointer_left: Option<std::time::Instant>,
@@ -1746,6 +1882,7 @@ struct Browser {
     sender: Sender<BrowserEvent>,
     shortcut_monitor: Option<Retained<AnyObject>>,
     click_monitor: Option<Retained<AnyObject>>,
+    magnify_monitor: Option<Retained<AnyObject>>,
     /// Lets pages set the pointer; see [`page_cursor`].
     cursor_monitor: Option<Retained<AnyObject>>,
     _poll: Task<()>,
@@ -1760,7 +1897,7 @@ impl Drop for Browser {
         // A window closed by hand leaves the session for the closed ones,
         // to reopen; any closed by quitting is restored next launch.
         if !self.common.quitting.get() {
-            if !self.private && !self.tabs.is_empty() {
+            if !self.private && !self.compact && !self.tabs.is_empty() {
                 // As it is now, not as last saved.
                 self.persist();
             }
@@ -1769,7 +1906,10 @@ impl Drop for Browser {
             if let Some(at) = sessions.iter().position(|(s, _)| *s == serial) {
                 let (_, window) = sessions.remove(at);
                 drop(sessions);
-                self.common.remember_closed(window, &self.settings.home_page);
+                if !self.compact {
+                    self.common
+                        .remember_closed(window, &self.settings.home_page);
+                }
             } else {
                 drop(sessions);
             }
@@ -1788,7 +1928,14 @@ impl Drop for Browser {
             }
             self.common.routes.borrow_mut().remove(&tab.id);
         }
-        for monitor in [self.click_monitor.take(), self.cursor_monitor.take()].into_iter().flatten() {
+        for monitor in [
+            self.click_monitor.take(),
+            self.magnify_monitor.take(),
+            self.cursor_monitor.take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
             // SAFETY: this is the monitor token returned by AppKit.
             unsafe { NSEvent::removeMonitor(&monitor) };
         }
@@ -1829,7 +1976,8 @@ impl Browser {
     /// was typed or selected there.
     fn reset_address(&mut self, cx: &mut Context<Self>) {
         let text = self.address_text(self.selected);
-        self.address.update(cx, |input, cx| input.set_text(&text, cx));
+        self.address
+            .update(cx, |input, cx| input.set_text(&text, cx));
     }
 
     fn address_focused(&self, window: &Window, cx: &App) -> bool {
@@ -1945,11 +2093,16 @@ impl Browser {
         restore: Option<state::SavedWindow>,
         launch: bool,
         carry: Option<BrowserTab>,
+        compact: bool,
     ) -> Self {
         // The layout last saved; the rest of the saved state is for main().
         let (vertical_tabs, compact_vertical_tabs, bookmarks_bar) = {
             let saved = common.saved.borrow();
-            (saved.vertical_tabs, saved.compact_vertical_tabs, saved.bookmarks_bar)
+            (
+                saved.vertical_tabs,
+                saved.compact_vertical_tabs,
+                saved.bookmarks_bar,
+            )
         };
         let settings = Settings::load();
         let first_window = common.browsers().is_empty();
@@ -1957,6 +2110,13 @@ impl Browser {
         let serial = common.next_window.get();
         common.next_window.set(serial + 1);
         let (ns_window, ns_view) = ns_window_of(window);
+        let page_clip = objc2_app_kit::NSView::new(
+            objc2::MainThreadMarker::new().expect("browser on main thread"),
+        );
+        page_clip.setClipsToBounds(true);
+        page_clip.setHidden(true);
+        // SAFETY: GPUI's native view lives for the lifetime of this browser.
+        unsafe { &*(ns_view as *const objc2_app_kit::NSView) }.addSubview(&page_clip);
         let (sender, events) = async_channel::unbounded();
         for event in common.stranded.take() {
             let _ = sender.try_send(event);
@@ -2065,7 +2225,6 @@ impl Browser {
             tabs: Vec::new(),
             auth_forms: HashMap::new(),
             certificate_offers: HashMap::new(),
-            auth_tabs: HashSet::new(),
             selected: 0,
             selection_generation: 0,
             focused_selection_generation: 0,
@@ -2079,6 +2238,7 @@ impl Browser {
             private_data: std::cell::OnceCell::new(),
             ns_window,
             ns_view,
+            page_clip,
             serial,
             tab_drag: None,
             download_drag: None,
@@ -2099,6 +2259,7 @@ impl Browser {
             bookmark_notice: None,
             label_widths: Default::default(),
             minimal: false,
+            compact,
             chrome_revealed: false,
             pointer_left: None,
             _minimal_watch: None,
@@ -2152,6 +2313,7 @@ impl Browser {
                 },
             ),
             click_monitor: install_page_click_monitor(sender.clone(), ns_window, typing),
+            magnify_monitor: install_page_magnify_monitor(sender.clone(), ns_window),
             cursor_monitor: page_cursor::watch(ns_window, ns_view),
             sender,
             _poll: poll,
@@ -2177,8 +2339,13 @@ impl Browser {
         // Once a minute, unload background tabs that have gone unused.
         cx.spawn_in(window, async move |this, cx| {
             loop {
-                cx.background_executor().timer(Duration::from_secs(60)).await;
-                if this.update(cx, |browser, _| browser.sleep_unused_tabs()).is_err() {
+                cx.background_executor()
+                    .timer(Duration::from_secs(60))
+                    .await;
+                if this
+                    .update(cx, |browser, _| browser.sleep_unused_tabs())
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -2200,7 +2367,11 @@ impl Browser {
         // can open without a WebKit process or extension backgrounds.
         // What the settings say to start with applies at launch; a window
         // reopened, or opened for links, has exactly its tabs.
-        let startup = if launch { browser.settings.startup } else { Startup::Restore };
+        let startup = if launch {
+            browser.settings.startup
+        } else {
+            Startup::Restore
+        };
         // Restored at launch, before extensions have loaded: see
         // `reload_after_extensions_load`.
         browser.reloaded_for_extensions = !launch;
@@ -2208,10 +2379,13 @@ impl Browser {
         let (restored, selected): (Vec<(String, String)>, usize) = match (restore, startup) {
             (None, _) => (Vec::new(), 0),
             (Some(window), Startup::Restore) => restorable(window),
-            (Some(_), Startup::Home) => (vec![(browser.settings.home_page.clone(), String::new())], 0),
-            (Some(_), Startup::StartPage) => {
-                (vec![(Page::Start.internal_url().to_owned(), String::new())], 0)
+            (Some(_), Startup::Home) => {
+                (vec![(browser.settings.home_page.clone(), String::new())], 0)
             }
+            (Some(_), Startup::StartPage) => (
+                vec![(Page::Start.internal_url().to_owned(), String::new())],
+                0,
+            ),
         };
         if let Some(tab) = carry {
             // A tab dragged out of another window.
@@ -2255,7 +2429,8 @@ impl Browser {
     /// of ours keeps its page running hidden, whose events mustn't reach
     /// the tab.
     fn web_index_of(&self, id: u64) -> Option<usize> {
-        self.index_of(id).filter(|&index| self.tabs[index].page == Page::Web)
+        self.index_of(id)
+            .filter(|&index| self.tabs[index].page == Page::Web)
     }
 
     /// A configuration for a private tab: this window's private store.
@@ -2332,6 +2507,14 @@ impl Browser {
         let reserved = live.reserved_downloads.clone();
         let released = live.reserved_downloads.clone();
         let permissions = live.permissions.clone();
+        let site_controls = if private {
+            Arc::new(std::sync::RwLock::new(SiteControls::default()))
+        } else {
+            self.common.site_controls.clone()
+        };
+        let permission_host = Arc::new(std::sync::RwLock::new(site_controls::host(url)));
+        let navigation_host = permission_host.clone();
+        let prompt_host = permission_host.clone();
         // Extensions don't run in private tabs, as in Firefox by default.
         let extensions = self.common.extensions.borrow();
         let own_store = store.and_then(|store| {
@@ -2350,7 +2533,9 @@ impl Browser {
             (Some(extensions), false) => WebViewBuilder::new()
                 .with_webview_configuration(extensions.webview_configuration_for(url)),
             (_, true) => match self.private_configuration() {
-                Some(configuration) => WebViewBuilder::new().with_webview_configuration(configuration),
+                Some(configuration) => {
+                    WebViewBuilder::new().with_webview_configuration(configuration)
+                }
                 None => WebViewBuilder::new(),
             },
             _ => WebViewBuilder::new(),
@@ -2405,7 +2590,9 @@ impl Browser {
                 }
                 if https_only.get() {
                     match navigation::https_only_action(
-                        &url, navigation::main_frame_load(), navigation::page_load(),
+                        &url,
+                        navigation::main_frame_load(),
+                        navigation::page_load(),
                         &mut upgraded.borrow_mut(),
                     ) {
                         navigation::HttpsAction::Allow => {}
@@ -2418,6 +2605,9 @@ impl Browser {
                             return false;
                         }
                     }
+                }
+                if let Ok(mut host) = navigation_host.write() {
+                    *host = site_controls::host(&url);
                 }
                 true
             })
@@ -2435,7 +2625,11 @@ impl Browser {
                     let keeper = keepers.entry(view_token).or_insert((view, 0));
                     keeper.1 += 1;
                 }
-                let _ = started_sender.try_send(BrowserEvent::DownloadStarted(url, path.clone(), private));
+                let _ = started_sender.try_send(BrowserEvent::DownloadStarted(
+                    url,
+                    path.clone(),
+                    private,
+                ));
                 true
             })
             .with_download_completed_handler(move |url, path, success| {
@@ -2455,7 +2649,8 @@ impl Browser {
                 // Keep ambiguous reservations until this run ends; releasing
                 // one by URL could reuse another in-progress download's path.
                 drop(released);
-                let _ = finished_sender.try_send(BrowserEvent::DownloadFinished(url, path, success));
+                let _ =
+                    finished_sender.try_send(BrowserEvent::DownloadFinished(url, path, success));
             })
             .with_permission_handler(move |kind| {
                 let slot = match kind {
@@ -2464,11 +2659,38 @@ impl Browser {
                     PermissionKind::DisplayCapture => 2,
                     _ => return PermissionResponse::Default,
                 };
-                match permissions[slot].load(Ordering::Relaxed) {
-                    1 => PermissionResponse::Allow,
-                    2 => PermissionResponse::Deny,
-                    _ => PermissionResponse::Default,
+                let host = prompt_host.read().ok().and_then(|host| host.clone());
+                let choice = host.as_ref().and_then(|host| {
+                    site_controls
+                        .read()
+                        .ok()
+                        .and_then(|store| store.get(host).permission(slot))
+                });
+                match choice {
+                    Some(SitePermission::Allow) => return PermissionResponse::Allow,
+                    Some(SitePermission::Block) => return PermissionResponse::Deny,
+                    _ => {}
                 }
+                if choice.is_none() {
+                    match permissions[slot].load(Ordering::Relaxed) {
+                        1 => return PermissionResponse::Allow,
+                        2 => return PermissionResponse::Deny,
+                        _ => {}
+                    }
+                }
+                let Some(host) = host else {
+                    return PermissionResponse::Default;
+                };
+                let (response, remember) = native::ask_site_permission(&host, slot, private);
+                if let Some(choice) = remember
+                    && let Ok(mut store) = site_controls.write()
+                {
+                    store.change(&host, |site| site.set_permission(slot, Some(choice)));
+                    if !private && let Err(err) = store.save() {
+                        eprintln!("Could not save site permissions: {err}");
+                    }
+                }
+                response
             });
         if !settings.javascript && url != "about:blank#http-auth" {
             builder = builder.with_javascript_disabled();
@@ -2492,9 +2714,13 @@ impl Browser {
         navigation::on_failure(&view.webview(), move |failure| {
             failed_route.send(BrowserEvent::LoadFailed(id, failure));
         });
-        navigation::on_authentication(&view.webview(), if private { self.serial } else { 0 }, move |challenge| {
-            auth_sender.send(BrowserEvent::AuthChallenge(id, challenge));
-        });
+        navigation::on_authentication(
+            &view.webview(),
+            if private { self.serial } else { 0 },
+            move |challenge| {
+                auth_sender.send(BrowserEvent::AuthChallenge(id, challenge));
+            },
+        );
         self.rules().apply(&view.webview());
         // A sleeping muted tab must be quiet before its page starts loading.
         if self.tabs.iter().any(|tab| tab.id == id && tab.muted) {
@@ -2510,7 +2736,10 @@ impl Browser {
         if self.common.rules.borrow().ready() {
             view.load_url(url)?;
         } else {
-            self.common.waiting_loads.borrow_mut().push((Rc::downgrade(&view), url.to_owned()));
+            self.common
+                .waiting_loads
+                .borrow_mut()
+                .push((Rc::downgrade(&view), url.to_owned()));
         }
         Ok(view)
     }
@@ -2536,6 +2765,16 @@ impl Browser {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> Option<u64> {
+        // A second tab needs the full browser controls. This also covers
+        // links that ask for a new tab while a compact page is in front.
+        if self.compact && !self.tabs.is_empty() {
+            self.compact = false;
+            if self.ns_window != 0 {
+                let native = unsafe { &*(self.ns_window as *const objc2_app_kit::NSWindow) };
+                native.setMinSize(objc2_foundation::NSSize::new(700.0, 460.0));
+                native.setContentSize(objc2_foundation::NSSize::new(1100.0, 760.0));
+            }
+        }
         // Everything in a private window is private.
         let private = private || self.private;
         let id = NEXT_TAB_ID.fetch_add(1, Ordering::Relaxed);
@@ -2608,7 +2847,11 @@ impl Browser {
     fn push_unloaded_tab(&mut self, url: String, title: String, private: bool) {
         let private = private || self.private;
         let page = Page::from_internal_url(&url).unwrap_or(Page::Web);
-        let url = if page == Page::Web { url } else { page.internal_url().to_owned() };
+        let url = if page == Page::Web {
+            url
+        } else {
+            page.internal_url().to_owned()
+        };
         let title = match page {
             Page::Web if !title.trim().is_empty() => title,
             Page::Web => site_name(&url),
@@ -2678,6 +2921,11 @@ impl Browser {
             let Some(view) = &tab.view else {
                 continue;
             };
+            // A muted participant may still be in a call, even when WebKit
+            // reports no media playback.
+            if audio::is_capturing(&view.webview()) {
+                continue;
+            }
             let id = tab.id;
             let route = self.route(id);
             let answer = RcBlock::new(move |state: objc2_web_kit::WKMediaPlaybackState| {
@@ -2686,7 +2934,10 @@ impl Browser {
                 }
             });
             // SAFETY: a live web view, and a block of the documented type.
-            unsafe { view.webview().requestMediaPlaybackStateWithCompletionHandler(&answer) };
+            unsafe {
+                view.webview()
+                    .requestMediaPlaybackStateWithCompletionHandler(&answer)
+            };
         }
     }
 
@@ -2707,7 +2958,11 @@ impl Browser {
     }
 
     pub(crate) fn toggle_tab_mute(&mut self, id: u64, cx: &mut Context<Self>) {
-        let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id && tab.page == Page::Web) else {
+        let Some(tab) = self
+            .tabs
+            .iter_mut()
+            .find(|tab| tab.id == id && tab.page == Page::Web)
+        else {
             return;
         };
         tab.muted = !tab.muted;
@@ -3000,7 +3255,10 @@ impl Browser {
         // To wherever the tab is by then.
         let route = self.route(tab.id);
         let _ = view.evaluate_script_with_callback(tint::SAMPLE_SCRIPT, move |result| {
-            route.send(BrowserEvent::Tint(key.clone(), tint::tint_from_sample(&result)));
+            route.send(BrowserEvent::Tint(
+                key.clone(),
+                tint::tint_from_sample(&result),
+            ));
         });
     }
 
@@ -3011,9 +3269,131 @@ impl Browser {
             return;
         }
         let sender = self.common.anywhere.clone();
-        self.rules().update(&self.settings, move || {
+        let controls = self
+            .common
+            .site_controls
+            .read()
+            .expect("site controls")
+            .clone();
+        self.rules().update(&self.settings, &controls, move || {
             let _ = sender.try_send(BrowserEvent::Command(Command::ApplyRules));
         });
+    }
+
+    fn change_site_control(
+        &mut self,
+        host: &str,
+        edit: impl FnOnce(&mut site_controls::SiteControl),
+        rebuild_rules: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.current().private {
+            return;
+        }
+        if let Ok(mut controls) = self.common.site_controls.write() {
+            controls.change(host, edit);
+            if let Err(err) = controls.save() {
+                eprintln!("Could not save site controls: {err}");
+            }
+        }
+        if rebuild_rules {
+            self.update_rules();
+        }
+        self.refresh_other_windows(cx);
+        cx.notify();
+    }
+
+    fn site_security_menu(&self, url: &str) -> Vec<(native::MenuEntry, Option<Command>)> {
+        use commands::submenu;
+        use settings::Protection;
+        let Some(host) = site_controls::host(url) else {
+            return Vec::new();
+        };
+        let private = self.current().private;
+        let site = self
+            .common
+            .site_controls
+            .read()
+            .expect("site controls")
+            .get(&host);
+        let mut items = vec![
+            (native::MenuEntry::disabled(&host), None),
+            (native::MenuEntry::Separator, None),
+        ];
+        if private {
+            items.push((
+                native::MenuEntry::disabled("Private tab: permissions are temporary"),
+                None,
+            ));
+        } else {
+            let protection = [
+                ("Use browser setting", None),
+                ("Off", Some(Protection::Off)),
+                ("Standard", Some(Protection::Standard)),
+                ("Strict", Some(Protection::Strict)),
+            ]
+            .into_iter()
+            .map(|(label, choice)| {
+                (
+                    native::MenuEntry::checked(label, site.protection == choice),
+                    Some(Command::SetSiteProtection(host.clone(), choice)),
+                )
+            })
+            .collect();
+            items.push(submenu("Tracking protection", protection));
+            let cookies = [
+                ("Use browser setting", None),
+                ("Block third-party cookies", Some(true)),
+                ("Allow third-party cookies", Some(false)),
+            ]
+            .into_iter()
+            .map(|(label, choice)| {
+                (
+                    native::MenuEntry::checked(label, site.third_party_cookies == choice),
+                    Some(Command::SetSiteCookies(host.clone(), choice)),
+                )
+            })
+            .collect();
+            items.push(submenu("Third-party cookies", cookies));
+            items.push((native::MenuEntry::Separator, None));
+            for (label, slot) in [("Camera", 0), ("Microphone", 1), ("Screen capture", 2)] {
+                let choices = std::iter::once(("Use browser setting", None))
+                    .chain(SitePermission::ALL.into_iter().map(|choice| (choice.label(), Some(choice))))
+                    .map(|(label, choice)| {
+                        (
+                            native::MenuEntry::checked(label, site.permission(slot) == choice),
+                            Some(Command::SetSitePermission(host.clone(), slot, choice)),
+                        )
+                    })
+                    .collect();
+                items.push(submenu(label, choices));
+            }
+        }
+        items.push((native::MenuEntry::Separator, None));
+        items.push(submenu(
+            "Site data",
+            vec![
+                (
+                    native::MenuEntry::item("Clear cookies"),
+                    Some(Command::ClearSiteData(
+                        host.clone(),
+                        cache::SiteDataKind::Cookies,
+                    )),
+                ),
+                (
+                    native::MenuEntry::item("Clear local storage and databases"),
+                    Some(Command::ClearSiteData(
+                        host.clone(),
+                        cache::SiteDataKind::Storage,
+                    )),
+                ),
+                (
+                    native::MenuEntry::item("Clear all data for this site"),
+                    Some(Command::ClearSiteData(host, cache::SiteDataKind::All)),
+                ),
+            ],
+        ));
+        items
     }
 
     /// A page that couldn't load. An old device's server that answered
@@ -3027,6 +3407,11 @@ impl Browser {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
+        // Cancelling the challenged request is expected while its sign-in
+        // document replaces the pending navigation in this web view.
+        if self.auth_forms.contains_key(&self.tabs[index].id) {
+            return;
+        }
         let url_error = failure.domain == "NSURLErrorDomain";
         // Stopped, or replaced by another load; or a download, or a
         // plug-in, taking over.
@@ -3066,17 +3451,24 @@ impl Browser {
         }
         let token = failure.certificate.as_ref().map(|cert| {
             let token = objc2_foundation::NSUUID::UUID().UUIDString().to_string();
-            self.certificate_offers.insert(self.tabs[index].id, (failure.url.clone(), cert.clone(), token.clone()));
+            self.certificate_offers.insert(
+                self.tabs[index].id,
+                (failure.url.clone(), cert.clone(), token.clone()),
+            );
             token
         });
-        if token.is_none() { self.certificate_offers.remove(&self.tabs[index].id); }
+        if token.is_none() {
+            self.certificate_offers.remove(&self.tabs[index].id);
+        }
         let html = error_page(&failure, token.as_deref(), self.tabs[index].private);
         let webview = view.webview();
         // SAFETY: WebKit's own method, checked for; the page shows under the
         // address that failed, and Reload tries that address again.
         unsafe {
             let html = objc2_foundation::NSString::from_str(&html);
-            let unreachable = objc2_foundation::NSURL::URLWithString(&objc2_foundation::NSString::from_str(&failure.url));
+            let unreachable = objc2_foundation::NSURL::URLWithString(
+                &objc2_foundation::NSString::from_str(&failure.url),
+            );
             let alternate = objc2::sel!(_loadAlternateHTMLString:baseURL:forUnreachableURL:);
             if let Some(unreachable) = unreachable.as_deref()
                 && objc2_foundation::NSObjectProtocol::respondsToSelector(&*webview, alternate)
@@ -3089,41 +3481,40 @@ impl Browser {
         cx.notify();
     }
 
-    /// Opens a real web document at the challenged origin. Extensions can
-    /// inspect and fill its form while the original WebKit request waits.
+    /// Opens the sign-in document at the challenged origin in this tab.
     fn show_auth_form(
         &mut self,
         original: u64,
         challenge: navigation::AuthChallenge,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(index) = self.web_index_of(original) else { return };
-        let Some(origin) = http_auth::origin(&challenge) else {
-            if let Some(view) = &self.tabs[index].view { navigation::cancel_auth(&view.webview()); }
+        let Some(index) = self.web_index_of(original) else {
             return;
         };
-        // A retry replaces the old form without cancelling the new challenge.
-        if let Some(form) = self.auth_forms.iter().find_map(|(form, target)| (*target == original).then_some(*form)) {
-            self.auth_forms.remove(&form);
-            if let Some(index) = self.web_index_of(form) {
-                self.close_tab(index, window, cx);
+        let Some(origin) = http_auth::origin(&challenge) else {
+            if let Some(view) = &self.tabs[index].view {
+                navigation::cancel_auth(&view.webview());
+            }
+            return;
+        };
+        let Some(view) = self.tabs[index].view.clone() else { return; };
+        if !navigation::suspend_auth(&view.webview()) { return; }
+        if !self.settings.javascript {
+            unsafe {
+                view.webview().configuration().defaultWebpagePreferences()
+                    .setAllowsContentJavaScript(true);
             }
         }
-        let Some(index) = self.web_index_of(original) else { return };
-        let private = self.tabs[index].private;
-        let Some(form) = self.add_tab(TabTarget::Url("about:blank#http-auth".into()), private, false, window, cx) else {
-            if let Some(view) = &self.tabs[index].view { navigation::cancel_auth(&view.webview()); }
+        let original_url = self.tabs[index].url.clone();
+        self.auth_forms.entry(original).or_insert(original_url);
+        self.tabs[index].title = format!("Sign in to {}", challenge.host);
+        let html = objc2_foundation::NSString::from_str(&http_auth::page(&challenge));
+        let Some(url) =
+            objc2_foundation::NSURL::URLWithString(&objc2_foundation::NSString::from_str(&origin))
+        else {
             return;
         };
-        self.auth_forms.insert(form, original);
-        self.auth_tabs.insert(form);
-        let Some(index) = self.web_index_of(form) else { return };
-        self.tabs[index].url = origin.clone();
-        self.tabs[index].title = format!("Sign in to {}", challenge.host);
-        let Some(view) = &self.tabs[index].view else { return };
-        let html = objc2_foundation::NSString::from_str(&http_auth::page(&challenge));
-        let Some(url) = objc2_foundation::NSURL::URLWithString(&objc2_foundation::NSString::from_str(&origin)) else { return };
         let request = objc2_foundation::NSURLRequest::requestWithURL(&url);
         // SAFETY: WebKit's public API loads the supplied HTML as the
         // response for this HTTPS or HTTP request, without a network fetch.
@@ -3185,11 +3576,8 @@ impl Browser {
             let Some(view) = view.upgrade() else {
                 continue;
             };
-            // Unless it's been sent somewhere since.
-            // SAFETY: a plain property read on a live web view.
-            if unsafe { view.webview().URL() }.is_some() {
-                continue;
-            }
+            // An untouched WKWebView may already report about:blank here.
+            // Explicit navigations remove their queued load in `load_in`.
             self.rules().apply(&view.webview());
             if let Err(err) = view.load_url(&url) {
                 eprintln!("Could not load {url}: {err}");
@@ -3267,14 +3655,6 @@ impl Browser {
         if index >= self.tabs.len() {
             return;
         }
-        let id = self.tabs[index].id;
-        if let Some(form) = self.auth_forms.iter().find_map(|(form, original)| (*original == id).then_some(*form))
-            && let Some(form_index) = self.index_of(form)
-        {
-            self.close_tab(form_index, window, cx);
-            if let Some(index) = self.index_of(id) { self.close_tab(index, window, cx); }
-            return;
-        }
         // Removing a hovered tab does not reliably deliver its hover-exit
         // event, especially when the pointer stays over the tab strip.
         self.dismiss_hint();
@@ -3285,14 +3665,7 @@ impl Browser {
         let width = self.strip_width_of(self.tabs[index].id);
         let tab = self.tabs.remove(index);
         self.certificate_offers.remove(&tab.id);
-        let auth_form = self.auth_tabs.remove(&tab.id);
-        if let Some(original) = self.auth_forms.remove(&tab.id)
-            && let Some(original_index) = self.web_index_of(original)
-            && let Some(view) = &self.tabs[original_index].view
-        {
-            navigation::cancel_auth(&view.webview());
-        }
-        self.auth_forms.retain(|_, original| *original != tab.id);
+        self.auth_forms.remove(&tab.id);
         if let Some(view) = &tab.view {
             let _ = view.set_visible(false);
             navigation::forget(&view.webview());
@@ -3308,13 +3681,11 @@ impl Browser {
             url: tab.url.clone(),
             width,
         });
-        if !auth_form {
-            self.recently_closed.push(ClosedTab {
-                url: tab.url.clone(),
-                page: tab.page,
-                private: tab.private,
-            });
-        }
+        self.recently_closed.push(ClosedTab {
+            url: tab.url.clone(),
+            page: tab.page,
+            private: tab.private,
+        });
         if self.recently_closed.len() > 25 {
             self.recently_closed.remove(0);
         }
@@ -3396,7 +3767,11 @@ impl Browser {
     /// response may have requested a download; the saved file is a new,
     /// ordinary file navigation and WebKit can render HTML from it.
     fn open_dropped_download(
-        &mut self, path: &PathBuf, tab_id: u64, window: &Window, cx: &mut Context<Self>,
+        &mut self,
+        path: &PathBuf,
+        tab_id: u64,
+        window: &Window,
+        cx: &mut Context<Self>,
     ) {
         if !path.is_file() {
             return;
@@ -3429,7 +3804,9 @@ impl Browser {
         let Some((id, _, covered, _)) = self.download_drag.take() else {
             return;
         };
-        if covered && self.current().id == id && self.current().page == Page::Web
+        if covered
+            && self.current().id == id
+            && self.current().page == Page::Web
             && let Some(view) = &self.current().view
         {
             let _ = view.set_visible(true);
@@ -3438,7 +3815,29 @@ impl Browser {
     }
 
     fn load_in(&mut self, index: usize, url: &str, window: &Window, cx: &mut Context<Self>) {
+        let id = self.tabs[index].id;
+        if self.auth_forms.remove(&id).is_some() {
+            if let Some(view) = &self.tabs[index].view {
+                navigation::cancel_auth(&view.webview());
+                if !self.settings.javascript {
+                    unsafe {
+                        view.webview().configuration().defaultWebpagePreferences()
+                            .setAllowsContentJavaScript(false);
+                    }
+                }
+            }
+        }
         self.certificate_offers.remove(&self.tabs[index].id);
+        if let Some(view) = &self.tabs[index].view {
+            self.common
+                .waiting_loads
+                .borrow_mut()
+                .retain(|(waiting, _)| {
+                    waiting
+                        .upgrade()
+                        .is_some_and(|queued| !Rc::ptr_eq(&queued, view))
+                });
+        }
         if let Some((page, section)) = parse_internal(url) {
             if let Some(section) = section {
                 self.settings_section = section;
@@ -3487,29 +3886,6 @@ impl Browser {
         cx.notify();
     }
 
-    /// Opens URLs other apps handed over: web links and local files, each
-    /// in a new tab.
-    fn open_external(&mut self, urls: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
-        for url in urls {
-            let Ok(parsed) = url::Url::parse(&url) else {
-                continue;
-            };
-            match parsed.scheme() {
-                "http" | "https" => {
-                    // Reuse an empty start page rather than piling up tabs.
-                    if self.current().page == Page::Start {
-                        self.navigate(&url, window, cx);
-                    } else {
-                        self.open_tab(TabTarget::Url(url), false, false, window, cx);
-                    }
-                }
-                "file" => self.open_tab(TabTarget::Url(url), false, false, window, cx),
-                _ => {}
-            }
-        }
-        cx.activate(true);
-    }
-
     fn drain_events(&mut self, first: BrowserEvent, window: &mut Window, cx: &mut Context<Self>) {
         let mut changed = false;
         let mut pending = Some(first);
@@ -3549,7 +3925,9 @@ impl Browser {
                 BrowserEvent::SuggestSnapshot(tab, request, jpeg) => {
                     self.suggest_snapshot(tab, request, jpeg, cx)
                 }
-                BrowserEvent::BookmarkSnapshot(tab, opened, jpeg) => self.bookmark_snapshot(tab, opened, jpeg, cx),
+                BrowserEvent::BookmarkSnapshot(tab, opened, jpeg) => {
+                    self.bookmark_snapshot(tab, opened, jpeg, cx)
+                }
                 BrowserEvent::Address(text) => {
                     let target = self.submitted_address(text);
                     self.close_suggestions(cx);
@@ -3584,29 +3962,17 @@ impl Browser {
                     }
                 }
                 BrowserEvent::Loaded(id, url) => {
-                    if self.auth_forms.contains_key(&id) && url.starts_with("about:blank") {
+                    if self.auth_forms.contains_key(&id) {
                         continue;
                     }
                     if let Some(index) = self.web_index_of(id) {
-                        if let Some(&original) = self.auth_forms.get(&id)
-                            && self.tabs[index].url != url
-                        {
-                            self.auth_forms.remove(&id);
-                            self.auth_tabs.remove(&id);
-                            if let Some(view) = self.web_index_of(original)
-                                .and_then(|index| self.tabs[index].view.as_ref())
-                            {
-                                navigation::cancel_auth(&view.webview());
-                            }
-                        }
-                        let auth_form = self.auth_forms.contains_key(&id);
                         self.tabs[index].url = url.clone();
                         // Don't clobber an address someone is typing.
                         if index == self.selected && !self.address_focused(window, cx) {
                             self.reset_address(cx);
                         }
                         let tab = &self.tabs[index];
-                        if !tab.private && !auth_form && self.settings.remember_history {
+                        if !tab.private && self.settings.remember_history {
                             let title = tab.title.clone();
                             // Written out every half minute, not every page.
                             self.history().record(&url, &title);
@@ -3624,6 +3990,7 @@ impl Browser {
                     }
                 }
                 BrowserEvent::UrlChanged(id) => {
+                    if self.auth_forms.contains_key(&id) { continue; }
                     if let Some(index) = self.web_index_of(id)
                         && let Some(view) = &self.tabs[index].view
                         && let Some(url) = webview_url(view)
@@ -3636,7 +4003,8 @@ impl Browser {
                             self.reset_address(cx);
                         }
                         let tab = &self.tabs[index];
-                        if !tab.private && !self.auth_forms.contains_key(&id)
+                        if !tab.private
+                            && !self.auth_forms.contains_key(&id)
                             && self.settings.remember_history
                         {
                             let title = tab.title.clone();
@@ -3713,6 +4081,9 @@ impl Browser {
                 }
                 BrowserEvent::DownloadStarted(url, path, private) => {
                     self.downloads().started(url, path, private);
+                    self.controls
+                        .scroll("download-shelf-items")
+                        .set_offset(point(px(0.0), px(0.0)));
                     self.refresh_other_windows(cx);
                     cx.notify();
                 }
@@ -3726,13 +4097,16 @@ impl Browser {
                     if self.current().id != id {
                         continue;
                     }
-                    let Some((drag_id, drag_request, covered, image)) = self.download_drag.as_mut() else {
+                    let Some((drag_id, drag_request, covered, image)) = self.download_drag.as_mut()
+                    else {
                         continue;
                     };
                     if *drag_id != id || *drag_request != request {
                         continue;
                     }
-                    *image = jpeg.map(|bytes| Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Jpeg, bytes)));
+                    *image = jpeg.map(|bytes| {
+                        Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Jpeg, bytes))
+                    });
                     *covered = true;
                     if let Some(view) = &self.current().view {
                         let _ = view.set_visible(false);
@@ -3740,21 +4114,42 @@ impl Browser {
                     cx.notify();
                 }
                 BrowserEvent::MediaInspected(serial, id, url, position, result) => {
-                    if self.media_inspecting != Some(serial) { continue; }
+                    if self.media_inspecting != Some(serial) {
+                        continue;
+                    }
                     self.media_inspecting = None;
                     cx.notify();
-                    if self.current().id != id || self.current().url != url { continue; }
+                    if self.current().id != id || self.current().url != url {
+                        continue;
+                    }
                     match result {
-                        Ok(info) => self.context_menu(position, self.media_menu(&url, info), window, cx),
+                        Ok(info) => {
+                            self.context_menu(position, self.media_menu(&url, info), window, cx)
+                        }
                         Err(error) => {
-                            let _ = app_dialog::open(cx, self.controls.palette(), "Couldn't inspect media", error, "OK", app_dialog::Kind::Alert);
+                            let _ = app_dialog::open(
+                                cx,
+                                self.controls.palette(),
+                                "Couldn't inspect media",
+                                error,
+                                "OK",
+                                app_dialog::Kind::Alert,
+                            );
                         }
                     }
                 }
                 BrowserEvent::MediaFinished(id, result) => {
-                    self.downloads().finished_id(id, result.as_ref().ok().cloned(), result.is_ok());
+                    self.downloads()
+                        .finished_id(id, result.as_ref().ok().cloned(), result.is_ok());
                     if let Err(error) = result {
-                        let _ = app_dialog::open(cx, self.controls.palette(), "Couldn't download media", error, "OK", app_dialog::Kind::Alert);
+                        let _ = app_dialog::open(
+                            cx,
+                            self.controls.palette(),
+                            "Couldn't download media",
+                            error,
+                            "OK",
+                            app_dialog::Kind::Alert,
+                        );
                     }
                     self.refresh_other_windows(cx);
                     cx.notify();
@@ -3787,7 +4182,11 @@ impl Browser {
                         && let Some(index) = self.web_index_of(id)
                     {
                         self.certificate_offers.remove(&id);
-                        let scope = if self.tabs[index].private { self.serial } else { 0 };
+                        let scope = if self.tabs[index].private {
+                            self.serial
+                        } else {
+                            0
+                        };
                         match certificate::trust(&cert, scope) {
                             Ok(()) => self.load_in(index, &url, window, cx),
                             Err(error) => eprintln!("Could not save certificate trust: {error}"),
@@ -3798,14 +4197,22 @@ impl Browser {
                     self.show_auth_form(id, challenge, window, cx);
                 }
                 BrowserEvent::AuthSubmitted(id, user, password) => {
-                    if let Some(&original) = self.auth_forms.get(&id) {
-                        let view = self.web_index_of(original)
+                    if let Some(target) = self.auth_forms.remove(&id) {
+                        let view = self
+                            .web_index_of(id)
                             .and_then(|index| self.tabs[index].view.clone());
                         if let Some(view) = view {
-                            navigation::answer_auth(&view.webview(), &user, &password);
-                        }
-                        if let Some(index) = self.web_index_of(id) {
-                            self.close_tab(index, window, cx);
+                            if navigation::answer_auth(&view.webview(), &user, &password)
+                                && let Some(index) = self.web_index_of(id)
+                            {
+                                if !self.settings.javascript {
+                                    unsafe {
+                                        view.webview().configuration().defaultWebpagePreferences()
+                                            .setAllowsContentJavaScript(false);
+                                    }
+                                }
+                                self.load_in(index, &target, window, cx);
+                            }
                         }
                     }
                 }
@@ -3826,6 +4233,11 @@ impl Browser {
                     }
                     cx.notify();
                 }
+                BrowserEvent::PageMagnified(magnification) => {
+                    if self.current().page == Page::Web {
+                        self.zoom_by((1.0 + magnification).max(0.01), cx);
+                    }
+                }
                 BrowserEvent::UblockRules(build, chunks, fingerprints, rules) => {
                     // Only if uBlock Origin is still running by the time the
                     // lists are ready, and nothing newer was asked for.
@@ -3839,14 +4251,22 @@ impl Browser {
                         self.set_ublock_rules(chunks, fingerprints);
                     }
                 }
-                BrowserEvent::ExtensionUpdates(report) => self.install_extension_updates(report, cx),
+                BrowserEvent::ExtensionUpdates(report) => {
+                    self.install_extension_updates(report, cx)
+                }
                 BrowserEvent::SleepTab(id) => {
                     if let Some(index) = self.index_of(id)
                         && index != self.selected
+                        && self.tabs[index]
+                            .view
+                            .as_ref()
+                            .is_some_and(|view| !audio::is_capturing(&view.webview()))
                     {
                         self.tabs[index].audio_observer = None;
                         self.tabs[index].url_observer = None;
-                        let Some(view) = self.tabs[index].view.take() else { continue };
+                        let Some(view) = self.tabs[index].view.take() else {
+                            continue;
+                        };
                         let _ = view.set_visible(false);
                         navigation::forget(&view.webview());
                         if let Some(extensions) = self.common.extensions.borrow_mut().as_mut() {
@@ -3858,7 +4278,9 @@ impl Browser {
                     }
                 }
                 BrowserEvent::FindEdited => self.find_step(false, cx),
-                BrowserEvent::Found(tab, serial, found, count) => self.found(tab, serial, found, count, cx),
+                BrowserEvent::Found(tab, serial, found, count) => {
+                    self.found(tab, serial, found, count, cx)
+                }
                 BrowserEvent::Notice(text) => {
                     self.notice = Some(text);
                     cx.notify();
@@ -3867,13 +4289,20 @@ impl Browser {
                 BrowserEvent::Exported(result) => {
                     self.notice = Some(match result {
                         Ok(path) => {
-                            let _ = std::process::Command::new("open").arg("-R").arg(&path).spawn();
+                            let _ = std::process::Command::new("open")
+                                .arg("-R")
+                                .arg(&path)
+                                .spawn();
                             format!("Exported to {}.", path.display())
                         }
                         Err(err) => {
                             let _ = app_dialog::open(
-                                cx, self.controls.palette(), "Couldn't export your browsing data",
-                                err.clone(), "OK", app_dialog::Kind::Alert,
+                                cx,
+                                self.controls.palette(),
+                                "Couldn't export your browsing data",
+                                err.clone(),
+                                "OK",
+                                app_dialog::Kind::Alert,
                             );
                             err
                         }
@@ -3887,8 +4316,12 @@ impl Browser {
                     }
                     Err(err) => {
                         let _ = app_dialog::open(
-                            cx, self.controls.palette(), "Couldn't import your browsing data",
-                            err.clone(), "OK", app_dialog::Kind::Alert,
+                            cx,
+                            self.controls.palette(),
+                            "Couldn't import your browsing data",
+                            err.clone(),
+                            "OK",
+                            app_dialog::Kind::Alert,
                         );
                         self.notice = Some(err);
                         cx.notify();
@@ -3932,7 +4365,8 @@ impl Browser {
         self.typing.set(self.text_field_focused(window, cx));
         self.suggesting.set(self.suggestions_open());
         self.removable.set(self.suggestion_removable());
-        self.page_editing.set(self.tabs.get(self.selected).is_some_and(|tab| tab.editing));
+        self.page_editing
+            .set(self.tabs.get(self.selected).is_some_and(|tab| tab.editing));
         self.finding.set(self.find_focused(window, cx));
     }
 
@@ -3941,7 +4375,9 @@ impl Browser {
     /// replaces the pending one.
     fn persist_soon(&mut self, cx: &mut Context<Self>) {
         self._persist_later = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(Duration::from_millis(800)).await;
+            cx.background_executor()
+                .timer(Duration::from_millis(800))
+                .await;
             let _ = this.update(cx, |browser, _| browser.persist());
         }));
     }
@@ -3950,7 +4386,8 @@ impl Browser {
     /// switcher, the address field's suggestions, a bookmarks folder) is
     /// still open: one closing mustn't uncover the page over another.
     fn show_page_if_uncovered(&self) {
-        let covered = self.palette.is_some() || self.suggest.is_some() || self.bookmark_menu.is_some();
+        let covered =
+            self.palette.is_some() || self.suggest.is_some() || self.bookmark_menu.is_some();
         let Some(tab) = self.tabs.get(self.selected) else {
             return;
         };
@@ -3963,7 +4400,11 @@ impl Browser {
     /// then), for what changes on its own but needn't be drawn every frame.
     fn redraw_soon(&mut self, delay: Duration, cx: &mut Context<Self>) {
         let due = std::time::Instant::now() + delay;
-        if self.redraw_later.as_ref().is_some_and(|(pending, _)| *pending <= due) {
+        if self
+            .redraw_later
+            .as_ref()
+            .is_some_and(|(pending, _)| *pending <= due)
+        {
             return;
         }
         let task = cx.spawn(async move |this, cx| {
@@ -3988,7 +4429,7 @@ impl Browser {
                 .tabs
                 .iter()
                 .enumerate()
-                .filter(|(_, tab)| !tab.private && !self.auth_tabs.contains(&tab.id))
+                .filter(|(_, tab)| !tab.private)
                 .collect();
             let selected = kept
                 .iter()
@@ -3997,7 +4438,9 @@ impl Browser {
             (
                 kept.iter()
                     .map(|(_, tab)| {
-                        if tab.page == Page::Web {
+                        if let Some(target) = self.auth_forms.get(&tab.id) {
+                            target.clone()
+                        } else if tab.page == Page::Web {
                             tab.view
                                 .as_ref()
                                 .and_then(|view| webview_url(view))
@@ -4015,7 +4458,7 @@ impl Browser {
                 selected,
             )
         };
-        if !self.private {
+        if !self.private && !self.compact {
             let mut sessions = self.common.sessions.borrow_mut();
             let window = state::SavedWindow {
                 tabs,
@@ -4023,7 +4466,10 @@ impl Browser {
                 selected,
                 bounds: self.window_bounds,
             };
-            match sessions.iter_mut().find(|(serial, _)| *serial == self.serial) {
+            match sessions
+                .iter_mut()
+                .find(|(serial, _)| *serial == self.serial)
+            {
                 Some(entry) => entry.1 = window,
                 None => sessions.push((self.serial, window)),
             }
@@ -4078,7 +4524,11 @@ impl Browser {
         action: impl FnOnce(&mut Browser, &mut Context<Browser>) + 'static,
     ) {
         let receiver = app_dialog::open(
-            cx, self.controls.palette(), title, message, button,
+            cx,
+            self.controls.palette(),
+            title,
+            message,
+            button,
             app_dialog::Kind::Confirm,
         );
         cx.spawn(async move |this, cx| {
@@ -4099,7 +4549,9 @@ impl Browser {
         let sender = self.common.anywhere.clone();
         let done = RcBlock::new(move || {
             sitedata::finish_cookie_clear();
-            let _ = sender.try_send(BrowserEvent::Notice("Cookies, caches and website data cleared.".into()));
+            let _ = sender.try_send(BrowserEvent::Notice(
+                "Cookies, caches and website data cleared.".into(),
+            ));
         });
         sitedata::begin_cookie_clear();
         // SAFETY: the default store, on the main thread, with a block of the
@@ -4131,7 +4583,9 @@ impl Browser {
         };
         hint::toast(self.ns_window, &text, anchor, self.controls.palette());
         self._toast_later = Some(cx.spawn(async move |_, cx| {
-            cx.background_executor().timer(Duration::from_millis(2800)).await;
+            cx.background_executor()
+                .timer(Duration::from_millis(2800))
+                .await;
             hint::hide_toast();
         }));
     }
@@ -4225,8 +4679,16 @@ impl Browser {
         std::thread::spawn(move || {
             if let Some(chunks) = filters::build(&dir, &state) {
                 let fingerprints = chunks.iter().map(|c| filters::fingerprint(c)).collect();
-                let rules = chunks.iter().map(|c| c.matches("\"trigger\"").count()).sum();
-                let _ = sender.try_send(BrowserEvent::UblockRules(build, chunks, fingerprints, rules));
+                let rules = chunks
+                    .iter()
+                    .map(|c| c.matches("\"trigger\"").count())
+                    .sum();
+                let _ = sender.try_send(BrowserEvent::UblockRules(
+                    build,
+                    chunks,
+                    fingerprints,
+                    rules,
+                ));
             }
         });
     }
@@ -4481,7 +4943,13 @@ impl Browser {
             ScrollAxis::Horizontal => (handle.offset().x, handle.max_offset().x),
         };
         let (offset, max) = (f32::from(offset), f32::from(max));
-        let wanted = |shown: bool| if fading && max > 0.5 && shown { 1.0 } else { 0.0 };
+        let wanted = |shown: bool| {
+            if fading && max > 0.5 && shown {
+                1.0
+            } else {
+                0.0
+            }
+        };
         let start_fades = axis == ScrollAxis::Vertical;
         let at_start = self.controls.tween(
             (id, "fade-start"),
@@ -4575,6 +5043,72 @@ impl Browser {
             bar = bar.child(self.toolbar_item(item, palette, cx));
         }
         bar
+    }
+
+    fn compact_header(&mut self, palette: Palette, cx: &mut Context<Self>) -> impl IntoElement {
+        let id = self.current().id;
+        let title = self.current().title.clone();
+        div()
+            .h(px(TOOLBAR_HEIGHT))
+            .w_full()
+            .flex_none()
+            .flex()
+            .items_center()
+            .pl(px(TRAFFIC_LIGHT_INSET))
+            .pr(px(12.0))
+            .gap(px(8.0))
+            .child(
+                div()
+                    .id("compact-drag")
+                    .relative()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, _, _| {
+                            this.begin_tab_drag(id, event.position);
+                        }),
+                    )
+                    .child(tabdrag::record_bounds(self.tab_bounds.clone(), id))
+                    .child(
+                        div()
+                            .truncate()
+                            .text_color(palette.text_primary)
+                            .child(title),
+                    ),
+            )
+            .child(
+                div()
+                    .id("compact-expand")
+                    .px(px(11.0))
+                    .h(px(28.0))
+                    .flex()
+                    .items_center()
+                    .rounded(px(7.0))
+                    .bg(Chrome::new(palette).raised)
+                    .hover(|style| style.bg(palette.row_hover))
+                    .cursor_pointer()
+                    .child("Expand")
+                    .on_click(cx.listener(|this, _, window, cx| this.expand_compact(window, cx))),
+            )
+    }
+
+    fn expand_compact(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.compact {
+            return;
+        }
+        self.compact = false;
+        window.resize(size(px(1100.0), px(760.0)));
+        if self.ns_window != 0 {
+            let native = unsafe { &*(self.ns_window as *const objc2_app_kit::NSWindow) };
+            native.setMinSize(objc2_foundation::NSSize::new(700.0, 460.0));
+        }
+        self.persist();
+        cx.notify();
     }
 
     fn toolbar_item(
@@ -4675,7 +5209,11 @@ impl Browser {
         };
         let needs_page = matches!(
             item,
-            ToolbarItem::Back | ToolbarItem::Forward | ToolbarItem::Reload | ToolbarItem::CopyLink | ToolbarItem::Media
+            ToolbarItem::Back
+                | ToolbarItem::Forward
+                | ToolbarItem::Reload
+                | ToolbarItem::CopyLink
+                | ToolbarItem::Media
         );
         // Back and forward only with somewhere to go.
         let history = self.current().view.as_ref().filter(|_| web).map(|view| {
@@ -4721,7 +5259,9 @@ impl Browser {
                 }
             }),
         );
-        if item == ToolbarItem::Media && let Some(serial) = self.media_inspecting {
+        if item == ToolbarItem::Media
+            && let Some(serial) = self.media_inspecting
+        {
             let accent = palette.accent;
             return div()
                 .relative()
@@ -4742,7 +5282,11 @@ impl Browser {
                                 glow.bg(color::with_alpha(accent, 0.12 + 0.14 * pulse))
                                     .border_1()
                                     .border_color(color::with_alpha(accent, 0.45 + 0.35 * pulse))
-                                    .shadow(vec![lighting::glow(accent, 0.22 + 0.2 * pulse, 6.0 + 5.0 * pulse)])
+                                    .shadow(vec![lighting::glow(
+                                        accent,
+                                        0.22 + 0.2 * pulse,
+                                        6.0 + 5.0 * pulse,
+                                    )])
                             },
                         ),
                 )
@@ -4769,7 +5313,8 @@ impl Browser {
                     .rounded(px(RADIUS))
                     .with_animation(
                         ("toolbar-ping", generation),
-                        Animation::new(slowed(Duration::from_millis(520))).with_easing(|t: f32| 1.0 - (1.0 - t).powi(3)),
+                        Animation::new(slowed(Duration::from_millis(520)))
+                            .with_easing(|t: f32| 1.0 - (1.0 - t).powi(3)),
                         move |ring, t| {
                             let grow = px(5.0 * t);
                             ring.top(-grow)
@@ -4902,7 +5447,28 @@ impl Browser {
                 .child(icon(Icon::Search, 14.0, palette.text_secondary))
                 .into_any_element()
         } else {
-            site_icon(self.shown_favicon(&url), &url, 20.0, true, palette)
+            div()
+                .id("site-security")
+                .flex_none()
+                .cursor_pointer()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        window.prevent_default();
+                        let url = this.current().url.clone();
+                        let menu = this.site_security_menu(&url);
+                        this.context_menu(event.position, menu, window, cx);
+                    }),
+                )
+                .child(site_icon(
+                    self.shown_favicon(&url),
+                    &url,
+                    20.0,
+                    true,
+                    palette,
+                ))
+                .into_any_element()
         };
         div()
             .id("omnibox")
@@ -5004,11 +5570,14 @@ impl Browser {
             })
             .child({
                 let record = self.omnibox_bounds.clone();
-                canvas(move |bounds, _, _| record.set(Some(bounds)), |_, _, _, _| {})
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .size_full()
+                canvas(
+                    move |bounds, _, _| record.set(Some(bounds)),
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
             })
             .child(leading)
             .child(
@@ -5064,7 +5633,11 @@ impl Browser {
                         .text_size(px(11.5))
                         .text_color(palette.soft_label)
                         .cursor_pointer()
-                        .with_hint(Hint::new("Reset zoom").shortcut("⌘0"), hint::Side::Below, cx)
+                        .with_hint(
+                            Hint::new("Reset zoom").shortcut("⌘0"),
+                            hint::Side::Below,
+                            cx,
+                        )
                         .on_click(cx.listener(|this, _, _, cx| this.zoom_by(0.0, cx)))
                         .child(format!("{:.0}%", zoom * 100.0)),
                 )
@@ -5159,7 +5732,14 @@ impl Browser {
     /// tab's mask over the corner.
     /// The icon of whatever is at `url`: an internal page's own, or the
     /// site's.
-    fn page_icon(&self, page: Page, url: &str, size: f32, active: bool, palette: Palette) -> AnyElement {
+    fn page_icon(
+        &self,
+        page: Page,
+        url: &str,
+        size: f32,
+        active: bool,
+        palette: Palette,
+    ) -> AnyElement {
         let glyph = match page {
             Page::Web => None,
             Page::Start => Some(Icon::Home),
@@ -5221,7 +5801,11 @@ impl Browser {
     /// pinned beside it once they overflow.
     fn horizontal_tab_room(&self) -> f32 {
         let view = f32::from(self.tab_scroll.bounds().size.width);
-        let pinned = if self.new_tab_pinned { NEW_TAB_PINNED_ROOM } else { 0.0 };
+        let pinned = if self.new_tab_pinned {
+            NEW_TAB_PINNED_ROOM
+        } else {
+            0.0
+        };
         // A little to spare, so rounding never leaves the + a pixel over.
         view + pinned - NEW_TAB_IN_STRIP_ROOM - 2.0
     }
@@ -5303,15 +5887,17 @@ impl Browser {
                 style.bg(wash)
             }
         })
-        .on_drop(cx.listener(move |this, dragged: &bookmarks_view::DraggedBookmark, window, cx| {
-            {
-                for (index, &bookmark) in dragged.ids().iter().enumerate() {
-                    // Onto the tab, the first; the rest in tabs of their own.
-                    let on = (index == 0).then_some(id);
-                    this.drop_bookmark_on_tabs(bookmark, on, window, cx);
+        .on_drop(cx.listener(
+            move |this, dragged: &bookmarks_view::DraggedBookmark, window, cx| {
+                {
+                    for (index, &bookmark) in dragged.ids().iter().enumerate() {
+                        // Onto the tab, the first; the rest in tabs of their own.
+                        let on = (index == 0).then_some(id);
+                        this.drop_bookmark_on_tabs(bookmark, on, window, cx);
+                    }
                 }
-            }
-        }))
+            },
+        ))
         .drag_over::<PathBuf>(move |style, _, _, _| style.border_2().border_color(accent))
         .on_drop(cx.listener(move |this, path: &PathBuf, window, cx| {
             this.open_dropped_download(path, id, window, cx);
@@ -5408,13 +5994,13 @@ impl Browser {
             .drag_over::<bookmarks_view::DraggedBookmark>(move |style, _, _, _| {
                 style.bg(color::with_alpha(palette.accent, 0.1))
             })
-            .on_drop(cx.listener(|this, dragged: &bookmarks_view::DraggedBookmark, window, cx| {
-                {
+            .on_drop(cx.listener(
+                |this, dragged: &bookmarks_view::DraggedBookmark, window, cx| {
                     for &bookmark in dragged.ids() {
                         this.drop_bookmark_on_tabs(bookmark, None, window, cx);
                     }
-                }
-            }))
+                },
+            ))
             .size_full()
             .overflow_x_scroll()
             .track_scroll(&self.tab_scroll)
@@ -5629,13 +6215,13 @@ impl Browser {
             .drag_over::<bookmarks_view::DraggedBookmark>(move |style, _, _, _| {
                 style.bg(color::with_alpha(palette.accent, 0.1))
             })
-            .on_drop(cx.listener(|this, dragged: &bookmarks_view::DraggedBookmark, window, cx| {
-                {
+            .on_drop(cx.listener(
+                |this, dragged: &bookmarks_view::DraggedBookmark, window, cx| {
                     for &bookmark in dragged.ids() {
                         this.drop_bookmark_on_tabs(bookmark, None, window, cx);
                     }
-                }
-            }))
+                },
+            ))
             .size_full()
             .overflow_y_scroll()
             .track_scroll(&scroll)
@@ -5649,25 +6235,25 @@ impl Browser {
                 Slot::Ghost(index) => {
                     let (ghost, t) = &ghosts[index];
                     revealed(
-                            div()
-                                .h(px(30.0))
-                                .w_full()
-                                .rounded(px(7.0))
-                                .bg(chrome.rest)
-                                .flex()
-                                .items_center()
-                                .gap(px(9.0))
-                                .pl(px(8.0))
-                                .text_size(px(12.5))
-                                .text_color(palette.text_secondary)
-                                .child(self.ghost_icon(&ghost.url, 18.0, palette))
-                                .child(
-                                    div()
-                                        .min_w(px(0.0))
-                                        .flex_1()
-                                        .truncate()
-                                        .child(ghost.title.clone()),
-                                ),
+                        div()
+                            .h(px(30.0))
+                            .w_full()
+                            .rounded(px(7.0))
+                            .bg(chrome.rest)
+                            .flex()
+                            .items_center()
+                            .gap(px(9.0))
+                            .pl(px(8.0))
+                            .text_size(px(12.5))
+                            .text_color(palette.text_secondary)
+                            .child(self.ghost_icon(&ghost.url, 18.0, palette))
+                            .child(
+                                div()
+                                    .min_w(px(0.0))
+                                    .flex_1()
+                                    .truncate()
+                                    .child(ghost.title.clone()),
+                            ),
                         30.0,
                         ROW_GAP,
                         *t,
@@ -5780,13 +6366,13 @@ impl Browser {
             .drag_over::<bookmarks_view::DraggedBookmark>(move |style, _, _, _| {
                 style.bg(color::with_alpha(palette.accent, 0.1))
             })
-            .on_drop(cx.listener(|this, dragged: &bookmarks_view::DraggedBookmark, window, cx| {
-                {
+            .on_drop(cx.listener(
+                |this, dragged: &bookmarks_view::DraggedBookmark, window, cx| {
                     for &bookmark in dragged.ids() {
                         this.drop_bookmark_on_tabs(bookmark, None, window, cx);
                     }
-                }
-            }))
+                },
+            ))
             .size_full()
             .overflow_y_scroll()
             .track_scroll(&scroll)
@@ -5913,7 +6499,8 @@ impl Render for Browser {
             return div().into_any_element();
         }
         self.wake_current(window);
-        if self.focused_selection_generation != self.selection_generation && self.palette.is_none() {
+        if self.focused_selection_generation != self.selection_generation && self.palette.is_none()
+        {
             self.focused_selection_generation = self.selection_generation;
             // Restored pages are created by wake_current above. Give the
             // newly selected page the keyboard once it exists, and clear
@@ -5950,49 +6537,76 @@ impl Render for Browser {
         // Switching layouts is one motion: the sidebar's width and the tab
         // strip's height glide together, each clipping content laid out at
         // its full size, so nothing reflows on the way.
-        let sidebar_target = match (self.vertical_tabs, self.compact_vertical_tabs) {
-            (false, _) => 0.0,
-            (true, true) => RAIL_WIDTH,
-            (true, false) => SIDEBAR_WIDTH,
+        let sidebar_target = match (self.compact, self.vertical_tabs, self.compact_vertical_tabs) {
+            (true, _, _) => 0.0,
+            (_, false, _) => 0.0,
+            (_, true, true) => RAIL_WIDTH,
+            (_, true, false) => SIDEBAR_WIDTH,
         };
-        let reveal = self.chrome_reveal();
-        self.fade_traffic_lights(reveal);
+        let reveal = if self.compact {
+            0.0
+        } else {
+            self.chrome_reveal()
+        };
+        self.fade_traffic_lights(if self.compact { 1.0 } else { reveal });
         let sidebar_width = self
             .controls
             .tween("sidebar-width", sidebar_target, LAYOUT_MOVE)
             * reveal;
-        let strip_height = self.tab_strip_height() * reveal;
+        let strip_height = if self.compact {
+            0.0
+        } else {
+            self.tab_strip_height() * reveal
+        };
         // The strip's tabs are where they were when last drawn, so it can
         // only scroll to the selected one once it has been drawn again.
-        self.strip_frames = if strip_height > 0.5 { self.strip_frames.saturating_add(1) } else { 0 };
-        if self.reveal_selected && !self.vertical_tabs && self.strip_frames > 1 && self.reveal_selected_tab() {
+        self.strip_frames = if strip_height > 0.5 {
+            self.strip_frames.saturating_add(1)
+        } else {
+            0
+        };
+        if self.reveal_selected
+            && !self.vertical_tabs
+            && self.strip_frames > 1
+            && self.reveal_selected_tab()
+        {
             self.reveal_selected = false;
         }
-        let bookmarks_target = if self.bookmarks_bar {
+        let bookmarks_target = if self.bookmarks_bar && !self.compact {
             BOOKMARKS_HEIGHT
         } else {
             0.0
         };
-        let bookmarks_height = self
-            .controls
-            .tween("bookmarks-height", bookmarks_target, LAYOUT_MOVE)
-            * reveal;
+        let bookmarks_height =
+            self.controls
+                .tween("bookmarks-height", bookmarks_target, LAYOUT_MOVE)
+                * reveal;
         let shelf_target = if self.downloads().shelf().next().is_some() {
             SHELF_HEIGHT
         } else {
             0.0
         };
-        let shelf_height = self
-            .controls
-            .tween("download-shelf-height", shelf_target, LAYOUT_MOVE);
+        let shelf_height =
+            self.controls
+                .tween_from("download-shelf-height", 0.0, shelf_target, LAYOUT_MOVE);
         let web_page = self.current().page == Page::Web && self.palette.is_none();
-        let find_target = if self.find.open && web_page { find::FIND_HEIGHT } else { 0.0 };
-        let find_height = self.controls.tween("find-height", find_target, find::FIND_MOVE);
+        let find_target = if self.find.open && web_page {
+            find::FIND_HEIGHT
+        } else {
+            0.0
+        };
+        let find_height = self
+            .controls
+            .tween("find-height", find_target, find::FIND_MOVE);
         // While the browser's parts slide, the page keeps one size and only
         // moves: the larger of its size when the slide began and where it
         // will end up, clipped by the window. Resizing it every frame would
         // make it reflow every frame. How much bigger it ends up, per axis:
-        let strip_target = if self.vertical_tabs { 0.0 } else { TAB_STRIP_HEIGHT };
+        let strip_target = if self.vertical_tabs || self.compact {
+            0.0
+        } else {
+            TAB_STRIP_HEIGHT
+        };
         let grow = (
             sidebar_width - sidebar_target,
             (strip_height - strip_target)
@@ -6005,12 +6619,39 @@ impl Render for Browser {
             self.page_hold.set(None);
         }
         let page_hold = self.page_hold.clone();
-        let drag_cover = self.download_drag.as_ref().and_then(|(id, _, covered, image)| {
-            (self.current().id == *id && *covered).then(|| image.clone())
-        });
+        let page_clip = self.page_clip.clone();
+        let peek_top = TOOLBAR_HEIGHT * reveal + bookmarks_height + strip_height;
+        let clip_top = if self.minimal {
+            self.controls
+                .tween(
+                    "minimal-bar",
+                    if self.chrome_revealed {
+                        0.0
+                    } else {
+                        minimal::MINIMAL_BAR
+                    },
+                    minimal::REVEAL,
+                )
+                .max(peek_top)
+        } else {
+            0.0
+        };
+        let clip_left = if self.minimal { sidebar_width } else { 0.0 };
+        let drag_cover = self
+            .download_drag
+            .as_ref()
+            .and_then(|(id, _, covered, image)| {
+                (self.current().id == *id && *covered).then(|| image.clone())
+            });
+        let has_drag_cover = drag_cover.is_some();
         let content: AnyElement = if (self.palette.is_some() || drag_cover.is_some())
-            && self.current().page == Page::Web {
-            let snapshot = drag_cover.flatten().or_else(|| self.palette.as_ref().and_then(|state| state.snapshot.clone()));
+            && self.current().page == Page::Web
+        {
+            let snapshot = drag_cover.clone().flatten().or_else(|| {
+                self.palette
+                    .as_ref()
+                    .and_then(|state| state.snapshot.clone())
+            });
             div()
                 .relative()
                 .size_full()
@@ -6023,31 +6664,23 @@ impl Render for Browser {
             let page = match self.current().page {
                 Page::Web => {
                     let view = self.current().view.clone();
-                    let minimal = self.minimal;
                     let covered = self.suggest.is_some() || self.bookmark_menu.is_some();
                     canvas(
-                        move |bounds, window, _| {
-                            // In minimal mode the page keeps the size it has
-                            // with the browser folded away; the browser
-                            // slides it down rather than squeezing it, so it
-                            // doesn't reflow each time.
+                        move |bounds, _window, _| {
+                            // The page keeps its bounds while minimal chrome
+                            // clips its top and left edges as it peeks in.
                             let mut size = bounds.size;
                             if sliding {
-                                let held = page_hold.get().unwrap_or((
-                                    f32::from(size.width),
-                                    f32::from(size.height),
-                                ));
+                                let held = page_hold
+                                    .get()
+                                    .unwrap_or((f32::from(size.width), f32::from(size.height)));
                                 page_hold.set(Some(held));
-                                let end = (f32::from(size.width) + grow.0, f32::from(size.height) + grow.1);
+                                let end = (
+                                    f32::from(size.width) + grow.0,
+                                    f32::from(size.height) + grow.1,
+                                );
                                 size.width = px(held.0.max(end.0));
                                 size.height = px(held.1.max(end.1));
-                            }
-                            if minimal {
-                                let viewport = window.viewport_size();
-                                size.width = size.width.max(viewport.width);
-                                let resting = viewport.height
-                                    - px(minimal::MINIMAL_BAR + 1.0 + shelf_height + find_height);
-                                size.height = size.height.max(resting);
                             }
                             if let Some(view) = &view {
                                 // WebKit moves the view into its own window for element
@@ -6056,16 +6689,42 @@ impl Render for Browser {
                                 if unsafe { view.webview().fullscreenState() }
                                     == WKFullscreenState::NotInFullscreen
                                 {
-                                    if view.set_bounds(Rect {
-                                        position: dpi::Position::Logical(dpi::LogicalPosition::new(
-                                            f64::from(bounds.origin.x),
-                                            f64::from(bounds.origin.y),
-                                        )),
-                                        size: dpi::Size::Logical(dpi::LogicalSize::new(
-                                            f64::from(size.width),
-                                            f64::from(size.height),
-                                        )),
-                                    }).is_ok() && !covered {
+                                    let webview = view.webview();
+                                    // Reparenting a tab to another window puts
+                                    // it back in GPUI's view. Restore the clip.
+                                    let parent = unsafe { webview.superview() };
+                                    if parent
+                                        .as_ref()
+                                        .is_none_or(|parent| !std::ptr::eq(&**parent, &*page_clip))
+                                    {
+                                        page_clip.addSubview(&webview);
+                                    }
+                                    let width = f64::from(size.width);
+                                    let height = f64::from(size.height);
+                                    let top = f64::from(clip_top).min(height);
+                                    let left = f64::from(clip_left).min(width);
+                                    let parent_height = unsafe { page_clip.superview() }
+                                        .map_or(0.0, |parent| parent.frame().size.height);
+                                    page_clip.setFrame(objc2_foundation::NSRect::new(
+                                        objc2_foundation::NSPoint::new(
+                                            f64::from(bounds.origin.x) + left,
+                                            parent_height - f64::from(bounds.origin.y) - height,
+                                        ),
+                                        objc2_foundation::NSSize::new(width - left, height - top),
+                                    ));
+                                    if view
+                                        .set_bounds(Rect {
+                                            position: dpi::Position::Logical(
+                                                dpi::LogicalPosition::new(-left, -top),
+                                            ),
+                                            size: dpi::Size::Logical(dpi::LogicalSize::new(
+                                                width, height,
+                                            )),
+                                        })
+                                        .is_ok()
+                                        && !covered
+                                    {
+                                        page_clip.setHidden(false);
                                         // Keep a new view hidden until its
                                         // first real page bounds are applied.
                                         let _ = view.set_visible(true);
@@ -6096,7 +6755,7 @@ impl Render for Browser {
             .flex()
             .flex_col()
             .border_t_1()
-            .when(sidebar_width > 0.5, |el| el.border_l_1())
+            .when(sidebar_width > 0.5 && !self.minimal, |el| el.border_l_1())
             .border_color(chrome.line)
             .drag_over::<PathBuf>(move |style, _, _, _| {
                 style.border_2().border_color(palette.accent)
@@ -6116,7 +6775,7 @@ impl Render for Browser {
                     .children(self.bookmark_menu_backdrop()),
             );
         let mut body = div().flex_1().min_h(px(0.0)).flex();
-        if sidebar_width > 0.5 {
+        if sidebar_width > 0.5 && !self.minimal {
             body = body.child(
                 div()
                     .w(px(sidebar_width))
@@ -6129,6 +6788,14 @@ impl Render for Browser {
             );
         }
         body = body.child(web_area);
+        if self.current().page != Page::Web
+            || self.palette.is_some()
+            || has_drag_cover
+            || self.suggest.is_some()
+            || self.bookmark_menu.is_some()
+        {
+            self.page_clip.setHidden(true);
+        }
         let mut root = vampir::root(div().id("root"), self, cx)
             .relative()
             .size_full()
@@ -6138,13 +6805,17 @@ impl Render for Browser {
             .text_size(px(13.0))
             .bg(chrome.ground)
             .text_color(palette.text_primary)
-            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                this.finish_download_drag(cx);
-            }))
-            .children(self.minimal_bar(palette));
-        root = if self.minimal {
-            // Slides down from above rather than unrolling.
-            root.child(
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.finish_download_drag(cx);
+                }),
+            );
+        let mut top_chrome = div().w_full().flex().flex_col();
+        top_chrome = if self.compact {
+            top_chrome.child(self.compact_header(palette, cx))
+        } else if self.minimal {
+            top_chrome.child(
                 div()
                     .h(px(TOOLBAR_HEIGHT * reveal))
                     .w_full()
@@ -6156,10 +6827,10 @@ impl Render for Browser {
                     .child(self.toolbar(palette, window, cx)),
             )
         } else {
-            root.child(self.toolbar(palette, window, cx))
+            top_chrome.child(self.toolbar(palette, window, cx))
         };
         if bookmarks_height > 0.5 {
-            root = root.child(
+            top_chrome = top_chrome.child(
                 // It slides up under the toolbar as it goes, rather than
                 // being cut off where it stands.
                 div()
@@ -6175,7 +6846,7 @@ impl Render for Browser {
             );
         }
         if strip_height > 0.5 {
-            root = root.child(
+            top_chrome = top_chrome.child(
                 div()
                     .h(px(strip_height))
                     .w_full()
@@ -6198,7 +6869,28 @@ impl Render for Browser {
             // back at its start instead of jumping there.
             self.tab_scroll.set_offset(point(px(0.0), px(0.0)));
         }
-        root = root.child(body);
+        if self.minimal {
+            root = root.child(body);
+            if let Some(bar) = self.minimal_bar(palette) {
+                root = root.child(div().absolute().top_0().left_0().w_full().child(bar));
+            }
+            root = root.child(top_chrome.absolute().top_0().left_0());
+            if sidebar_width > 0.5 {
+                root = root.child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .top(px(TOOLBAR_HEIGHT * reveal + bookmarks_height))
+                        .bottom_0()
+                        .w(px(sidebar_width))
+                        .overflow_hidden()
+                        .opacity((sidebar_width / RAIL_WIDTH).min(1.0))
+                        .child(self.vertical_tabs(palette, cx)),
+                );
+            }
+        } else {
+            root = root.child(top_chrome).child(body);
+        }
         if let Some(anchor) = self.omnibox_bounds.get()
             && let Some(list) = self.suggestion_list(anchor, palette, cx)
         {
@@ -6425,7 +7117,11 @@ thread_local! {
 fn active_browser(cx: &mut App) -> Option<gpui::WindowHandle<Browser>> {
     cx.active_window()
         .and_then(|w| w.downcast::<Browser>())
-        .or_else(|| cx.windows().into_iter().find_map(|w| w.downcast::<Browser>()))
+        .or_else(|| {
+            cx.windows()
+                .into_iter()
+                .find_map(|w| w.downcast::<Browser>())
+        })
 }
 
 /// Opens a browser window, a little down and right of the frontmost one.
@@ -6446,23 +7142,26 @@ fn open_browser_window(
     let bounds = if let Some(bounds) = remembered {
         bounds
     } else {
-        match cx.active_window().and_then(|w| w.update(cx, |_, window, _| window.bounds()).ok()) {
-        // A step down and right of the front window, if that stays on
-        // screen; otherwise centred.
-        Some(front)
-            if cx.displays().iter().any(|display| {
-                let screen = display.bounds();
-                let next = front.origin + point(px(26.0), px(26.0));
-                next.x >= screen.origin.x
-                    && next.y >= screen.origin.y
-                    && next.x + front.size.width <= screen.origin.x + screen.size.width
-                    && next.y + front.size.height <= screen.origin.y + screen.size.height
-            }) =>
+        match cx
+            .active_window()
+            .and_then(|w| w.update(cx, |_, window, _| window.bounds()).ok())
         {
-            Bounds::new(front.origin + point(px(26.0), px(26.0)), front.size)
+            // A step down and right of the front window, if that stays on
+            // screen; otherwise centred.
+            Some(front)
+                if cx.displays().iter().any(|display| {
+                    let screen = display.bounds();
+                    let next = front.origin + point(px(26.0), px(26.0));
+                    next.x >= screen.origin.x
+                        && next.y >= screen.origin.y
+                        && next.x + front.size.width <= screen.origin.x + screen.size.width
+                        && next.y + front.size.height <= screen.origin.y + screen.size.height
+                }) =>
+            {
+                Bounds::new(front.origin + point(px(26.0), px(26.0)), front.size)
+            }
+            _ => Bounds::centered(None, window_size, cx),
         }
-        _ => Bounds::centered(None, window_size, cx),
-    }
     };
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -6470,7 +7169,14 @@ fn open_browser_window(
         // The toolbar is the titlebar, so the whole window takes the
         // active tab's hue. It drags the window itself.
         titlebar: Some(TitlebarOptions {
-            title: Some(if private { "Private Browsing" } else { "Vamprowser" }.into()),
+            title: Some(
+                if private {
+                    "Private Browsing"
+                } else {
+                    "Vamprowser"
+                }
+                .into(),
+            ),
             appears_transparent: true,
             traffic_light_position: Some(point(px(TRAFFIC_LIGHTS.0), px(TRAFFIC_LIGHTS.1))),
         }),
@@ -6479,11 +7185,37 @@ fn open_browser_window(
     };
     let handle = cx
         .open_window(options, move |window, cx| {
-            cx.new(|cx| Browser::new(window, cx, common, private, restore, launch, carry))
+            cx.new(|cx| Browser::new(window, cx, common, private, restore, launch, carry, false))
         })
         .ok()?;
     let _ = handle.update(cx, |_, window, _| window.activate_window());
     Some(handle)
+}
+
+/// Each link from another app starts as a small page window. Its title can
+/// be dragged onto an ordinary window's tabs, or expanded in place.
+fn open_compact_window(cx: &mut App, common: Rc<Common>, url: String) {
+    let bounds = Bounds::centered(None, size(px(520.0), px(620.0)), cx);
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        window_min_size: Some(size(px(360.0), px(260.0))),
+        titlebar: Some(TitlebarOptions {
+            title: Some("Vamprowser".into()),
+            appears_transparent: true,
+            traffic_light_position: Some(point(px(TRAFFIC_LIGHTS.0), px(TRAFFIC_LIGHTS.1))),
+        }),
+        app_owns_titlebar_drag: true,
+        ..Default::default()
+    };
+    let restore = state::SavedWindow {
+        tabs: vec![url],
+        ..Default::default()
+    };
+    if let Ok(handle) = cx.open_window(options, move |window, cx| {
+        cx.new(|cx| Browser::new(window, cx, common, false, Some(restore), false, None, true))
+    }) {
+        let _ = handle.update(cx, |_, window, _| window.activate_window());
+    }
 }
 
 /// Sends an extension's event to the window it concerns: a tab's own
@@ -6509,7 +7241,10 @@ fn dispatch_extension_event(common: &Rc<Common>, event: ExtensionEvent, cx: &mut
         }
         _ => browsers.first().cloned(),
     };
-    if matches!(event, ExtensionEvent::Changed | ExtensionEvent::ActionChanged) {
+    if matches!(
+        event,
+        ExtensionEvent::Changed | ExtensionEvent::ActionChanged
+    ) {
         for browser in browsers.iter().skip(1) {
             browser.update(cx, |_, cx| cx.notify());
         }
@@ -6522,7 +7257,10 @@ fn dispatch_extension_event(common: &Rc<Common>, event: ExtensionEvent, cx: &mut
             .and_then(|handle| handle.entity(cx).ok())
     });
     if let Some(browser) = target {
-        let _ = browser.read(cx).sender.try_send(BrowserEvent::Extension(event));
+        let _ = browser
+            .read(cx)
+            .sender
+            .try_send(BrowserEvent::Extension(event));
     }
 }
 
@@ -6546,7 +7284,10 @@ fn without_window(command: Command, cx: &mut App) {
     };
     let done = matches!(
         command,
-        Command::NewTab | Command::NewPrivateTab | Command::ReopenClosedTab | Command::ReopenClosedWindow
+        Command::NewTab
+            | Command::NewPrivateTab
+            | Command::ReopenClosedTab
+            | Command::ReopenClosedWindow
     );
     if !done {
         let _ = handle.update(cx, |browser, window, cx| browser.run(command, window, cx));
@@ -6587,7 +7328,11 @@ fn main() {
     // The Dock icon clicked with no window open: a new one. The ones
     // closed come back with ⌘⇧T.
     app.on_reopen(|cx| {
-        if cx.windows().iter().any(|w| w.downcast::<Browser>().is_some()) {
+        if cx
+            .windows()
+            .iter()
+            .any(|w| w.downcast::<Browser>().is_some())
+        {
             return;
         }
         let Some(common) = COMMON.with(|slot| slot.borrow().clone()) else {
@@ -6706,7 +7451,12 @@ fn main() {
                 cx.update(|cx| {
                     let front = active_browser(cx)
                         .and_then(|h| h.entity(cx).ok())
-                        .filter(|b| common.browsers().iter().any(|o| o.entity_id() == b.entity_id()));
+                        .filter(|b| {
+                            common
+                                .browsers()
+                                .iter()
+                                .any(|o| o.entity_id() == b.entity_id())
+                        });
                     match front.or_else(|| common.browsers().first().cloned()) {
                         Some(browser) => {
                             let _ = browser.read(cx).sender.try_send(event);
@@ -6749,40 +7499,17 @@ fn main() {
         })
         .detach();
         // URLs and files macOS hands over, including the ones that launched
-        // the app, go to the frontmost window.
+        // the app, get small page windows that can join a browser window.
         let forward = common.clone();
         cx.spawn(async move |cx| {
             while let Ok(urls) = opened_rx.recv().await {
                 let common = forward.clone();
                 cx.update(|cx| {
-                    // Never into a private window: links from other apps
-                    // are ordinary browsing.
-                    let ordinary = |handle: &gpui::WindowHandle<Browser>, cx: &App| {
-                        handle.entity(cx).is_ok_and(|b| !b.read(cx).private)
-                    };
-                    let target = active_browser(cx).filter(|h| ordinary(h, cx)).or_else(|| {
-                        common.browsers().into_iter().find(|b| !b.read(cx).private).and_then(|b| {
-                            cx.windows().into_iter().find_map(|w| {
-                                let handle = w.downcast::<Browser>()?;
-                                (handle.entity(cx).ok()?.entity_id() == b.entity_id()).then_some(handle)
-                            })
-                        })
-                    });
-                    match target {
-                        Some(browser) => {
-                            let _ = browser.update(cx, |this, window, cx| {
-                                this.open_external(urls, window, cx)
-                            });
-                        }
-                        None => {
-                            open_browser_window(
-                                cx,
-                                common.clone(),
-                                false,
-                                Some(state::SavedWindow { tabs: urls, ..Default::default() }),
-                                false,
-                                None,
-                            );
+                    for url in urls {
+                        if url::Url::parse(&url)
+                            .is_ok_and(|url| matches!(url.scheme(), "http" | "https" | "file"))
+                        {
+                            open_compact_window(cx, common.clone(), url);
                         }
                     }
                 });
@@ -6794,7 +7521,9 @@ fn main() {
         let history = common.clone();
         cx.spawn(async move |cx| {
             loop {
-                cx.background_executor().timer(Duration::from_secs(30)).await;
+                cx.background_executor()
+                    .timer(Duration::from_secs(30))
+                    .await;
                 history.history.borrow_mut().save();
                 sitedata::keep_cookies();
             }
@@ -6879,11 +7608,17 @@ mod browser_input_tests {
         let cmd = NSEventModifierFlags::Command;
         let idle = KeyState::default();
         assert!(matches!(shortcut("", 123, cmd, idle), Some(Command::Back)));
-        assert!(matches!(shortcut("", 124, cmd, idle), Some(Command::Forward)));
+        assert!(matches!(
+            shortcut("", 124, cmd, idle),
+            Some(Command::Forward)
+        ));
         assert!(shortcut("", 123, cmd | NSEventModifierFlags::Option, idle).is_none());
         assert!(shortcut("", 124, NSEventModifierFlags::empty(), idle).is_none());
         // Editing text, they move the caret.
-        let editing = KeyState { editing: true, ..idle };
+        let editing = KeyState {
+            editing: true,
+            ..idle
+        };
         assert!(shortcut("", 123, cmd, editing).is_none());
         assert!(shortcut("", 124, cmd, editing).is_none());
     }
@@ -6891,8 +7626,14 @@ mod browser_input_tests {
     #[test]
     fn command_shift_c_copies_current_link() {
         let cmd_shift = NSEventModifierFlags::Command | NSEventModifierFlags::Shift;
-        let editing = KeyState { editing: true, ..KeyState::default() };
-        assert!(matches!(shortcut("c", 8, cmd_shift, editing), Some(Command::CopyLink)));
+        let editing = KeyState {
+            editing: true,
+            ..KeyState::default()
+        };
+        assert!(matches!(
+            shortcut("c", 8, cmd_shift, editing),
+            Some(Command::CopyLink)
+        ));
         assert!(shortcut("c", 8, NSEventModifierFlags::Command, editing).is_none());
         assert!(shortcut("c", 8, cmd_shift | NSEventModifierFlags::Option, editing).is_none());
     }
@@ -6908,16 +7649,31 @@ mod browser_input_tests {
     #[test]
     fn option_command_r_opens_reader_mode() {
         let flags = NSEventModifierFlags::Command | NSEventModifierFlags::Option;
-        assert!(matches!(shortcut("r", 15, flags, KeyState::default()), Some(Command::ToggleReaderMode)));
-        assert!(matches!(shortcut("r", 15, NSEventModifierFlags::Command, KeyState::default()), Some(Command::Reload)));
+        assert!(matches!(
+            shortcut("r", 15, flags, KeyState::default()),
+            Some(Command::ToggleReaderMode)
+        ));
+        assert!(matches!(
+            shortcut("r", 15, NSEventModifierFlags::Command, KeyState::default()),
+            Some(Command::Reload)
+        ));
     }
 
     #[test]
     fn shift_delete_removes_only_a_picked_row() {
         let shift = NSEventModifierFlags::Shift;
-        let suggesting = KeyState { suggesting: true, ..KeyState::default() };
+        let suggesting = KeyState {
+            suggesting: true,
+            ..KeyState::default()
+        };
         assert!(shortcut("", 51, shift, suggesting).is_none());
-        let picked = KeyState { removable: true, ..suggesting };
-        assert!(matches!(shortcut("", 51, shift, picked), Some(Command::RemoveSuggestion)));
+        let picked = KeyState {
+            removable: true,
+            ..suggesting
+        };
+        assert!(matches!(
+            shortcut("", 51, shift, picked),
+            Some(Command::RemoveSuggestion)
+        ));
     }
 }

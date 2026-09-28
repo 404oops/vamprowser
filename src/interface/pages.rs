@@ -9,14 +9,14 @@ use std::{
 };
 
 use gpui::{
-    Animation, AnimationExt, AnyElement, Context, Div, Entity, ExternalDragPayload,
-    FileDragPaths, FontWeight, MouseButton, MouseDownEvent, Render, SharedString, Stateful, Window,
-    div, img, prelude::*, px,
+    Animation, AnimationExt, AnyElement, Context, Div, Entity, ExternalDragPayload, FileDragPaths,
+    FontWeight, MouseButton, MouseDownEvent, Render, SharedString, Stateful, Window, div, img,
+    prelude::*, px,
 };
 use vampir::{ButtonVariant, Palette, TextInput, WidgetContext, color, lighting};
 
 use crate::{
-    Browser, BrowserEvent, Chrome, Page, SettingsInputs, WithHint, slowed,
+    Browser, BrowserEvent, Chrome, Page, SettingsInputs, WithHint,
     commands::{Command, Place, Section},
     downloads::DownloadState,
     history::Visit,
@@ -27,7 +27,7 @@ use crate::{
         self, NewTabPage, PopupPolicy, Protection, SchemeChoice, Settings, SitePermission,
         StartSection, Startup, TabPlacement, TintMode, ToolbarItem, UserAgent,
     },
-    site_icon, site_name,
+    site_icon, site_name, slowed,
     state::now_secs,
 };
 
@@ -146,14 +146,16 @@ fn long_date() -> SharedString {
 /// click, as links on a page do.
 fn opens_link(el: Stateful<Div>, url: SharedString, cx: &mut Context<Browser>) -> Stateful<Div> {
     let middle = url.clone();
-    el.on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
-        let place = if event.modifiers().platform {
-            Place::BackgroundTab
-        } else {
-            Place::Here
-        };
-        this.open_link(&url, place, window, cx)
-    }))
+    el.on_click(
+        cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+            let place = if event.modifiers().platform {
+                Place::BackgroundTab
+            } else {
+                Place::Here
+            };
+            this.open_link(&url, place, window, cx)
+        }),
+    )
     .on_mouse_up(
         MouseButton::Middle,
         cx.listener(move |this, _, window, cx| {
@@ -313,10 +315,19 @@ impl Browser {
         cx: &mut Context<Self>,
         set: impl Fn(&mut Settings, T) + 'static,
     ) -> AnyElement {
-        self.choose(id, title, detail, options, current, palette, cx, move |this, value, cx| {
-            set(&mut this.settings, value);
-            this.save_settings(cx);
-        })
+        self.choose(
+            id,
+            title,
+            detail,
+            options,
+            current,
+            palette,
+            cx,
+            move |this, value, cx| {
+                set(&mut this.settings, value);
+                this.save_settings(cx);
+            },
+        )
     }
 
     fn field(
@@ -600,22 +611,32 @@ impl Browser {
             let bookmarks = self.bookmarks();
             // The links on the bookmarks bar; folders have the bar and the
             // bookmark manager.
-            let favorites: Vec<&crate::bookmarks::Node> =
-                bookmarks.root().iter().filter(|node| !node.is_folder()).take(16).collect();
+            let favorites: Vec<&crate::bookmarks::Node> = bookmarks
+                .root()
+                .iter()
+                .filter(|node| !node.is_folder())
+                .take(16)
+                .collect();
             if sections.favorites && !favorites.is_empty() {
                 let mut grid = div().flex().flex_wrap().gap(px(18.0));
                 for bookmark in &favorites {
                     let id = bookmark.id;
                     let url = bookmark.url.as_deref().unwrap_or_default();
                     grid = grid.child(
-                        tile(("start-favorite", id as usize), url, &bookmark.title, self, cx)
-                            .on_mouse_down(
-                                MouseButton::Right,
-                                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                                    let items = this.bookmark_menu(id);
-                                    this.context_menu(event.position, items, window, cx);
-                                }),
-                            ),
+                        tile(
+                            ("start-favorite", id as usize),
+                            url,
+                            &bookmark.title,
+                            self,
+                            cx,
+                        )
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                let items = this.bookmark_menu(id);
+                                this.context_menu(event.position, items, window, cx);
+                            }),
+                        ),
                     );
                 }
                 column = column.child(section("Favorites", 14.0, palette).child(grid));
@@ -641,13 +662,14 @@ impl Browser {
                     };
                     let menu_url = visit.url.clone();
                     grid = grid.child(
-                        tile(("start-frequent", index), &visit.url, &title, self, cx).on_mouse_down(
-                            MouseButton::Right,
-                            cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                                let items = this.link_menu(&menu_url, true);
-                                this.context_menu(event.position, items, window, cx);
-                            }),
-                        ),
+                        tile(("start-frequent", index), &visit.url, &title, self, cx)
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                    let items = this.link_menu(&menu_url, true);
+                                    this.context_menu(event.position, items, window, cx);
+                                }),
+                            ),
                     );
                 }
                 column = column.child(section("Frequently visited", 14.0, palette).child(grid));
@@ -871,7 +893,8 @@ impl Browser {
                         this.settings_section = section;
                         this.notice = None;
                         let text = this.address_text(this.selected);
-                        this.address.update(cx, |input, cx| input.set_text(&text, cx));
+                        this.address
+                            .update(cx, |input, cx| input.set_text(&text, cx));
                         cx.notify();
                     }))
                     .child(section.label()),
@@ -1439,7 +1462,9 @@ impl Browser {
         type Permission = fn(&mut Settings) -> &mut SitePermission;
         let pickers: [(&'static str, &str, SitePermission, Permission); 3] = [
             ("camera", "Camera", self.settings.camera, |s| &mut s.camera),
-            ("microphone", "Microphone", self.settings.microphone, |s| &mut s.microphone),
+            ("microphone", "Microphone", self.settings.microphone, |s| {
+                &mut s.microphone
+            }),
             (
                 "screen-capture",
                 "Screen sharing",
@@ -1450,9 +1475,18 @@ impl Browser {
         let permissions: Vec<AnyElement> = pickers
             .into_iter()
             .map(|(id, title, current, setting)| {
-                self.choose_setting(id, title, None, &permission_options, current, palette, cx, move |s, value| {
-                    *setting(s) = value;
-                })
+                self.choose_setting(
+                    id,
+                    title,
+                    None,
+                    &permission_options,
+                    current,
+                    palette,
+                    cx,
+                    move |s, value| {
+                        *setting(s) = value;
+                    },
+                )
             })
             .collect();
         let clear_data = self.action(
@@ -1883,7 +1917,9 @@ impl Browser {
                             "Remove",
                             cx,
                             move |this, cx| {
-                                if let Some(extensions) = this.common.extensions.borrow_mut().as_mut() {
+                                if let Some(extensions) =
+                                    this.common.extensions.borrow_mut().as_mut()
+                                {
                                     extensions.remove(&id);
                                 }
                                 this.refresh_other_windows(cx);
@@ -2187,24 +2223,30 @@ impl Browser {
     /// the window. Check the path then, since a file may have moved since
     /// the download was drawn.
     fn draggable_download(
-        row: Stateful<Div>, path: PathBuf, palette: Palette,
+        row: Stateful<Div>,
+        path: PathBuf,
+        palette: Palette,
         sender: async_channel::Sender<BrowserEvent>,
     ) -> Stateful<Div> {
-        let name: SharedString = path.file_name()
+        let name: SharedString = path
+            .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.to_string_lossy().into_owned())
             .into();
         row.on_drag(path, move |_, _, _, cx| {
             let _ = sender.try_send(BrowserEvent::DownloadDragStarted);
-            cx.new(|_| DraggedDownload { name: name.clone(), palette })
-        })
-            .external_drag_payload(|path: &PathBuf, _, _| {
-                let metadata = std::fs::metadata(path).ok()?;
-                Some(ExternalDragPayload::Files(FileDragPaths::new([(
-                    path.clone(),
-                    metadata.is_dir(),
-                )])))
+            cx.new(|_| DraggedDownload {
+                name: name.clone(),
+                palette,
             })
+        })
+        .external_drag_payload(|path: &PathBuf, _, _| {
+            let metadata = std::fs::metadata(path).ok()?;
+            Some(ExternalDragPayload::Files(FileDragPaths::new([(
+                path.clone(),
+                metadata.is_dir(),
+            )])))
+        })
     }
 
     /// The shelf along the bottom of the window, as old Chrome had it:
@@ -2215,6 +2257,7 @@ impl Browser {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let chrome = Chrome::new(palette);
+        let scroll = self.controls.scroll("download-shelf-items");
         let downloads = self.downloads();
         let mut strip = div()
             .id("download-shelf-items")
@@ -2222,6 +2265,7 @@ impl Browser {
             .min_w(px(0.0))
             .h_full()
             .overflow_x_scroll()
+            .track_scroll(&scroll)
             .flex()
             .items_center()
             .gap(px(6.0));
@@ -2236,101 +2280,109 @@ impl Browser {
                 },
                 DownloadState::Failed => "Failed".to_owned(),
             };
-            strip = strip.child(
-                div()
-                    .id(("shelf-item", id))
-                    .w(px(240.0))
-                    .h(px(SHELF_ITEM_HEIGHT))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.0))
-                    .px(px(10.0))
-                    .rounded(px(8.0))
-                    .bg(chrome.raised)
-                    .border_1()
-                    .border_color(color::with_alpha(chrome.line, 0.8))
-                    .cursor_pointer()
-                    .hover(move |s| s.bg(palette.soft_fill))
-                    .when(item.state == DownloadState::Done, |row| {
-                        Self::draggable_download(row, item.path.clone(), palette, self.sender.clone())
-                    })
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.run(Command::OpenDownload(id), window, cx)
-                    }))
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                            let items = this.download_menu(id);
-                            this.context_menu(event.position, items, window, cx);
-                        }),
-                    )
-                    .child(icon(
-                        Icon::File,
-                        18.0,
-                        if item.state == DownloadState::Failed {
-                            palette.danger_label
+            let chip = div()
+                .id(("shelf-item", id))
+                .w(px(240.0))
+                .h(px(SHELF_ITEM_HEIGHT))
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .px(px(10.0))
+                .rounded(px(8.0))
+                .bg(chrome.raised)
+                .border_1()
+                .border_color(color::with_alpha(chrome.line, 0.8))
+                .cursor_pointer()
+                .hover(move |s| s.bg(palette.soft_fill))
+                .when(item.state == DownloadState::Done, |row| {
+                    Self::draggable_download(row, item.path.clone(), palette, self.sender.clone())
+                })
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.run(Command::OpenDownload(id), window, cx)
+                }))
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                        let items = this.download_menu(id);
+                        this.context_menu(event.position, items, window, cx);
+                    }),
+                )
+                .child(icon(
+                    Icon::File,
+                    18.0,
+                    if item.state == DownloadState::Failed {
+                        palette.danger_label
+                    } else {
+                        palette.text_secondary
+                    },
+                ))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .flex()
+                        .flex_col()
+                        .justify_center()
+                        .gap(px(2.0))
+                        .child(
+                            div()
+                                .truncate()
+                                .text_size(px(12.5))
+                                .line_height(px(16.0))
+                                .text_color(palette.text_primary)
+                                .child(SharedString::from(item.name())),
+                        )
+                        .child(if item.state == DownloadState::InProgress {
+                            div()
+                                .h(px(14.0))
+                                .flex()
+                                .items_center()
+                                .child(Self::busy_bar(("shelf-busy", id), 150.0, palette))
+                                .into_any_element()
                         } else {
-                            palette.text_secondary
-                        },
-                    ))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .flex()
-                            .flex_col()
-                            .justify_center()
-                            .gap(px(2.0))
-                            .child(
-                                div()
-                                    .truncate()
-                                    .text_size(px(12.5))
-                                    .line_height(px(16.0))
-                                    .text_color(palette.text_primary)
-                                    .child(SharedString::from(item.name())),
-                            )
-                            .child(if item.state == DownloadState::InProgress {
-                                div()
-                                    .h(px(14.0))
-                                    .flex()
-                                    .items_center()
-                                    .child(Self::busy_bar(("shelf-busy", id), 150.0, palette))
-                                    .into_any_element()
-                            } else {
-                                div()
-                                    .h(px(14.0))
-                                    .text_size(px(11.0))
-                                    .line_height(px(14.0))
-                                    .text_color(palette.text_secondary)
-                                    .child(status)
-                                    .into_any_element()
-                            }),
-                    )
-                    .child(
-                        div()
-                            .id(("shelf-item-menu", id))
-                            .w(px(20.0))
-                            .h(px(28.0))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(5.0))
-                            .cursor_pointer()
-                            .hover(move |button| button.bg(chrome.wash))
-                            .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                            div()
+                                .h(px(14.0))
+                                .text_size(px(11.0))
+                                .line_height(px(14.0))
+                                .text_color(palette.text_secondary)
+                                .child(status)
+                                .into_any_element()
+                        }),
+                )
+                .child(
+                    div()
+                        .id(("shelf-item-menu", id))
+                        .w(px(20.0))
+                        .h(px(28.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(5.0))
+                        .cursor_pointer()
+                        .hover(move |button| button.bg(chrome.wash))
+                        .on_click(
+                            cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
                                 cx.stop_propagation();
                                 let items = this.download_menu(id);
                                 this.context_menu(event.position(), items, window, cx);
-                            }))
-                            .child(icon(Icon::ChevronDown, 12.0, palette.text_secondary)),
-                    )
+                            }),
+                        )
+                        .child(icon(Icon::ChevronDown, 12.0, palette.text_secondary)),
+                );
+            strip = strip.child(
+                div()
+                    .w(px(240.0))
+                    .h(px(SHELF_ITEM_HEIGHT))
+                    .flex_none()
+                    .overflow_hidden()
+                    .child(chip)
                     .with_animation(
                         ("shelf-item-enter", id),
                         Animation::new(slowed(Duration::from_millis(220)))
                             .with_easing(|t: f32| 1.0 - (1.0 - t).powi(3)),
-                        |row, t| row.opacity(t),
+                        |wrapper, t| wrapper.w(px(240.0 * t)).opacity(t),
                     ),
             );
         }
@@ -2347,7 +2399,18 @@ impl Browser {
             .border_t_1()
             .border_color(chrome.line)
             .bg(chrome.ground)
-            .child(strip)
+            .child(
+                self.faded(
+                    "download-shelf",
+                    strip,
+                    &scroll,
+                    crate::ScrollAxis::Horizontal,
+                    chrome.ground,
+                )
+                .flex_1()
+                .min_w(px(0.0))
+                .h_full(),
+            )
             .child(
                 div()
                     .id("shelf-show-all")
@@ -2464,9 +2527,21 @@ impl Browser {
             if let Some(size) = size.filter(|_| item.state == DownloadState::Done) {
                 details.push(file_size(size));
             }
-            details.extend(status.filter(|_| item.state != DownloadState::InProgress).map(str::to_owned));
-            let details = details.into_iter().filter(|d| !d.is_empty()).collect::<Vec<_>>().join(" · ");
-            let ink = if strike { palette.text_secondary } else { palette.text_primary };
+            details.extend(
+                status
+                    .filter(|_| item.state != DownloadState::InProgress)
+                    .map(str::to_owned),
+            );
+            let details = details
+                .into_iter()
+                .filter(|d| !d.is_empty())
+                .collect::<Vec<_>>()
+                .join(" · ");
+            let ink = if strike {
+                palette.text_secondary
+            } else {
+                palette.text_primary
+            };
             column = column.child(
                 card(palette)
                     .id(("download", id))
@@ -2475,7 +2550,12 @@ impl Browser {
                     .items_center()
                     .gap(px(14.0))
                     .when(item.state == DownloadState::Done, |row| {
-                        Self::draggable_download(row, item.path.clone(), palette, self.sender.clone())
+                        Self::draggable_download(
+                            row,
+                            item.path.clone(),
+                            palette,
+                            self.sender.clone(),
+                        )
                     })
                     .on_mouse_down(
                         MouseButton::Right,
@@ -2564,7 +2644,9 @@ impl Browser {
                                 false,
                                 palette,
                                 cx,
-                                move |this, window, cx| this.run(Command::RemoveDownload(id), window, cx),
+                                move |this, window, cx| {
+                                    this.run(Command::RemoveDownload(id), window, cx)
+                                },
                             )),
                     ),
             );

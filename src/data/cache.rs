@@ -9,9 +9,70 @@ use objc2::{
 };
 use objc2_foundation::{NSArray, NSError, NSSet, NSString};
 use objc2_web_kit::{
-    WKWebView, WKWebsiteDataRecord, WKWebsiteDataTypeDiskCache, WKWebsiteDataTypeFetchCache,
-    WKWebsiteDataTypeMemoryCache, WKWebsiteDataTypeOfflineWebApplicationCache,
+    WKWebView, WKWebsiteDataRecord, WKWebsiteDataTypeCookies, WKWebsiteDataTypeDiskCache,
+    WKWebsiteDataTypeFetchCache, WKWebsiteDataTypeFileSystem, WKWebsiteDataTypeIndexedDBDatabases,
+    WKWebsiteDataTypeLocalStorage, WKWebsiteDataTypeMemoryCache,
+    WKWebsiteDataTypeOfflineWebApplicationCache, WKWebsiteDataTypeServiceWorkerRegistrations,
+    WKWebsiteDataTypeSessionStorage, WKWebsiteDataTypeWebSQLDatabases,
 };
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SiteDataKind {
+    Cookies,
+    Storage,
+    All,
+}
+
+/// Removes the selected data for records covering this host in this tab's
+/// WebKit data store. Private tabs therefore clear only private data.
+pub fn clear_site_data(webview: &WKWebView, host: String, kind: SiteDataKind) {
+    let store = unsafe { webview.configuration().websiteDataStore() };
+    let types: Retained<NSSet<NSString>> = if kind == SiteDataKind::All {
+        objc2::MainThreadMarker::new()
+            .map(|mtm| unsafe { objc2_web_kit::WKWebsiteDataStore::allWebsiteDataTypes(mtm) })
+            .unwrap_or_else(|| NSSet::from_slice(&[]))
+    } else if kind == SiteDataKind::Cookies {
+        unsafe { NSSet::from_slice(&[WKWebsiteDataTypeCookies]) }
+    } else {
+        unsafe {
+            NSSet::from_slice(&[
+                WKWebsiteDataTypeLocalStorage,
+                WKWebsiteDataTypeIndexedDBDatabases,
+                WKWebsiteDataTypeSessionStorage,
+                WKWebsiteDataTypeWebSQLDatabases,
+                WKWebsiteDataTypeServiceWorkerRegistrations,
+                WKWebsiteDataTypeFileSystem,
+            ])
+        }
+    };
+    let (remove_store, remove_types) = (store.clone(), types.clone());
+    let weak = Weak::from(webview);
+    let fetched = RcBlock::new(
+        move |records: std::ptr::NonNull<NSArray<WKWebsiteDataRecord>>| {
+            let chosen: Vec<Retained<WKWebsiteDataRecord>> = unsafe { records.as_ref() }
+                .iter()
+                .filter(|record| covers(&unsafe { record.displayName() }.to_string(), &host))
+                .collect();
+            if chosen.is_empty() {
+                return;
+            }
+            let weak = weak.clone();
+            let done = RcBlock::new(move || {
+                if let Some(view) = weak.load() {
+                    unsafe { view.reload() };
+                }
+            });
+            unsafe {
+                remove_store.removeDataOfTypes_forDataRecords_completionHandler(
+                    &remove_types,
+                    &NSArray::from_retained_slice(&chosen),
+                    &done,
+                );
+            }
+        },
+    );
+    unsafe { store.fetchDataRecordsOfTypes_completionHandler(&types, &fetched) };
+}
 
 /// The page's host and those of everything it loaded, as a JSON array.
 const HOSTS_SCRIPT: &str = r#"JSON.stringify([location.hostname].concat(
@@ -24,7 +85,10 @@ fn covers(site: &str, host: &str) -> bool {
     let site = site.trim_start_matches('.').to_ascii_lowercase();
     let host = host.to_ascii_lowercase();
     !site.is_empty()
-        && (host == site || host.strip_suffix(site.as_str()).is_some_and(|rest| rest.ends_with('.')))
+        && (host == site
+            || host
+                .strip_suffix(site.as_str())
+                .is_some_and(|rest| rest.ends_with('.')))
 }
 
 fn hosts_of(result: &str) -> Vec<String> {
@@ -58,7 +122,10 @@ pub fn erase_and_reload(webview: &WKWebView) {
     // SAFETY: a valid script and a block of the documented type, called
     // once on the main thread.
     unsafe {
-        webview.evaluateJavaScript_completionHandler(&NSString::from_str(HOSTS_SCRIPT), Some(&answered));
+        webview.evaluateJavaScript_completionHandler(
+            &NSString::from_str(HOSTS_SCRIPT),
+            Some(&answered),
+        );
     }
 }
 
@@ -75,38 +142,40 @@ fn erase_for(webview: &WKWebView, hosts: Vec<String>) {
     };
     let weak = Weak::from(webview);
     let (store_again, types_again) = (store.clone(), types.clone());
-    let fetched = RcBlock::new(move |records: std::ptr::NonNull<NSArray<WKWebsiteDataRecord>>| {
-        // SAFETY: WebKit passes a valid array for the callback's duration.
-        let records = unsafe { records.as_ref() };
-        let chosen: Vec<Retained<WKWebsiteDataRecord>> = records
-            .iter()
-            .filter(|record| {
-                // SAFETY: a plain property read.
-                let site = unsafe { record.displayName() }.to_string();
-                hosts.iter().any(|host| covers(&site, host))
-            })
-            .collect();
-        let weak = weak.clone();
-        let reload = RcBlock::new(move || {
-            if let Some(webview) = weak.load() {
-                // SAFETY: a live web view, on the main thread.
-                unsafe { webview.reloadFromOrigin() };
+    let fetched = RcBlock::new(
+        move |records: std::ptr::NonNull<NSArray<WKWebsiteDataRecord>>| {
+            // SAFETY: WebKit passes a valid array for the callback's duration.
+            let records = unsafe { records.as_ref() };
+            let chosen: Vec<Retained<WKWebsiteDataRecord>> = records
+                .iter()
+                .filter(|record| {
+                    // SAFETY: a plain property read.
+                    let site = unsafe { record.displayName() }.to_string();
+                    hosts.iter().any(|host| covers(&site, host))
+                })
+                .collect();
+            let weak = weak.clone();
+            let reload = RcBlock::new(move || {
+                if let Some(webview) = weak.load() {
+                    // SAFETY: a live web view, on the main thread.
+                    unsafe { webview.reloadFromOrigin() };
+                }
+            });
+            if chosen.is_empty() {
+                reload.call(());
+                return;
             }
-        });
-        if chosen.is_empty() {
-            reload.call(());
-            return;
-        }
-        // SAFETY: records this store just listed, and a block of the
-        // documented type.
-        unsafe {
-            store_again.removeDataOfTypes_forDataRecords_completionHandler(
-                &types_again,
-                &NSArray::from_retained_slice(&chosen),
-                &reload,
-            );
-        }
-    });
+            // SAFETY: records this store just listed, and a block of the
+            // documented type.
+            unsafe {
+                store_again.removeDataOfTypes_forDataRecords_completionHandler(
+                    &types_again,
+                    &NSArray::from_retained_slice(&chosen),
+                    &reload,
+                );
+            }
+        },
+    );
     // SAFETY: a valid set of types and a block of the documented type.
     unsafe { store.fetchDataRecordsOfTypes_completionHandler(&types, &fetched) };
 }
@@ -125,7 +194,10 @@ mod tests {
 
     #[test]
     fn hosts_come_from_the_page_script() {
-        assert_eq!(hosts_of(r#"["a.org","","cdn.b.net"]"#), ["a.org", "cdn.b.net"]);
+        assert_eq!(
+            hosts_of(r#"["a.org","","cdn.b.net"]"#),
+            ["a.org", "cdn.b.net"]
+        );
         assert!(hosts_of("not json").is_empty());
     }
 }

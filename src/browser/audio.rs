@@ -1,23 +1,42 @@
-//! WebKit's per-page audio controls. These selectors are WebKit SPI: the
-//! public WKWebView API exposes playback state, but not tab audio muting.
+//! WebKit's per-page audio controls and activity observation. The audio
+//! selectors are WebKit SPI; capture state and playback state are public.
 
-use std::{ffi::c_void, ptr};
+use std::{
+    cell::{Cell, RefCell},
+    ffi::c_void,
+    ptr,
+};
 
 use objc2::{
-    DefinedClass, MainThreadMarker, MainThreadOnly, Message, define_class, msg_send, rc::Retained,
-    runtime::AnyObject,
+    DefinedClass, MainThreadMarker, MainThreadOnly, Message, define_class, msg_send,
+    rc::Retained,
+    runtime::{AnyObject, ProtocolObject},
 };
 use objc2_foundation::{
-    NSDictionary, NSKeyValueChangeKey, NSKeyValueChangeNewKey, NSKeyValueObservingOptions,
-    NSNumber, NSObject, NSObjectNSKeyValueObserverRegistration, NSObjectProtocol, NSString,
+    NSActivityOptions, NSDictionary, NSKeyValueChangeKey, NSKeyValueChangeNewKey,
+    NSKeyValueObservingOptions, NSNumber, NSObject, NSObjectNSKeyValueObserverRegistration,
+    NSObjectProtocol, NSProcessInfo, NSString,
 };
-use objc2_web_kit::WKWebView;
+use objc2_web_kit::{WKMediaCaptureState, WKWebView};
 
 const AUDIO_MUTED: usize = 1;
 
+/// A muted capture can still be part of an ongoing call.
+pub fn is_capturing(view: &WKWebView) -> bool {
+    // SAFETY: public WebKit state reads on the main thread.
+    unsafe {
+        view.cameraCaptureState() != WKMediaCaptureState::None
+            || view.microphoneCaptureState() != WKMediaCaptureState::None
+    }
+}
+
 pub(crate) struct AudioIvars {
     view: Retained<WKWebView>,
-    key: Retained<NSString>,
+    audio_key: Retained<NSString>,
+    camera_key: Retained<NSString>,
+    microphone_key: Retained<NSString>,
+    playing: Cell<bool>,
+    activity: RefCell<Option<Retained<ProtocolObject<dyn NSObjectProtocol>>>>,
     changed: Box<dyn Fn(bool)>,
 }
 
@@ -34,16 +53,20 @@ define_class!(
         #[unsafe(method(observeValueForKeyPath:ofObject:change:context:))]
         fn observe_value(
             &self,
-            _key: Option<&NSString>,
+            key: Option<&NSString>,
             _object: Option<&AnyObject>,
             change: Option<&NSDictionary<NSKeyValueChangeKey, AnyObject>>,
             _context: *mut c_void,
         ) {
-            let playing = change
-                .and_then(|change| change.objectForKey(unsafe { NSKeyValueChangeNewKey }))
-                .and_then(|value| value.downcast::<NSNumber>().ok())
-                .is_some_and(|value| value.boolValue());
-            (self.ivars().changed)(playing);
+            if key.is_some_and(|key| key == &*self.ivars().audio_key) {
+                let playing = change
+                    .and_then(|change| change.objectForKey(unsafe { NSKeyValueChangeNewKey }))
+                    .and_then(|value| value.downcast::<NSNumber>().ok())
+                    .is_some_and(|value| value.boolValue());
+                self.ivars().playing.set(playing);
+                (self.ivars().changed)(playing);
+            }
+            self.refresh_activity();
         }
     }
 
@@ -51,40 +74,78 @@ define_class!(
 );
 
 impl AudioObserver {
+    /// Keep the display and computer awake only while this page has live
+    /// media. A muted capture still belongs to an ongoing call.
+    fn refresh_activity(&self) {
+        let ivars = self.ivars();
+        let active = ivars.playing.get() || is_capturing(&ivars.view);
+        let mut activity = ivars.activity.borrow_mut();
+        if active && activity.is_none() {
+            *activity = Some(
+                NSProcessInfo::processInfo().beginActivityWithOptions_reason(
+                    NSActivityOptions::UserInitiated | NSActivityOptions::IdleDisplaySleepDisabled,
+                    &NSString::from_str("Vamprowser page media or call in progress"),
+                ),
+            );
+        } else if !active && let Some(token) = activity.take() {
+            // SAFETY: `token` came from beginActivity on this process.
+            unsafe { NSProcessInfo::processInfo().endActivity(&token) };
+        }
+    }
+
     pub fn new(view: &WKWebView, changed: impl Fn(bool) + 'static) -> Retained<Self> {
-        let key = NSString::from_str("_isPlayingAudio");
         let observer = Self::alloc(MainThreadMarker::new().expect("audio observer on main thread"))
             .set_ivars(AudioIvars {
                 view: view.retain(),
-                key,
+                audio_key: NSString::from_str("_isPlayingAudio"),
+                camera_key: NSString::from_str("cameraCaptureState"),
+                microphone_key: NSString::from_str("microphoneCaptureState"),
+                playing: Cell::new(false),
+                activity: RefCell::new(None),
                 changed: Box::new(changed),
             });
         let observer: Retained<Self> = unsafe { msg_send![super(observer), init] };
-        // SAFETY: the observer owns the web view and unregisters in Drop.
+        // SAFETY: WebKit documents KVO on both capture properties. The
+        // observer owns the web view and unregisters in Drop.
         unsafe {
-            observer
-                .ivars()
-                .view
-                .addObserver_forKeyPath_options_context(
-                    &observer,
-                    &observer.ivars().key,
-                    NSKeyValueObservingOptions::New,
-                    ptr::null_mut(),
-                );
+            for key in [
+                &observer.ivars().audio_key,
+                &observer.ivars().camera_key,
+                &observer.ivars().microphone_key,
+            ] {
+                observer
+                    .ivars()
+                    .view
+                    .addObserver_forKeyPath_options_context(
+                        &observer,
+                        key,
+                        NSKeyValueObservingOptions::New,
+                        ptr::null_mut(),
+                    );
+            }
         }
+        observer.refresh_activity();
         observer
     }
 }
 
 impl Drop for AudioObserver {
     fn drop(&mut self) {
-        // SAFETY: this is the same registration created in new, and the
+        // SAFETY: these are the registrations created in new, and the
         // retained web view is still alive during this destructor.
         unsafe {
-            self.ivars()
-                .view
-                .removeObserver_forKeyPath(self, &self.ivars().key)
+            for key in [
+                &self.ivars().audio_key,
+                &self.ivars().camera_key,
+                &self.ivars().microphone_key,
+            ] {
+                self.ivars().view.removeObserver_forKeyPath(self, key);
+            }
         };
+        if let Some(token) = self.ivars().activity.borrow_mut().take() {
+            // SAFETY: `token` came from beginActivity on this process.
+            unsafe { NSProcessInfo::processInfo().endActivity(&token) };
+        }
     }
 }
 

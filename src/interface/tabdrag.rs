@@ -160,7 +160,10 @@ impl Browser {
                 .fold(px(0.0), |a, b| a.max(b));
             at.x <= right + slack
         } else {
-            let top = tabs.iter().map(|(_, b)| b.origin.y).fold(px(f32::MAX), |a, b| a.min(b));
+            let top = tabs
+                .iter()
+                .map(|(_, b)| b.origin.y)
+                .fold(px(f32::MAX), |a, b| a.min(b));
             let bottom = tabs
                 .iter()
                 .map(|(_, b)| b.origin.y + b.size.height)
@@ -218,6 +221,19 @@ impl Browser {
             self.tab_drag = None;
             return;
         };
+        // The compact window's title is a tab handle, even though it has no
+        // visible tab strip. Carry the entire window as soon as it is dragged.
+        if self.compact {
+            let grab = (f64::from(f32::from(at.x)), f64::from(f32::from(at.y)));
+            if let Some(drag) = &mut self.tab_drag {
+                drag.carrier = Some(Carrier {
+                    browser: cx.weak_entity(),
+                    ns_window: self.ns_window,
+                    grab,
+                });
+            }
+            return;
+        }
         // Along the strip: the tab moves among the others as it goes.
         if let Some(to) = self.drop_index(at, Some(id)) {
             if to != from {
@@ -258,7 +274,8 @@ impl Browser {
         let private = self.private;
         let me = cx.weak_entity();
         cx.defer(move |cx| {
-            let Some(handle) = open_browser_window(cx, common, private, None, false, Some(tab)) else {
+            let Some(handle) = open_browser_window(cx, common, private, None, false, Some(tab))
+            else {
                 return;
             };
             let Ok(entity) = handle.entity(cx) else {
@@ -369,7 +386,7 @@ impl Browser {
     /// (or isn't) private would land, with the pointer where it is now.
     fn landing(&self, private: bool) -> Option<usize> {
         // Private tabs stay out of ordinary windows, and the other way round.
-        if self.private != private {
+        if self.private != private || self.compact {
             return None;
         }
         self.drop_index(pointer_in(self.ns_window)?, None)
@@ -407,9 +424,15 @@ impl Browser {
             (
                 Bounds::new(
                     Point::new(first.origin.x - pad, first.origin.y - pad),
-                    gpui::size(first.size.width + pad * 2.0, bottom - first.origin.y + pad * 2.0),
+                    gpui::size(
+                        first.size.width + pad * 2.0,
+                        bottom - first.origin.y + pad * 2.0,
+                    ),
                 ),
-                Bounds::new(Point::new(first.origin.x, y), gpui::size(first.size.width, px(3.0))),
+                Bounds::new(
+                    Point::new(first.origin.x, y),
+                    gpui::size(first.size.width, px(3.0)),
+                ),
             )
         } else {
             let right = last.origin.x + last.size.width;
@@ -420,9 +443,15 @@ impl Browser {
             (
                 Bounds::new(
                     Point::new(first.origin.x - pad, first.origin.y - pad),
-                    gpui::size(right - first.origin.x + pad * 2.0, first.size.height + pad * 2.0),
+                    gpui::size(
+                        right - first.origin.x + pad * 2.0,
+                        first.size.height + pad * 2.0,
+                    ),
                 ),
-                Bounds::new(Point::new(x, first.origin.y), gpui::size(px(3.0), first.size.height)),
+                Bounds::new(
+                    Point::new(x, first.origin.y),
+                    gpui::size(px(3.0), first.size.height),
+                ),
             )
         };
         Some(
@@ -456,9 +485,19 @@ impl Browser {
                 // The tab itself, where it will land.
                 .child({
                     let (left, top, width, height) = if self.vertical_tabs {
-                        (first.origin.x + px(10.0), bar.origin.y - first.size.height / 2.0, first.size.width - px(20.0), first.size.height)
+                        (
+                            first.origin.x + px(10.0),
+                            bar.origin.y - first.size.height / 2.0,
+                            first.size.width - px(20.0),
+                            first.size.height,
+                        )
                     } else {
-                        (bar.origin.x + px(6.0), first.origin.y, px(170.0), first.size.height)
+                        (
+                            bar.origin.x + px(6.0),
+                            first.origin.y,
+                            px(170.0),
+                            first.size.height,
+                        )
                     };
                     gpui::div()
                         .absolute()
@@ -533,7 +572,8 @@ impl Browser {
                     let moved = me.clone();
                     window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
                         if phase == DispatchPhase::Capture {
-                            let _ = moved.update(cx, |browser, cx| browser.drag_moved(event.position, cx));
+                            let _ = moved
+                                .update(cx, |browser, cx| browser.drag_moved(event.position, cx));
                         }
                     });
                     let ended = me.clone();

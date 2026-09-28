@@ -57,6 +57,9 @@ fn place_traffic_lights(window: &NSWindow) {
 
 impl Browser {
     pub(crate) fn toggle_minimal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.compact {
+            return;
+        }
         self.minimal = !self.minimal;
         self.chrome_revealed = false;
         self.pointer_left = None;

@@ -1,6 +1,6 @@
 [package]
 name = "vamprowser"
-version = "0.4.3"
+version = "0.4.4"
 edition = "2024"
 rust-version = "1.89"
 description = "A macOS browser with Vampir controls and WebKit"
@@ -46,6 +46,7 @@ objc2-app-kit = { version = "0.3", features = [
     "NSFont",
     "NSWorkspace",
     "objc2-core-graphics",
+    "objc2-core-foundation",
 ] }
 objc2-foundation = { version = "0.3", features = [
     "NSArray",
@@ -68,6 +69,7 @@ objc2-foundation = { version = "0.3", features = [
     "NSTimer",
     "NSNotification",
     "NSOperation",
+    "NSProcessInfo",
     "NSKeyValueObserving",
     "NSUserActivity",
     "NSURLResponse",

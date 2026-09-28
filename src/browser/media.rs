@@ -148,15 +148,30 @@ pub fn destination(dir: &Path, info: &Info, choice: &Choice) -> Result<PathBuf, 
     let Choice::Bundle = choice else {
         let tag = match choice {
             Choice::Format(id) => format!("format {id}"),
-            Choice::Subtitle(lang, automatic) => format!("subtitle {lang}{}", if *automatic { " auto" } else { "" }),
+            Choice::Subtitle(lang, automatic) => {
+                format!("subtitle {lang}{}", if *automatic { " auto" } else { "" })
+            }
             Choice::Description => "description".into(),
             Choice::Bundle => unreachable!(),
         };
-        let tag: String = tag.chars().map(|c| if c.is_control() || "/\\:%".contains(c) { '_' } else { c }).collect();
+        let tag: String = tag
+            .chars()
+            .map(|c| {
+                if c.is_control() || "/\\:%".contains(c) {
+                    '_'
+                } else {
+                    c
+                }
+            })
+            .collect();
         let base = format!("{base} · {tag}");
         let mut reserved = reservations().lock().map_err(|e| e.to_string())?;
         for number in 1.. {
-            let name = if number == 1 { base.clone() } else { format!("{base} {number}") };
+            let name = if number == 1 {
+                base.clone()
+            } else {
+                format!("{base} {number}")
+            };
             let stem = dir.join(name);
             if !reserved.contains(&stem) && individual_file(&stem).is_err() {
                 reserved.insert(stem.clone());
@@ -182,7 +197,9 @@ pub fn destination(dir: &Path, info: &Info, choice: &Choice) -> Result<PathBuf, 
 pub fn download(url: &str, destination: &Path, choice: &Choice) -> Result<PathBuf, String> {
     let result = download_inner(url, destination, choice);
     if !matches!(choice, Choice::Bundle) {
-        if let Ok(mut reserved) = reservations().lock() { reserved.remove(destination); }
+        if let Ok(mut reserved) = reservations().lock() {
+            reserved.remove(destination);
+        }
     }
     result
 }
@@ -201,7 +218,13 @@ fn download_inner(url: &str, destination: &Path, choice: &Choice) -> Result<Path
     };
     let mut command = Command::new(exe);
     command
-        .args(["--no-playlist", "--no-warnings", "--no-progress", "--no-overwrites", "-o"])
+        .args([
+            "--no-playlist",
+            "--no-warnings",
+            "--no-progress",
+            "--no-overwrites",
+            "-o",
+        ])
         .arg(template);
     match choice {
         Choice::Bundle => {
@@ -210,7 +233,6 @@ fn download_inner(url: &str, destination: &Path, choice: &Choice) -> Result<Path
                 "bestvideo,bestaudio/best",
                 "--write-description",
                 "--write-subs",
-                "--write-auto-subs",
                 "--sub-langs",
                 "all",
             ]);
@@ -239,19 +261,34 @@ fn download_inner(url: &str, destination: &Path, choice: &Choice) -> Result<Path
         .arg(url)
         .output()
         .map_err(|e| e.to_string())?;
-    if !output.status.success() { return Err(error_message(&output.stderr)); }
-    if matches!(choice, Choice::Bundle) { Ok(destination.to_owned()) }
-    else { individual_file(destination) }
+    if !output.status.success() {
+        return Err(error_message(&output.stderr));
+    }
+    if matches!(choice, Choice::Bundle) {
+        Ok(destination.to_owned())
+    } else {
+        individual_file(destination)
+    }
 }
 
 fn individual_file(stem: &Path) -> Result<PathBuf, String> {
     let parent = stem.parent().ok_or("Invalid download path")?;
-    let prefix = format!("{}.", stem.file_name().ok_or("Invalid download name")?.to_string_lossy());
+    let prefix = format!(
+        "{}.",
+        stem.file_name()
+            .ok_or("Invalid download name")?
+            .to_string_lossy()
+    );
     std::fs::read_dir(parent)
         .map_err(|e| e.to_string())?
         .filter_map(Result::ok)
         .map(|entry| entry.path())
-        .find(|path| path.is_file() && path.file_name().is_some_and(|name| name.to_string_lossy().starts_with(&prefix)))
+        .find(|path| {
+            path.is_file()
+                && path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(&prefix))
+        })
         .ok_or_else(|| "yt-dlp reported success, but no file was saved".into())
 }
 
@@ -279,19 +316,33 @@ mod tests {
     #[test]
     fn folder_name_cannot_escape_download_directory() {
         let info = Info {
-            title: "../bad/name: title".into(), id: "id/other".into(),
-            formats: Vec::new(), subtitles: Default::default(),
-            automatic_captions: Default::default(), description: None,
+            title: "../bad/name: title".into(),
+            id: "id/other".into(),
+            formats: Vec::new(),
+            subtitles: Default::default(),
+            automatic_captions: Default::default(),
+            description: None,
         };
         assert_eq!(folder_name(&info), "_bad_name_ title [idother]");
     }
 
     #[test]
     fn individual_destination_is_a_file_stem_in_downloads() {
-        let dir = std::env::temp_dir().join(format!("vamp-media-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let dir = std::env::temp_dir().join(format!(
+            "vamp-media-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         let info = Info {
-            title: "Example".into(), id: "abc".into(), formats: Vec::new(),
-            subtitles: Default::default(), automatic_captions: Default::default(), description: None,
+            title: "Example".into(),
+            id: "abc".into(),
+            formats: Vec::new(),
+            subtitles: Default::default(),
+            automatic_captions: Default::default(),
+            description: None,
         };
         let stem = destination(&dir, &info, &Choice::Format("602".into())).unwrap();
         assert_eq!(stem.parent(), Some(dir.as_path()));

@@ -6,16 +6,19 @@
 //! key, or switching to another app closes it; that click does nothing
 //! else.
 
-use std::{cell::Cell, cell::RefCell, ptr::NonNull, rc::Rc, time::Duration};
+use std::{cell::Cell, cell::RefCell, ptr::NonNull, rc::Rc};
 
 use async_channel::{Receiver, Sender};
 use block2::RcBlock;
 use gpui::{
-    Animation, AnimationExt, App, Bounds, Context, DisplayId, Point, Render, Task, Window, WindowBounds, WindowKind,
+    App, Bounds, Context, DisplayId, Point, Render, Task, Window, WindowBounds, WindowKind,
     WindowOptions, div, prelude::*, px, size,
 };
-use objc2::{rc::Retained, runtime::{AnyObject, ProtocolObject}};
-use objc2_app_kit::{NSEvent, NSEventMask, NSEventType};
+use objc2::{
+    rc::Retained,
+    runtime::{AnyObject, ProtocolObject},
+};
+use objc2_app_kit::{NSColor, NSEvent, NSEventMask, NSEventType};
 use objc2_foundation::{NSNotificationCenter, NSObjectProtocol};
 use vampir::{ControlHost, ControlState, Palette, ui_font};
 
@@ -122,7 +125,10 @@ fn close_from_outside(ns_window: usize, dismiss: &Sender<Signal>, dismissed: &Ce
     dismissed.set(true);
     OPEN.with(|slot| {
         let mut slot = slot.borrow_mut();
-        if slot.as_ref().is_some_and(|open| open.ns_window == ns_window) {
+        if slot
+            .as_ref()
+            .is_some_and(|open| open.ns_window == ns_window)
+        {
             *slot = None;
         }
     });
@@ -153,7 +159,11 @@ fn watch(
             }
             close_from_outside(ns_window, &dismiss, &dismissed);
             // Escape.
-            return if event_ref.keyCode() == 53 { std::ptr::null_mut() } else { event.as_ptr() };
+            return if event_ref.keyCode() == 53 {
+                std::ptr::null_mut()
+            } else {
+                event.as_ptr()
+            };
         }
         if crate::event_in(event_ref, ns_window) {
             return event.as_ptr();
@@ -199,7 +209,10 @@ impl Menu {
         let ns_window = self.ns_window;
         OPEN.with(|slot| {
             let mut slot = slot.borrow_mut();
-            if slot.as_ref().is_some_and(|open| open.ns_window == ns_window) {
+            if slot
+                .as_ref()
+                .is_some_and(|open| open.ns_window == ns_window)
+            {
                 *slot = None;
             }
         });
@@ -216,7 +229,10 @@ impl Menu {
             unsafe { NSEvent::removeMonitor(&monitor) };
         }
         // SAFETY: the observer the notification center returned.
-        unsafe { NSNotificationCenter::defaultCenter().removeObserver(ProtocolObject::as_ref(&*watch.resign)) };
+        unsafe {
+            NSNotificationCenter::defaultCenter()
+                .removeObserver(ProtocolObject::as_ref(&*watch.resign))
+        };
     }
 
     /// Opens a correctly sized popup for the next menu level.
@@ -240,7 +256,9 @@ impl Menu {
 
     fn reopen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let origin = window.bounds().origin;
-        let display = window.display(cx).map(|display| (display.id(), display.bounds()));
+        let display = window
+            .display(cx)
+            .map(|display| (display.id(), display.bounds()));
         let levels = self.levels.clone();
         let answer = self.answer.clone();
         let palette = self.palette;
@@ -248,7 +266,10 @@ impl Menu {
         self.stop_watching();
         OPEN.with(|slot| {
             let mut slot = slot.borrow_mut();
-            if slot.as_ref().is_some_and(|open| open.ns_window == self.ns_window) {
+            if slot
+                .as_ref()
+                .is_some_and(|open| open.ns_window == self.ns_window)
+            {
                 if let Some(open) = slot.take() {
                     open.dismissed.set(true);
                 }
@@ -377,12 +398,6 @@ impl Render for Menu {
                 )
             })
             .children(rows)
-            .with_animation(
-                ("menu-enter", self.levels.len()),
-                Animation::new(crate::slowed(Duration::from_millis(130)))
-                    .with_easing(|t: f32| 1.0 - (1.0 - t).powi(3)),
-                |menu, t| menu.opacity(t),
-            )
     }
 }
 
@@ -417,9 +432,9 @@ fn open_level(
     answer: Sender<Option<usize>>,
     palette: Palette,
 ) {
-    let height = levels
-        .last()
-        .map_or(2.0 * PADDING, |(entries, _)| height_of(entries, levels.len() > 1));
+    let height = levels.last().map_or(2.0 * PADDING, |(entries, _)| {
+        height_of(entries, levels.len() > 1)
+    });
     if let Some((_, screen)) = display {
         origin.x = origin
             .x
@@ -440,12 +455,16 @@ fn open_level(
         // window it's for look inactive.
         kind: WindowKind::PopUp,
         focus: false,
+        // GPUI's macOS popup backing starts out black. Keep it hidden until
+        // its first draw has filled the window with the menu surface.
+        show: false,
         titlebar: None,
         is_resizable: false,
         is_minimizable: false,
         ..Default::default()
     };
-    let _ = cx.open_window(options, move |window, cx| {
+    let surface = vampir::color::channels(palette.field_surface);
+    let result = cx.open_window(options, move |window, cx| {
         let (ns_window, _) = crate::ns_window_of(window);
         let (dismiss, signals) = async_channel::unbounded();
         let dismissed = Rc::new(Cell::new(false));
@@ -484,6 +503,24 @@ fn open_level(
         });
         menu
     });
+    if let Ok(handle) = result {
+        let _ = handle.update(cx, |_, window, _| {
+            let (ns_window, _) = crate::ns_window_of(window);
+            if ns_window == 0 {
+                return;
+            }
+            // SAFETY: the native window belongs to this live GPUI window.
+            let ns_window = unsafe { &*(ns_window as *const objc2_app_kit::NSWindow) };
+            let background = NSColor::colorWithSRGBRed_green_blue_alpha(
+                f64::from(surface[0]),
+                f64::from(surface[1]),
+                f64::from(surface[2]),
+                f64::from(surface[3]),
+            );
+            ns_window.setBackgroundColor(Some(&background));
+            ns_window.orderFront(None);
+        });
+    }
 }
 
 #[cfg(test)]
@@ -505,11 +542,18 @@ mod tests {
 
     #[test]
     fn menus_are_as_tall_as_their_rows() {
-        let entries = [MenuEntry::item("A"), MenuEntry::Separator, MenuEntry::item("B")];
+        let entries = [
+            MenuEntry::item("A"),
+            MenuEntry::Separator,
+            MenuEntry::item("B"),
+        ];
         assert_eq!(
             height_of(&entries, false),
             2.0 * ROW_HEIGHT + SEPARATOR_HEIGHT + 2.0 * PADDING
         );
-        assert_eq!(height_of(&entries, true), height_of(&entries, false) + ROW_HEIGHT);
+        assert_eq!(
+            height_of(&entries, true),
+            height_of(&entries, false) + ROW_HEIGHT
+        );
     }
 }

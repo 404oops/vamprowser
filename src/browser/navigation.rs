@@ -132,6 +132,7 @@ thread_local! {
     static FAILURES: RefCell<HashMap<usize, FailureHandler>> = RefCell::default();
     static AUTH_HANDLERS: RefCell<HashMap<usize, AuthRegistration>> = RefCell::default();
     static AUTH_PENDING: RefCell<HashMap<usize, PendingAuth>> = RefCell::default();
+    static AUTH_SUSPENDED: RefCell<HashMap<usize, AuthSpace>> = RefCell::default();
     static CERT_PRESENTED: RefCell<HashMap<usize, crate::certificate::Presented>> = RefCell::default();
     /// Browser-owned credentials, never written to Keychain or session files.
     static AUTH_SESSION: RefCell<HashMap<AuthSpace, (String, String)>> = RefCell::default();
@@ -258,7 +259,11 @@ fn session_credential(space: &AuthSpace, failed: bool) -> Option<(String, String
 pub fn answer_auth(webview: &WKWebView, user: &str, password: &str) -> bool {
     let key = webview as *const WKWebView as usize;
     let pending = AUTH_PENDING.with(|pending| pending.borrow_mut().remove(&key));
-    let Some(pending) = pending else { return false };
+    let Some(pending) = pending else {
+        let Some(space) = AUTH_SUSPENDED.with(|suspended| suspended.borrow_mut().remove(&key)) else { return false };
+        AUTH_SESSION.with(|session| session.borrow_mut().insert(space, (user.to_owned(), password.to_owned())));
+        return true;
+    };
     AUTH_SESSION.with(|session| session.borrow_mut().insert(
         pending.space, (user.to_owned(), password.to_owned()),
     ));
@@ -269,8 +274,19 @@ pub fn answer_auth(webview: &WKWebView, user: &str, password: &str) -> bool {
     true
 }
 
+/// Stop the challenged load while retaining its protection space for a
+/// sign-in document shown in the same web view.
+pub fn suspend_auth(webview: &WKWebView) -> bool {
+    let key = webview as *const WKWebView as usize;
+    let Some(pending) = AUTH_PENDING.with(|pending| pending.borrow_mut().remove(&key)) else { return false };
+    AUTH_SUSPENDED.with(|suspended| suspended.borrow_mut().insert(key, pending.space));
+    pending.completion.call((2, std::ptr::null_mut()));
+    true
+}
+
 pub fn cancel_auth(webview: &WKWebView) {
     let key = webview as *const WKWebView as usize;
+    AUTH_SUSPENDED.with(|suspended| suspended.borrow_mut().remove(&key));
     if let Some(pending) = AUTH_PENDING.with(|pending| pending.borrow_mut().remove(&key)) {
         pending.completion.call((2, std::ptr::null_mut()));
     }

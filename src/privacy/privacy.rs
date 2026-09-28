@@ -13,7 +13,10 @@ use objc2_foundation::{NSError, NSString};
 use objc2_web_kit::{WKContentRuleList, WKContentRuleListStore, WKWebView};
 use serde_json::{Value, json};
 
-use crate::settings::{Protection, Settings};
+use crate::{
+    settings::{Protection, Settings},
+    site_controls::SiteControls,
+};
 
 /// Analytics, session recording and cross-site tracking. Blocked when a
 /// page loads them from another site, so the services' own sites still work.
@@ -162,45 +165,97 @@ const ADVERTISING: &[&str] = &[
 
 /// The rule list for these settings as WebKit's JSON, or `None` when there
 /// is nothing to enforce.
+#[cfg(test)]
 pub fn rules(settings: &Settings) -> Option<String> {
+    rules_for(settings, &SiteControls::default())
+}
+
+/// Builds one list for all pages. Top-URL conditions make individual site
+/// choices effective without changing the rules on unrelated tabs.
+pub fn rules_for(settings: &Settings, controls: &SiteControls) -> Option<String> {
     let mut rules: Vec<Value> = Vec::new();
-    let mut block = |domains: &[&str]| {
+    let mut block = |domains: &[&str], base: bool, enabled: &[String], disabled: &[String]| {
+        if !base && enabled.is_empty() {
+            return;
+        }
         for domain in domains {
             // WebKit's rule regexes have no alternation, so one rule per
             // domain; the prefix matches the domain and its subdomains.
             let escaped = regex_escape(domain);
-            rules.push(json!({
-                "trigger": {
-                    "url-filter": format!("^https?://([^/:]*\\.)?{escaped}[/:?]"),
-                    "load-type": ["third-party"],
-                },
-                "action": { "type": "block" },
-            }));
+            let filter = format!("^https?://([^/:]*\\.)?{escaped}[/:?]");
+            if base {
+                let mut trigger = json!({ "url-filter": filter, "load-type": ["third-party"] });
+                if !disabled.is_empty() {
+                    trigger["unless-top-url"] = json!(disabled);
+                }
+                rules.push(json!({ "trigger": trigger, "action": { "type": "block" } }));
+            }
+            if !enabled.is_empty() {
+                rules.push(json!({ "trigger": {
+                    "url-filter": filter, "load-type": ["third-party"], "if-top-url": enabled
+                }, "action": { "type": "block" } }));
+            }
         }
     };
-    match settings.protection {
-        Protection::Off => {}
-        Protection::Standard => block(TRACKERS),
-        Protection::Strict => {
-            block(TRACKERS);
-            block(ADVERTISING);
+    let mut tracker_on = Vec::new();
+    let mut tracker_off = Vec::new();
+    let mut ads_on = Vec::new();
+    let mut ads_off = Vec::new();
+    let mut cookies_on = Vec::new();
+    let mut cookies_off = Vec::new();
+    let base_trackers = settings.protection != Protection::Off;
+    let base_ads = settings.protection == Protection::Strict;
+    let base_cookies = settings.block_third_party_cookies || base_ads;
+    for (host, site) in &controls.0 {
+        let top = format!("^https?://{}[/:?]", regex_escape(host));
+        let protection = site.protection.unwrap_or(settings.protection);
+        let trackers = protection != Protection::Off;
+        let ads = protection == Protection::Strict;
+        let cookies = site
+            .third_party_cookies
+            .unwrap_or(settings.block_third_party_cookies || ads);
+        for (actual, base, on, off) in [
+            (trackers, base_trackers, &mut tracker_on, &mut tracker_off),
+            (ads, base_ads, &mut ads_on, &mut ads_off),
+            (cookies, base_cookies, &mut cookies_on, &mut cookies_off),
+        ] {
+            if actual != base {
+                if actual {
+                    on.push(top.clone());
+                } else {
+                    off.push(top.clone());
+                }
+            }
         }
     }
+    block(TRACKERS, base_trackers, &tracker_on, &tracker_off);
+    block(ADVERTISING, base_ads, &ads_on, &ads_off);
+    drop(block);
     // Facebook's pixel is served from its own domain, so it needs a path.
-    if settings.protection != Protection::Off {
-        rules.push(json!({
-            "trigger": {
-                "url-filter": "^https?://([^/:]*\\.)?facebook\\.com/tr",
-                "load-type": ["third-party"],
-            },
-            "action": { "type": "block" },
-        }));
+    if base_trackers {
+        let mut trigger = json!({ "url-filter": "^https?://([^/:]*\\.)?facebook\\.com/tr", "load-type": ["third-party"] });
+        if !tracker_off.is_empty() {
+            trigger["unless-top-url"] = json!(tracker_off);
+        }
+        rules.push(json!({ "trigger": trigger, "action": { "type": "block" } }));
     }
-    if settings.block_third_party_cookies || settings.protection == Protection::Strict {
-        rules.push(json!({
-            "trigger": { "url-filter": ".*", "load-type": ["third-party"] },
-            "action": { "type": "block-cookies" },
-        }));
+    if !tracker_on.is_empty() {
+        rules.push(json!({ "trigger": {
+            "url-filter": "^https?://([^/:]*\\.)?facebook\\.com/tr", "load-type": ["third-party"],
+            "if-top-url": tracker_on
+        }, "action": { "type": "block" } }));
+    }
+    if base_cookies {
+        let mut trigger = json!({ "url-filter": ".*", "load-type": ["third-party"] });
+        if !cookies_off.is_empty() {
+            trigger["unless-top-url"] = json!(cookies_off);
+        }
+        rules.push(json!({ "trigger": trigger, "action": { "type": "block-cookies" } }));
+    }
+    if !cookies_on.is_empty() {
+        rules.push(json!({ "trigger": {
+            "url-filter": ".*", "load-type": ["third-party"], "if-top-url": cookies_on
+        }, "action": { "type": "block-cookies" } }));
     }
     (!rules.is_empty()).then(|| Value::Array(rules).to_string())
 }
@@ -248,8 +303,13 @@ impl ContentRules {
     /// Compiles the list for `settings` if it differs from the current one,
     /// then calls `ready` on the main thread. `ready` should re-apply rules
     /// to every open tab.
-    pub fn update(&mut self, settings: &Settings, ready: impl Fn() + 'static) {
-        let source = rules(settings);
+    pub fn update(
+        &mut self,
+        settings: &Settings,
+        controls: &SiteControls,
+        ready: impl Fn() + 'static,
+    ) {
+        let source = rules_for(settings, controls);
         self.primed = true;
         if source == self.source {
             return;
@@ -353,29 +413,33 @@ impl ContentRules {
                 generation.clone(),
             );
             let target = self.ublock.clone();
-            let looked_up = RcBlock::new(move |list: *mut WKContentRuleList, _error: *mut NSError| {
-                // SAFETY: WebKit passes a valid list or null.
-                found.borrow_mut()[index] = unsafe { Retained::retain(list) };
-                remaining.set(remaining.get() - 1);
-                if remaining.get() > 0 {
-                    return;
-                }
-                outstanding.set(outstanding.get().saturating_sub(1));
-                // Anything newer asked for meanwhile wins.
-                if generation.get() == mine {
-                    let lists: Vec<_> = found.borrow_mut().drain(..).collect();
-                    // Only if they all are: part of the filters could let
-                    // through what the rest were written around.
-                    if lists.iter().all(Option::is_some) {
-                        *target.borrow_mut() = lists.into_iter().flatten().collect();
+            let looked_up =
+                RcBlock::new(move |list: *mut WKContentRuleList, _error: *mut NSError| {
+                    // SAFETY: WebKit passes a valid list or null.
+                    found.borrow_mut()[index] = unsafe { Retained::retain(list) };
+                    remaining.set(remaining.get() - 1);
+                    if remaining.get() > 0 {
+                        return;
                     }
-                }
-                ready();
-            });
+                    outstanding.set(outstanding.get().saturating_sub(1));
+                    // Anything newer asked for meanwhile wins.
+                    if generation.get() == mine {
+                        let lists: Vec<_> = found.borrow_mut().drain(..).collect();
+                        // Only if they all are: part of the filters could let
+                        // through what the rest were written around.
+                        if lists.iter().all(Option::is_some) {
+                            *target.borrow_mut() = lists.into_iter().flatten().collect();
+                        }
+                    }
+                    ready();
+                });
             let identifier = NSString::from_str(&format!("{UBLOCK_PREFIX}{fingerprint}"));
             // SAFETY: a valid identifier and a block of the documented type.
             unsafe {
-                store.lookUpContentRuleListForIdentifier_completionHandler(Some(&identifier), Some(&looked_up));
+                store.lookUpContentRuleListForIdentifier_completionHandler(
+                    Some(&identifier),
+                    Some(&looked_up),
+                );
             }
         }
     }
@@ -584,5 +648,20 @@ mod tests {
     fn domains_are_escaped_into_anchored_filters() {
         let list = rules(&Settings::default()).unwrap();
         assert!(list.contains(r#"^https?://([^/:]*\\.)?doubleclick\\.net[/:?]"#));
+    }
+
+    #[test]
+    fn site_overrides_scope_tracking_and_cookie_rules_to_top_url() {
+        let mut controls = SiteControls::default();
+        controls.change("teams.microsoft.com", |site| {
+            site.protection = Some(Protection::Off);
+            site.third_party_cookies = Some(false);
+        });
+        let list: Vec<Value> = serde_json::from_str(&rules_for(&Settings::default(), &controls).unwrap()).unwrap();
+        let top = "^https?://teams\\.microsoft\\.com[/:?]";
+        assert!(list.iter().any(|rule| rule["action"]["type"] == "block"
+            && rule["trigger"]["unless-top-url"] == json!([top])));
+        assert!(list.iter().any(|rule| rule["action"]["type"] == "block-cookies"
+            && rule["trigger"]["unless-top-url"] == json!([top])));
     }
 }

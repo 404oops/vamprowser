@@ -9,6 +9,7 @@ A macOS browser built in Rust: Apple's WebKit (through Wry's `WKWebView`) for pa
   - ⌘-click or middle-click a link to open it in a new tab behind (⌘⇧-click, in front).
   - Windows come back only when you ask: ⌘⇧T, once a window's own closed tabs run out, reopens the windows you closed, and after a relaunch the ones open when you quit, where you left them (Settings → General can restore them at launch instead). Closing the last window leaves the app running, and the Dock icon opens a new one.
 - **Minimal mode** (⌘⇧M) shows only the page, under a hairline. Point at the top of the window and the browser slides in over the page without it reflowing.
+- **Links from other apps** open in a compact page window. Drag its title onto a browser window's tabs to move the live page there, or click **Expand** to turn it into a full browser window. Opening another tab expands it too.
 - **Address field**: suggestions as you type.
   - It completes the site you most likely mean.
   - The list shows matching history and bookmarks, most visited first, then your search engine's suggestions.
@@ -38,7 +39,7 @@ A macOS browser built in Rust: Apple's WebKit (through Wry's `WKWebView`) for pa
   - It opens links and HTML/PDF/image/text files handed over by other apps.
   - Handoff offers the page in front to your other devices; this needs a Developer ID-signed build.
   - It has a Dock menu.
-- **Media downloads**: the toolbar's media button asks `yt-dlp` what the current page offers, then lists video and audio formats, subtitles, a description, and a folder bundle with all available parts. Individual choices save files directly in Downloads; only the bundle creates a folder. Install `yt-dlp` separately (`brew install yt-dlp`); some formats also need `ffmpeg` (`brew install ffmpeg`).
+- **Media downloads**: the toolbar's media button asks `yt-dlp` what the current page offers, then lists video and audio formats, subtitles, a description, and a folder bundle with video, audio, supplied subtitles, and a description. Automatic captions can be downloaded individually; requesting every translated caption at once can trigger a site's rate limit. Individual choices save files directly in Downloads; only the bundle creates a folder. Install `yt-dlp` separately (`brew install yt-dlp`); some formats also need `ffmpeg` (`brew install ffmpeg`).
 
 Your data lives in `~/Library/Application Support/Vamprowser/`: settings, session, bookmarks, history, downloads, extensions, and `Site Data` — cookies and logins, site storage and extensions' storage. WebKit would keep site data under the app's identifier, which a development build and the installed app don't share; here both use the same, and it stays put across reinstalls. Site icons and filter lists are cached in `~/Library/Caches/Vamprowser/`.
 

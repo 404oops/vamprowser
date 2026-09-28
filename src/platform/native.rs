@@ -4,12 +4,56 @@ use std::cell::Cell;
 
 use block2::RcBlock;
 use objc2::{AnyThread, MainThreadMarker, rc::Retained};
-use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep, NSImage};
+use objc2_app_kit::{
+    NSAlert, NSAlertFirstButtonReturn, NSBitmapImageFileType, NSBitmapImageRep, NSImage,
+};
 use objc2_foundation::{
     NSCalendar, NSCalendarUnit, NSDate, NSDateFormatter, NSDateFormatterStyle, NSDictionary,
     NSError, NSString,
 };
 use objc2_web_kit::{WKSnapshotConfiguration, WKWebView};
+
+/// WebKit's default media prompt forgets its answer when a view is rebuilt.
+/// Ask here so an explicit lasting choice can be stored for this host.
+pub fn ask_site_permission(
+    host: &str,
+    slot: usize,
+    private: bool,
+) -> (
+    wry::PermissionResponse,
+    Option<crate::settings::SitePermission>,
+) {
+    use crate::settings::SitePermission;
+    use wry::PermissionResponse;
+    let Some(mtm) = MainThreadMarker::new() else {
+        return (PermissionResponse::Default, None);
+    };
+    let name = ["camera", "microphone", "screen"][slot];
+    let alert = NSAlert::new(mtm);
+    alert.setMessageText(&NSString::from_str(&format!(
+        "Allow {host} to use your {name}?"
+    )));
+    let detail = if private {
+        "This private tab forgets its choices when closed."
+    } else {
+        "Change a saved choice from the site's icon in the address bar."
+    };
+    alert.setInformativeText(&NSString::from_str(detail));
+    for label in [
+        if private { "Allow for Tab" } else { "Allow Always" },
+        "Allow Once",
+        if private { "Block for Tab" } else { "Block Always" },
+        "Block Once",
+    ] {
+        alert.addButtonWithTitle(&NSString::from_str(label));
+    }
+    match alert.runModal() - NSAlertFirstButtonReturn {
+        0 => (PermissionResponse::Allow, Some(SitePermission::Allow)),
+        1 => (PermissionResponse::Allow, None),
+        2 => (PermissionResponse::Deny, Some(SitePermission::Block)),
+        _ => (PermissionResponse::Deny, None),
+    }
+}
 
 /// One row of a context menu.
 #[derive(Clone)]
@@ -21,7 +65,10 @@ pub enum MenuEntry {
     },
     Separator,
     /// A row that opens another menu.
-    Submenu { label: String, entries: Vec<MenuEntry> },
+    Submenu {
+        label: String,
+        entries: Vec<MenuEntry>,
+    },
 }
 
 impl MenuEntry {
@@ -59,14 +106,18 @@ pub fn choose_file(extensions: &[&str]) -> Option<std::path::PathBuf> {
     panel.setAllowsMultipleSelection(false);
     #[allow(deprecated)]
     {
-        let types: Vec<Retained<NSString>> = extensions.iter().map(|e| NSString::from_str(e)).collect();
+        let types: Vec<Retained<NSString>> =
+            extensions.iter().map(|e| NSString::from_str(e)).collect();
         let types = objc2_foundation::NSArray::from_retained_slice(&types);
         panel.setAllowedFileTypes(Some(&types));
     }
     if panel.runModal() != objc2_app_kit::NSModalResponseOK {
         return None;
     }
-    panel.URL()?.path().map(|p| std::path::PathBuf::from(p.to_string()))
+    panel
+        .URL()?
+        .path()
+        .map(|p| std::path::PathBuf::from(p.to_string()))
 }
 
 /// Asks where to save a file, suggesting `name`. Blocks until chosen.
@@ -77,7 +128,10 @@ pub fn choose_save_path(name: &str) -> Option<std::path::PathBuf> {
     if panel.runModal() != objc2_app_kit::NSModalResponseOK {
         return None;
     }
-    panel.URL()?.path().map(|p| std::path::PathBuf::from(p.to_string()))
+    panel
+        .URL()?
+        .path()
+        .map(|p| std::path::PathBuf::from(p.to_string()))
 }
 
 /// Asks WebKit for a still of the page as JPEG, delivered on the main

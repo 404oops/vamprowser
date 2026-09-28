@@ -3,11 +3,12 @@
 //! button — as one [`Command`], carried out in one place.
 
 use gpui::{ClipboardItem, Context, Pixels, Point, Window};
+use wry::WebViewExtMacOS;
 
 use crate::{
     Browser, Page, PingTarget, TabTarget, media,
     native::MenuEntry,
-    settings::{StartSection, ToolbarItem},
+    settings::{Protection, SitePermission, StartSection, ToolbarItem},
 };
 
 /// A settings section, for opening settings where something lives.
@@ -175,6 +176,10 @@ pub enum Command {
     ForgetPage(String),
     ClearHistory,
     ClearBrowsingData,
+    SetSitePermission(String, usize, Option<SitePermission>),
+    SetSiteProtection(String, Option<Protection>),
+    SetSiteCookies(String, Option<bool>),
+    ClearSiteData(String, crate::cache::SiteDataKind),
     /// The whole profile, logins and all, to an archive.
     ExportBrowserData,
     /// An archive in place of the profile, relaunching.
@@ -453,6 +458,20 @@ impl Browser {
         }
         match command {
             Command::NewTab => self.new_tab(false, window, cx),
+            Command::SetSitePermission(host, slot, choice) => {
+                self.change_site_control(&host, |site| site.set_permission(slot, choice), false, cx);
+            }
+            Command::SetSiteProtection(host, choice) => {
+                self.change_site_control(&host, |site| site.protection = choice, true, cx);
+            }
+            Command::SetSiteCookies(host, choice) => {
+                self.change_site_control(&host, |site| site.third_party_cookies = choice, true, cx);
+            }
+            Command::ClearSiteData(host, kind) => {
+                if let Some(view) = &self.current().view {
+                    crate::cache::clear_site_data(&view.webview(), host, kind);
+                }
+            }
             Command::ToggleStartSection(section) => {
                 self.settings.start_page_sections.toggle(section);
                 self.save_settings(cx);
@@ -741,6 +760,7 @@ impl Browser {
                     }
                 };
                 let id = self.downloads().started(url.clone(), destination.clone(), private);
+                self.controls.scroll("download-shelf-items").set_offset(gpui::point(gpui::px(0.0), gpui::px(0.0)));
                 self.refresh_other_windows(cx);
                 cx.notify();
                 let sender = self.sender.clone();
@@ -985,7 +1005,12 @@ impl Browser {
         let make = |label: String, choice: media::Choice| {
             (
                 MenuEntry::item(label),
-                Some(Command::DownloadMedia(url.to_owned(), info.clone(), choice, private)),
+                Some(Command::DownloadMedia(
+                    url.to_owned(),
+                    info.clone(),
+                    choice,
+                    private,
+                )),
             )
         };
         let mut items = vec![make(
