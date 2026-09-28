@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.4.6 — 2026-09-28
+
+- The signed macOS app now allows WebKit to load sites outside App Transport Security's app defaults. Explicitly trusted self-signed certificates work in the installed browser; sites without a saved trust choice still show a certificate warning. The exception applies to web content, not the app's other network requests.
+
 ## v0.4.5 — 2026-09-28
 
 - Each window now shows only its own new downloads on the download shelf. Clearing a shelf leaves other windows' shelves alone; the full Downloads page still shows the shared download history.
