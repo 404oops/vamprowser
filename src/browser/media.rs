@@ -239,23 +239,19 @@ fn reservations() -> &'static Mutex<HashSet<PathBuf>> {
     RESERVED.get_or_init(Mutex::default)
 }
 
-fn download_inner(url: &str, destination: &Path, choice: &Choice) -> Result<PathBuf, String> {
-    let exe = executable().ok_or("yt-dlp is not installed")?;
-    let template = if matches!(choice, Choice::Bundle) {
-        destination.join("%(title).200B [%(id)s] · %(format_id)s.%(ext)s")
-    } else {
-        PathBuf::from(format!("{}.%(ext)s", destination.display()))
-    };
-    let mut command = Command::new(exe);
-    command
-        .args([
-            "--no-playlist",
-            "--no-warnings",
-            "--no-progress",
-            "--no-overwrites",
-            "-o",
-        ])
-        .arg(template);
+fn combine_video_audio(command: &mut Command) {
+    command.args([
+        "--audio-multistreams",
+        "--merge-output-format",
+        "mp4",
+        "--postprocessor-args",
+        "Merger+ffmpeg_i2:-stream_loop -1",
+        "--postprocessor-args",
+        "Merger+ffmpeg_o:-map -0:a? -c:a aac -b:a 192k -shortest",
+    ]);
+}
+
+fn configure_choice(command: &mut Command, choice: &Choice) {
     match choice {
         Choice::Bundle => {
             command.args([
@@ -268,13 +264,15 @@ fn download_inner(url: &str, destination: &Path, choice: &Choice) -> Result<Path
             ]);
         }
         Choice::Best => {
-            command.args(["-f", "bestvideo+bestaudio/best"]);
+            command.args(["-f", "bestvideo[acodec=none]+bestaudio/bestvideo*+bestaudio/best"]);
+            combine_video_audio(command);
         }
         Choice::Format(id) => {
             command.args(["-f", id]);
         }
         Choice::VideoWithAudio(id) => {
             command.args(["-f", &format!("{id}+bestaudio/{id}")]);
+            combine_video_audio(command);
         }
         Choice::Subtitle(lang, automatic) => {
             command.args([
@@ -292,6 +290,26 @@ fn download_inner(url: &str, destination: &Path, choice: &Choice) -> Result<Path
             command.args(["--skip-download", "--write-description"]);
         }
     }
+}
+
+fn download_inner(url: &str, destination: &Path, choice: &Choice) -> Result<PathBuf, String> {
+    let exe = executable().ok_or("yt-dlp is not installed")?;
+    let template = if matches!(choice, Choice::Bundle) {
+        destination.join("%(title).200B [%(id)s] · %(format_id)s.%(ext)s")
+    } else {
+        PathBuf::from(format!("{}.%(ext)s", destination.display()))
+    };
+    let mut command = Command::new(exe);
+    command
+        .args([
+            "--no-playlist",
+            "--no-warnings",
+            "--no-progress",
+            "--no-overwrites",
+            "-o",
+        ])
+        .arg(template);
+    configure_choice(&mut command, choice);
     let output = command
         .arg("--")
         .arg(url)
@@ -365,6 +383,23 @@ mod tests {
         assert_eq!(videos, ["v1080_60", "v1080", "v720"]);
         assert_eq!(audios, ["a256", "a128"]);
         assert!(video_formats(&info)[0].needs_audio());
+    }
+
+    #[test]
+    fn combined_video_uses_a_separate_audio_stream() {
+        let mut best = Command::new("yt-dlp");
+        configure_choice(&mut best, &Choice::Best);
+        let args: Vec<_> = best.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
+        assert!(args.contains(&"bestvideo[acodec=none]+bestaudio/bestvideo*+bestaudio/best".into()));
+        assert!(args.contains(&"--audio-multistreams".into()));
+        assert!(args.contains(&"Merger+ffmpeg_o:-map -0:a? -c:a aac -b:a 192k -shortest".into()));
+
+        let mut selected = Command::new("yt-dlp");
+        configure_choice(&mut selected, &Choice::VideoWithAudio("v1".into()));
+        let args: Vec<_> = selected.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
+        assert!(args.contains(&"v1+bestaudio/v1".into()));
+        assert!(args.contains(&"--audio-multistreams".into()));
+
     }
 
     #[test]

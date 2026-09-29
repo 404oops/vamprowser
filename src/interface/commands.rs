@@ -1079,16 +1079,17 @@ impl Browser {
         if info.description.is_some() {
             items.push(make("Description only".into(), media::Choice::Description));
         }
+        let separate_audio = !media::audio_formats(&info).is_empty();
         let videos: Vec<_> = media::video_formats(&info)
             .into_iter()
             .map(|format| {
                 make(
-                    if format.needs_audio() {
-                        format!("{} + audio", format.label())
+                    if separate_audio {
+                        format!("{} + best audio", format.label())
                     } else {
                         format.label()
                     },
-                    if format.needs_audio() {
+                    if separate_audio || format.needs_audio() {
                         media::Choice::VideoWithAudio(format.format_id.clone())
                     } else {
                         media::Choice::Format(format.format_id.clone())

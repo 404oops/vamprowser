@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.4.9 — 2026-09-29
+
+- Media downloads pair video choices with the best separate audio track when one is available. Combined downloads use the separate audio stream and finish at the video's length.
+- Context menus leave keyboard focus in the browser window, keep rows clear of the macOS titlebar click area, and size submenu headers for their actual font weight and controls.
+- Compact windows show Expand as a simpler underlined control.
+
 ## v0.4.8 — 2026-09-29
 
 - Choosing “Remove from List” in a download’s right-click menu now dispatches directly to the browser window.

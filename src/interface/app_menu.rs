@@ -11,9 +11,9 @@ use std::{cell::Cell, cell::RefCell, ptr::NonNull, rc::Rc, time::Duration};
 use async_channel::{Receiver, Sender};
 use block2::RcBlock;
 use gpui::{
-    Animation, AnimationExt, App, Bounds, Context, DisplayId, FontWeight, Point,
-    Render, Task, Window, WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, div,
-    prelude::*, px, size,
+    Animation, AnimationExt, App, Bounds, Context, DisplayId, FontWeight, Point, Render, Task,
+    Window, WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, div, prelude::*,
+    px, size,
 };
 use objc2::{
     rc::Retained,
@@ -48,6 +48,12 @@ const TRAILING_SLOT: f32 = 14.0;
 const GAP: f32 = 8.0;
 /// Taller menus scroll.
 const MAX_HEIGHT: f32 = 520.0;
+/// Clear space the popup keeps above its panel. AppKit treats the top of
+/// any titled window, even one with no visible title bar, as its title
+/// bar: a click there in a window that isn't key goes to moving the
+/// window instead of to the view. A menu never becomes key, so its rows
+/// stay below that band.
+const TITLE_BAND: f32 = 28.0;
 
 /// How long the panel opens, its rows sweep, and its size changes.
 const SWEEP: Duration = Duration::from_millis(190);
@@ -207,15 +213,15 @@ fn columns(entries: &[MenuEntry]) -> (bool, bool) {
 }
 
 /// The width that fits `level`'s longest row, given how wide `measure`
-/// finds a label.
-fn width_of_level(level: &Level, measure: impl Fn(&str) -> f32) -> f32 {
+/// finds a label at a weight.
+fn width_of_level(level: &Level, measure: impl Fn(&str, FontWeight) -> f32) -> f32 {
     let (icons, trailing) = columns(&level.entries);
     let label = level
         .entries
         .iter()
         .filter_map(|entry| match entry {
             MenuEntry::Item { label, .. } | MenuEntry::Submenu { label, .. } => {
-                Some(measure(label))
+                Some(measure(label, FontWeight::NORMAL))
             }
             MenuEntry::Separator => None,
         })
@@ -227,19 +233,27 @@ fn width_of_level(level: &Level, measure: impl Fn(&str) -> f32) -> f32 {
     if trailing {
         row += TRAILING_SLOT + GAP;
     }
-    let back = level
-        .title
-        .as_deref()
-        .map_or(0.0, |title| ICON_SLOT + GAP + measure(title));
+    // The way back keeps the level's columns, with its chevron in the
+    // icon's and its title set medium.
+    let back = level.title.as_deref().map_or(0.0, |title| {
+        let mut back = ICON_SLOT + GAP + measure(title, FontWeight::MEDIUM);
+        if trailing {
+            back += TRAILING_SLOT + GAP;
+        }
+        back
+    });
     // A little over, so the longest label isn't flush against the edge.
     let slack = 12.0;
     (row.max(back) + 2.0 * (PADDING + BORDER + ROW_INSET) + slack).clamp(MIN_WIDTH, MAX_WIDTH)
 }
 
-/// How wide `text` sets in the menu's font, from its glyphs' advances.
-fn measure(cx: &App, text: &str) -> f32 {
+/// How wide `text` sets in the menu's font at `weight`, from its glyphs'
+/// advances.
+fn measure(cx: &App, text: &str, weight: FontWeight) -> f32 {
     let system = cx.text_system();
-    let font = system.resolve_font(&gpui::font(ui_font()));
+    let mut font = gpui::font(ui_font());
+    font.weight = weight;
+    let font = system.resolve_font(&font);
     let size = px(TEXT_SIZE);
     text.chars()
         .map(|ch| {
@@ -252,7 +266,7 @@ fn measure(cx: &App, text: &str) -> f32 {
 
 /// A transparent popup large enough for any level, so its visible panel can
 /// resize without AppKit stretching or clipping a render in progress.
-fn maximum_size(level: &Level, measure: impl Fn(&str) -> f32 + Copy) -> (f32, f32) {
+fn maximum_size(level: &Level, measure: impl Fn(&str, FontWeight) -> f32 + Copy) -> (f32, f32) {
     let mut width = width_of_level(level, measure);
     let mut height = height_of(level);
     for entry in &level.entries {
@@ -385,6 +399,7 @@ impl Menu {
         let _ = self.answer.try_send(choice);
         self.stop_watching();
         let ns_window = self.ns_window;
+        allow_key(ns_window);
         OPEN.with(|slot| {
             let mut slot = slot.borrow_mut();
             if slot
@@ -437,7 +452,7 @@ impl Menu {
 
     fn change_level(&mut self, sweep: Sweep, cx: &mut Context<Self>) {
         let level = self.levels.last().expect("menu has a level");
-        self.width = width_of_level(level, |text| measure(cx, text));
+        self.width = width_of_level(level, |text, weight| measure(cx, text, weight));
         self.height = height_of(level);
         self.row_indices = row_indices(level);
         self.sweep = sweep;
@@ -520,6 +535,7 @@ impl Menu {
 impl Drop for Menu {
     fn drop(&mut self) {
         self.stop_watching();
+        allow_key(self.ns_window);
     }
 }
 
@@ -670,6 +686,7 @@ impl Render for Menu {
         };
         let root = vampir::root(div().id("app-menu"), self, cx)
             .size_full()
+            .pt(px(TITLE_BAND))
             .relative()
             .flex()
             .flex_col()
@@ -765,12 +782,17 @@ fn open_level(
         return;
     };
     let height = height_of(level);
-    let width = width_of_level(level, |text| measure(cx, text));
-    let (popup_width, popup_height) = maximum_size(level, |text| measure(cx, text));
+    let width = width_of_level(level, |text, weight| measure(cx, text, weight));
+    let (popup_width, popup_height) = maximum_size(level, |text, weight| measure(cx, text, weight));
+    let popup_height = popup_height + TITLE_BAND;
     let initial_row_indices = row_indices(level);
-    if sweep == Sweep::Up {
-        origin.y -= px(popup_height);
-    }
+    // The panel's edge stays at the pointer: below the band opening down,
+    // at the popup's bottom opening up.
+    origin.y -= px(if sweep == Sweep::Up {
+        popup_height
+    } else {
+        TITLE_BAND
+    });
     if let Some((_, screen)) = display {
         origin.x = origin
             .x
@@ -862,9 +884,71 @@ fn open_level(
             // The popup reserves transparent space for wider/taller
             // submenus. A native shadow outlines that invisible space.
             ns_window.setHasShadow(false);
+            never_key(ns_window);
             ns_window.orderFront(None);
         });
     }
+}
+
+/// Keeps `window` from becoming the key window while it's a menu.
+///
+/// GPUI's panels answer `canBecomeKeyWindow` with YES, so any click that
+/// leaves the menu open — into a submenu, or back out of one — would take
+/// the keyboard from the browser window. `becomesKeyOnlyIfNeeded` isn't
+/// enough: AppKit still makes the panel key on a later click. So the
+/// panel class's answer is replaced with one that says NO for the windows
+/// in [`KEYLESS`], and what it said before for any other.
+fn never_key(window: &objc2_app_kit::NSWindow) {
+    use objc2::runtime::{AnyObject, Bool, Sel};
+
+    type CanBecomeKey = unsafe extern "C-unwind" fn(&AnyObject, Sel) -> Bool;
+
+    unsafe extern "C-unwind" fn can_become_key(this: &AnyObject, sel: Sel) -> Bool {
+        let this_ptr = this as *const AnyObject as usize;
+        if KEYLESS.with(|set| set.borrow().contains(&this_ptr)) {
+            return Bool::NO;
+        }
+        let Some(original) = ORIGINAL_CAN_BECOME_KEY.with(Cell::get) else {
+            return Bool::YES;
+        };
+        // SAFETY: the implementation this one replaced, of the same shape.
+        let original: CanBecomeKey = unsafe { std::mem::transmute(original) };
+        unsafe { original(this, sel) }
+    }
+
+    KEYLESS.with(|set| {
+        set.borrow_mut()
+            .insert(window as *const objc2_app_kit::NSWindow as usize)
+    });
+    if ORIGINAL_CAN_BECOME_KEY.with(Cell::get).is_some() {
+        return;
+    }
+    let Some(method) = window
+        .class()
+        .instance_method(objc2::sel!(canBecomeKeyWindow))
+    else {
+        return;
+    };
+    let replacement: CanBecomeKey = can_become_key;
+    // SAFETY: `canBecomeKeyWindow` takes nothing and returns a BOOL, as
+    // the replacement does; the original is kept to answer for other
+    // windows of the class.
+    let original = unsafe { method.set_implementation(std::mem::transmute(replacement)) };
+    ORIGINAL_CAN_BECOME_KEY.with(|slot| slot.set(Some(original)));
+}
+
+/// Lets `ns_window` become key again, once it's no longer a menu.
+fn allow_key(ns_window: usize) {
+    KEYLESS.with(|set| set.borrow_mut().remove(&ns_window));
+}
+
+thread_local! {
+    /// The menu windows open: those answer `canBecomeKeyWindow` with NO.
+    static KEYLESS: RefCell<std::collections::HashSet<usize>> =
+        RefCell::new(std::collections::HashSet::new());
+    /// What GPUI's panel class answered `canBecomeKeyWindow` with, before
+    /// [`never_key`] replaced it.
+    static ORIGINAL_CAN_BECOME_KEY: Cell<Option<objc2::runtime::Imp>> = const { Cell::new(None) };
 }
 
 #[cfg(test)]
@@ -907,7 +991,7 @@ mod tests {
 
     #[test]
     fn menus_are_as_wide_as_their_longest_row() {
-        let by_char = |text: &str| text.chars().count() as f32 * 7.0;
+        let by_char = |text: &str, _: FontWeight| text.chars().count() as f32 * 7.0;
         let short = Level {
             entries: vec![MenuEntry::item("Open")],
             base: 0,
@@ -954,8 +1038,8 @@ mod tests {
             base: 0,
             title: None,
         };
-        let (width, height) = maximum_size(&level, |text| text.len() as f32 * 7.0);
-        assert!(width > width_of_level(&level, |text| text.len() as f32 * 7.0));
+        let (width, height) = maximum_size(&level, |text, _| text.len() as f32 * 7.0);
+        assert!(width > width_of_level(&level, |text, _| text.len() as f32 * 7.0));
         assert!(height > height_of(&level));
     }
 }
