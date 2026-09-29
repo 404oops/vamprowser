@@ -2187,7 +2187,6 @@ impl Browser {
                 MenuEntry::item("Copy Download Link").with_icon(Icon::Link),
                 Some(Command::Copy(item.url.clone())),
             ),
-            (MenuEntry::Separator, None),
             (
                 MenuEntry::item("Remove from List").with_icon(Icon::Close),
                 Some(Command::RemoveDownload(item.id)),
@@ -2275,7 +2274,9 @@ impl Browser {
         for item in downloads.shelf(self.serial).take(8) {
             let id = item.id;
             let status = match item.state {
-                DownloadState::InProgress => "Downloading…".to_owned(),
+                DownloadState::InProgress => item.file_size().flatten()
+                    .map(|size| file_size(size))
+                    .unwrap_or_else(|| "Starting…".to_owned()),
                 DownloadState::Done => match item.file_size() {
                     Some(Some(size)) => file_size(size),
                     Some(None) => "Moved or deleted".to_owned(),
@@ -2311,7 +2312,7 @@ impl Browser {
                         this.context_menu_above(event.position, items, window, cx);
                     }),
                 )
-                .child(match interop::file_icon(&item.path) {
+                .child(match interop::download_icon(&item.path) {
                     Some(image) => img(image).size(px(22.0)).into_any_element(),
                     None => icon(Icon::File, 18.0, palette.text_secondary).into_any_element(),
                 })
@@ -2336,7 +2337,9 @@ impl Browser {
                                 .h(px(14.0))
                                 .flex()
                                 .items_center()
-                                .child(Self::busy_bar(("shelf-busy", id), 150.0, palette))
+                                .gap(px(7.0))
+                                .child(Self::busy_bar(("shelf-busy", id), 105.0, palette))
+                                .child(div().text_size(px(11.0)).text_color(palette.text_secondary).child(status))
                                 .into_any_element()
                         } else {
                             div()
@@ -2501,18 +2504,22 @@ impl Browser {
             );
         }
         let mut group = String::new();
-        for item in items {
+        let page_offset = self.download_page_offset.min(items.len().saturating_sub(1) / 50 * 50);
+        for item in items.iter().skip(page_offset).take(50) {
             let label = day_label(item.started);
             if label != group {
                 column = column.child(heading(&label, palette).pt(px(10.0)));
                 group = label;
             }
             let id = item.id;
-            // The size, if the file is still there; while that's being
-            // looked up, it counts as there.
+            // For active downloads, read WebKit's temporary file.
             let looked = item.file_size();
             let size = looked.flatten();
-            let exists = looked.is_none_or(|size| size.is_some());
+            let exists = if item.state == DownloadState::InProgress {
+                size.is_some()
+            } else {
+                looked.is_none_or(|size| size.is_some())
+            };
             let (status, strike) = match item.state {
                 DownloadState::InProgress => (Some("Downloading…"), false),
                 DownloadState::Done if exists => (None, false),
@@ -2522,12 +2529,11 @@ impl Browser {
             // One line under the name: where it came from, how big it is,
             // and what went wrong, if anything did.
             let mut details = vec![site_name(&item.url)];
-            if let Some(size) = size.filter(|_| item.state == DownloadState::Done) {
+            if let Some(size) = size {
                 details.push(file_size(size));
             }
             details.extend(
                 status
-                    .filter(|_| item.state != DownloadState::InProgress)
                     .map(str::to_owned),
             );
             let details = details
@@ -2571,7 +2577,7 @@ impl Browser {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .child(match interop::file_icon(&item.path) {
+                            .child(match interop::download_icon(&item.path) {
                                 Some(image) => img(image).size(px(30.0)).into_any_element(),
                                 None => icon(Icon::File, 20.0, palette.soft_label).into_any_element(),
                             }),
@@ -2602,8 +2608,11 @@ impl Browser {
                             )
                             .child(if item.state == DownloadState::InProgress {
                                 div()
-                                    .pt(px(4.0))
-                                    .child(Self::busy_bar(("page-busy", id), 240.0, palette))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(10.0))
+                                    .child(Self::busy_bar(("page-busy", id), 180.0, palette))
+                                    .child(div().text_size(px(11.5)).text_color(palette.text_secondary).child(details))
                                     .into_any_element()
                             } else {
                                 div()
@@ -2620,7 +2629,7 @@ impl Browser {
                             .flex()
                             .items_center()
                             .gap(px(14.0))
-                            .when(exists, |el| {
+                            .when(exists && item.state != DownloadState::InProgress, |el| {
                                 el.child(link(
                                     ("dl-reveal", id),
                                     "Show in Finder",
@@ -2644,11 +2653,48 @@ impl Browser {
                     ),
             );
         }
+        if page_offset > 0 || items.len() > page_offset + 50 {
+            column = column.child(
+                div()
+                    .mt(px(8.0))
+                    .flex()
+                    .justify_between()
+                    .when(page_offset > 0, |row| row.child(
+                        div()
+                            .id("dl-show-newer")
+                            .py(px(12.0))
+                            .text_size(px(12.0))
+                            .text_color(palette.accent)
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.download_page_offset = page_offset.saturating_sub(50);
+                                this.controls.scroll("downloads-page").set_offset(gpui::point(px(0.0), px(0.0)));
+                                cx.notify();
+                            }))
+                            .child("Newer downloads"),
+                    ))
+                    .when(items.len() > page_offset + 50, |row| row.child(
+                        div()
+                            .id("dl-show-older")
+                            .py(px(12.0))
+                            .text_size(px(12.0))
+                            .text_color(palette.accent)
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.download_page_offset = page_offset + 50;
+                                this.controls.scroll("downloads-page").set_offset(gpui::point(px(0.0), px(0.0)));
+                                cx.notify();
+                            }))
+                            .child("Older downloads"),
+                    )),
+            );
+        }
         drop(downloads);
         div()
             .id("downloads-page")
             .size_full()
             .overflow_y_scroll()
+            .track_scroll(&self.controls.scroll("downloads-page"))
             .bg(palette.backdrop)
             .flex()
             .justify_center()

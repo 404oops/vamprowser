@@ -1,5 +1,5 @@
 #!/bin/zsh
-# Build, replace the copy in /Applications, and launch it.
+# Build, replace the copy in /Applications, and reopen the saved session.
 set -euo pipefail
 cd "${0:A:h:h:h}"
 
@@ -50,12 +50,12 @@ if ! mv "$staging/Vamprowser.app" "$installed"; then
 fi
 
 print "Installed $installed"
-if ! open "$installed"; then
+if ! open -a "$installed" --args --restore-session; then
   print -u2 "Could not launch the new app; restoring the previous copy."
   if [[ -e "$staging/previous.app" ]]; then
     rm -rf "$installed"
     mv "$staging/previous.app" "$installed"
-    open "$installed" || true
+    open -a "$installed" --args --restore-session || true
   fi
   exit 1
 fi

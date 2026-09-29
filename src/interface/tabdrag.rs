@@ -217,14 +217,16 @@ impl Browser {
             return;
         }
         let id = drag.id;
+        let start = drag.start;
         let Some(from) = self.index_of(id) else {
             self.tab_drag = None;
             return;
         };
-        // The compact window's title is a tab handle, even though it has no
-        // visible tab strip. Carry the entire window as soon as it is dragged.
+        // The compact window's titlebar carries its whole window. Keep
+        // the original grab point so crossing the drag threshold does not
+        // make the window jump under the pointer.
         if self.compact {
-            let grab = (f64::from(f32::from(at.x)), f64::from(f32::from(at.y)));
+            let grab = (f64::from(f32::from(start.x)), f64::from(f32::from(start.y)));
             if let Some(drag) = &mut self.tab_drag {
                 drag.carrier = Some(Carrier {
                     browser: cx.weak_entity(),
@@ -232,6 +234,7 @@ impl Browser {
                     grab,
                 });
             }
+            follow_pointer(self.ns_window, grab);
             return;
         }
         // Along the strip: the tab moves among the others as it goes.

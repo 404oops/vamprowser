@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.4.8 — 2026-09-29
+
+- Choosing “Remove from List” in a download’s right-click menu now dispatches directly to the browser window.
+- Web downloads now use a `.download` filename while in progress. The final filename appears only after WebKit confirms completion; failed partial files keep the temporary suffix.
+- Active downloads show the bytes saved so far on the shelf and Downloads page. The Downloads page shows history 50 items at a time, and file type icons are shared between rows so opening a long history stays responsive.
+- Find in page updates its match count as the page changes, without moving the current match.
+- Media formats are listed from highest to lowest quality. Video-only choices include the best available audio, and both format lists offer a best video and audio choice.
+- Compact windows open on the current desktop with a slimmer, draggable titlebar. The address field preserves drag selection and selects all after a click when first focused.
+- Tab close buttons replace favicons on hover, and selected sleeping tabs wake after the interface draws. Menu submenus resize within the popup as they open.
+- Installing an update reopens the saved session, including when automatic session restore is off.
+
 ## v0.4.7 — 2026-09-28
 
 - Right-click menus were redesigned. Each menu is as wide as its longest label (184–340 pt) instead of a fixed width, with rounded corners, a hairline border, a native shadow, larger 13 pt text, and more room around rows and separators. Menus only reserve space for icons, checkmarks, or submenu chevrons when they have some; checkmarks now sit on the right in the accent colour.

@@ -1,6 +1,6 @@
 //! Minimal mode (⌘⇧M): only the page, under a hairline bar. Pointing at
-//! the top of the window brings the browser back, sliding in over the page
-//! without it reflowing, and it slides away again when the pointer leaves.
+//! the top of the window brings the browser back, sliding in over the page,
+//! and it slides away again when the pointer leaves.
 
 use std::time::{Duration, Instant};
 
@@ -9,7 +9,10 @@ use objc2_app_kit::{NSWindow, NSWindowButton, NSWindowStyleMask};
 use objc2_foundation::NSPoint;
 use vampir::{Palette, color};
 
-use crate::{BOOKMARKS_HEIGHT, Browser, Chrome, TAB_STRIP_HEIGHT, TOOLBAR_HEIGHT, TRAFFIC_LIGHTS, tabdrag};
+use crate::{
+    BOOKMARKS_HEIGHT, Browser, Chrome, COMPACT_TRAFFIC_LIGHTS, TAB_STRIP_HEIGHT, TOOLBAR_HEIGHT,
+    TRAFFIC_LIGHTS, tabdrag,
+};
 
 /// The bar left at the top of the window.
 pub(crate) const MINIMAL_BAR: f32 = 8.0;
@@ -23,7 +26,7 @@ const WATCH: Duration = Duration::from_millis(50);
 /// Puts the traffic lights back where the window has them, in the toolbar:
 /// AppKit resets them to its own place while they're hidden, and GPUI only
 /// lays them out again when the window changes. The same layout GPUI does.
-fn place_traffic_lights(window: &NSWindow) {
+fn place_traffic_lights(window: &NSWindow, position: (f32, f32)) {
     if window.styleMask().contains(NSWindowStyleMask::FullScreen) {
         return;
     }
@@ -34,7 +37,7 @@ fn place_traffic_lights(window: &NSWindow) {
     ) else {
         return;
     };
-    let (x, y) = (f64::from(TRAFFIC_LIGHTS.0), f64::from(TRAFFIC_LIGHTS.1));
+    let (x, y) = (f64::from(position.0), f64::from(position.1));
     let frame = close.frame();
     // Already in place: most frames.
     if (frame.origin.x - x).abs() < 0.5 && (frame.origin.y - y).abs() < 0.5 {
@@ -178,16 +181,21 @@ impl Browser {
             }
         }
         if !hidden {
-            place_traffic_lights(window);
+            place_traffic_lights(
+                window,
+                if self.compact {
+                    COMPACT_TRAFFIC_LIGHTS
+                } else {
+                    TRAFFIC_LIGHTS
+                },
+            );
         }
     }
 
     /// The hairline along the top in minimal mode, in the page's hue, with
     /// a grip in the middle. It slides up out of the way as the browser
     /// comes in, on hover or leaving minimal mode, and back down as it goes.
-    pub(crate) fn minimal_bar(&self, palette: Palette) -> Option<AnyElement> {
-        let target = if self.minimal && !self.chrome_revealed { MINIMAL_BAR } else { 0.0 };
-        let height = self.controls.tween("minimal-bar", target, REVEAL);
+    pub(crate) fn minimal_bar(&self, palette: Palette, height: f32) -> Option<AnyElement> {
         if height < 0.25 {
             return None;
         }

@@ -736,7 +736,11 @@ impl Browser {
                 },
                 cx,
             ),
-            Command::ShowDownloads => self.open_page(Page::Downloads, window, cx),
+            Command::ShowDownloads => {
+                self.download_page_offset = 0;
+                self.controls.scroll("downloads-page").set_offset(gpui::point(gpui::px(0.0), gpui::px(0.0)));
+                self.open_page(Page::Downloads, window, cx);
+            }
             Command::InspectMedia => {
                 let tab = self.current();
                 if tab.page == Page::Web {
@@ -840,9 +844,7 @@ impl Browser {
             let Some(command) = flatten(items).into_iter().nth(chosen).flatten() else {
                 return;
             };
-            let _ = cx.update(|window, app| {
-                this.update(app, |browser, cx| browser.run(command, window, cx))
-            });
+            let _ = this.update_in(cx, |browser, window, cx| browser.run(command, window, cx));
         })
         .detach();
     }
@@ -1059,7 +1061,7 @@ impl Browser {
                 MenuEntry::item(label).with_icon(match choice {
                     media::Choice::Bundle => Icon::Folder,
                     media::Choice::Description => Icon::File,
-                    media::Choice::Format(_) => Icon::Download,
+                    media::Choice::Best | media::Choice::Format(_) | media::Choice::VideoWithAudio(_) => Icon::Download,
                     media::Choice::Subtitle(..) => Icon::Captions,
                 }),
                 Some(Command::DownloadMedia(
@@ -1077,21 +1079,25 @@ impl Browser {
         if info.description.is_some() {
             items.push(make("Description only".into(), media::Choice::Description));
         }
-        let videos: Vec<_> = info
-            .formats
-            .iter()
-            .filter(|format| format.is_video())
+        let videos: Vec<_> = media::video_formats(&info)
+            .into_iter()
             .map(|format| {
                 make(
-                    format.label(),
-                    media::Choice::Format(format.format_id.clone()),
+                    if format.needs_audio() {
+                        format!("{} + audio", format.label())
+                    } else {
+                        format.label()
+                    },
+                    if format.needs_audio() {
+                        media::Choice::VideoWithAudio(format.format_id.clone())
+                    } else {
+                        media::Choice::Format(format.format_id.clone())
+                    },
                 )
             })
             .collect();
-        let audios: Vec<_> = info
-            .formats
-            .iter()
-            .filter(|format| format.is_audio())
+        let audios: Vec<_> = media::audio_formats(&info)
+            .into_iter()
             .map(|format| {
                 make(
                     format.label(),
@@ -1105,7 +1111,9 @@ impl Browser {
                 None,
             ));
         } else {
-            items.push(submenu(Icon::Play, "Video formats", videos));
+            let mut choices = vec![make("Best video + audio".into(), media::Choice::Best)];
+            choices.extend(videos);
+            items.push(submenu(Icon::Play, "Video formats", choices));
         }
         if audios.is_empty() {
             items.push((
@@ -1113,7 +1121,9 @@ impl Browser {
                 None,
             ));
         } else {
-            items.push(submenu(Icon::Sound, "Audio formats", audios));
+            let mut choices = vec![make("Best video + audio".into(), media::Choice::Best)];
+            choices.extend(audios);
+            items.push(submenu(Icon::Sound, "Audio formats", choices));
         }
         let mut subtitles = Vec::new();
         for lang in info.subtitles.keys() {

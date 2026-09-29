@@ -27,6 +27,26 @@ pub(crate) const FIND_MOVE: Duration = Duration::from_millis(160);
 const COUNT_SCRIPT: &str = "(q => { const t = (document.body && document.body.innerText || '').toLocaleLowerCase(); \
     let n = 0, i = 0; while ((i = t.indexOf(q, i)) !== -1) { n++; i += q.length; } return n; })";
 
+/// A DOM change costs almost nothing until it settles. During continuous
+/// updates (including generated text), report at most once every 1.5 seconds.
+const WATCH_SCRIPT: &str = r#"(serial => {
+    window.__vamprowserFindWatch?.stop();
+    if (!document.body) return;
+    let timer;
+    const observer = new MutationObserver(() => {
+        if (timer) return;
+        timer = setTimeout(() => {
+            timer = undefined;
+            window.ipc.postMessage('find-dirty:' + serial);
+        }, 1500);
+    });
+    observer.observe(document.body, {subtree: true, childList: true, characterData: true});
+    window.__vamprowserFindWatch = {
+        stop() { observer.disconnect(); clearTimeout(timer); }
+    };
+})"#;
+const STOP_WATCH_SCRIPT: &str = "window.__vamprowserFindWatch?.stop(); window.__vamprowserFindWatch = undefined";
+
 /// What the bar knows of the last search: which tab and query it was for,
 /// numbered so a late answer for an earlier one is ignored.
 #[derive(Default)]
@@ -36,6 +56,8 @@ pub(crate) struct FindState {
     /// Whether the last step found anything, once WebKit says.
     pub found: Option<bool>,
     pub count: Option<usize>,
+    /// The tab with an active DOM observer, so switching tabs stops it.
+    pub watching: Option<u64>,
 }
 
 impl Browser {
@@ -66,6 +88,7 @@ impl Browser {
         self.find.open = false;
         self.find.found = None;
         self.find.count = None;
+        self.stop_find_watch();
         window.blur();
         if let Some(view) = self.current().view.clone()
             && self.current().page == Page::Web
@@ -88,7 +111,8 @@ impl Browser {
         self.find.serial += 1;
         let serial = self.find.serial;
         let tab = self.current().id;
-        if query.is_empty() {
+        self.stop_find_watch();
+        if query.is_empty() || self.current().page != Page::Web {
             self.find.found = None;
             self.find.count = None;
             cx.notify();
@@ -97,6 +121,23 @@ impl Browser {
         let Some(view) = self.current().view.clone() else {
             return;
         };
+        if self.find.open {
+            let _ = view.evaluate_script(&format!("{WATCH_SCRIPT}({serial})"));
+            self.find.watching = Some(tab);
+        }
+        self.find_webkit(&query, backwards, tab, serial, &view);
+        self.count_find_matches(&query, tab, serial, &view);
+    }
+
+    fn stop_find_watch(&mut self) {
+        if let Some(tab) = self.find.watching.take()
+            && let Some(view) = self.tabs.iter().find(|item| item.id == tab).and_then(|item| item.view.as_ref())
+        {
+            let _ = view.evaluate_script(STOP_WATCH_SCRIPT);
+        }
+    }
+
+    fn find_webkit(&self, query: &str, backwards: bool, tab: u64, serial: u64, view: &wry::WebView) {
         let webview = view.webview();
         let Some(mtm) = objc2::MainThreadMarker::new() else {
             return;
@@ -124,12 +165,26 @@ impl Browser {
                 &handler,
             );
         }
+    }
+
+    fn count_find_matches(&self, query: &str, tab: u64, serial: u64, view: &wry::WebView) {
         let lowered = serde_json::to_string(&query.to_lowercase()).unwrap_or_default();
         let sender = self.sender.clone();
         let _ = view.evaluate_script_with_callback(&format!("{COUNT_SCRIPT}({lowered})"), move |result| {
             let count = result.trim().parse::<usize>().ok();
             let _ = sender.try_send(BrowserEvent::Found(tab, serial, None, count));
         });
+    }
+
+    /// A page mutation has settled. Recount without moving the current match.
+    pub(crate) fn find_dirty(&mut self, tab: u64, serial: u64, cx: &mut Context<Self>) {
+        if !self.find.open || self.find.serial != serial || self.current().id != tab {
+            return;
+        }
+        let query = self.find_input.read(cx).content.to_string();
+        if let Some(view) = self.current().view.as_ref() {
+            self.count_find_matches(&query, tab, serial, view);
+        }
     }
 
     /// An answer from [`Browser::find_step`], if it's for the latest.
@@ -141,7 +196,14 @@ impl Browser {
             self.find.found = found;
         }
         if count.is_some() {
+            let newly_present = self.find.count == Some(0) && count.is_some_and(|n| n > 0);
             self.find.count = count;
+            if newly_present {
+                let query = self.find_input.read(cx).content.to_string();
+                if let Some(view) = self.current().view.as_ref() {
+                    self.find_webkit(&query, false, tab, serial, view);
+                }
+            }
         }
         cx.notify();
     }

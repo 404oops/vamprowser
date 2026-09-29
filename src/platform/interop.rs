@@ -3,21 +3,23 @@
 //! by other apps arrives through GPUI's `on_open_urls`; the Info.plist
 //! declares the schemes and document types.
 
-use std::{collections::HashMap, path::{Path, PathBuf}, sync::{Arc, LazyLock, Mutex}};
+use std::{collections::HashMap, path::Path, sync::{Arc, LazyLock, Mutex}};
 
 use objc2::MainThreadMarker;
 use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep, NSWorkspace};
 use objc2_foundation::{NSArray, NSBundle, NSDictionary, NSString, NSURL};
 
-/// The file icon Finder assigns to a downloaded path, cached across redraws.
-pub fn file_icon(path: &Path) -> Option<Arc<gpui::Image>> {
-    static ICONS: LazyLock<Mutex<HashMap<PathBuf, Option<Arc<gpui::Image>>>>> =
+/// A shared icon for the filename's type. Download rows may include hundreds
+/// of files, so resolving and decoding an icon for every path stalls drawing.
+#[allow(deprecated)]
+pub fn download_icon(path: &Path) -> Option<Arc<gpui::Image>> {
+    static ICONS: LazyLock<Mutex<HashMap<String, Option<Arc<gpui::Image>>>>> =
         LazyLock::new(|| Mutex::new(HashMap::new()));
-    if let Some(icon) = ICONS.lock().ok()?.get(path).cloned() {
+    let kind = path.extension().and_then(|ext| ext.to_str()).unwrap_or("").to_ascii_lowercase();
+    if let Some(icon) = ICONS.lock().ok()?.get(&kind).cloned() {
         return icon;
     }
-    let image = NSWorkspace::sharedWorkspace()
-        .iconForFile(&NSString::from_str(&path.to_string_lossy()));
+    let image = NSWorkspace::sharedWorkspace().iconForFileType(&NSString::from_str(&kind));
     let icon = image.TIFFRepresentation().and_then(|tiff| {
         let bitmap = NSBitmapImageRep::imageRepsWithData(&tiff)
             .iter()
@@ -32,7 +34,7 @@ pub fn file_icon(path: &Path) -> Option<Arc<gpui::Image>> {
         }?;
         Some(Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, png.to_vec())))
     });
-    ICONS.lock().ok()?.insert(path.to_path_buf(), icon.clone());
+    ICONS.lock().ok()?.insert(kind, icon.clone());
     icon
 }
 

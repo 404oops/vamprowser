@@ -11,7 +11,9 @@ use std::{
 #[derive(Clone, Debug, PartialEq)]
 pub enum Choice {
     Bundle,
+    Best,
     Format(String),
+    VideoWithAudio(String),
     Subtitle(String, bool),
     Description,
 }
@@ -24,6 +26,8 @@ pub struct Format {
     pub format_note: Option<String>,
     pub height: Option<u32>,
     pub abr: Option<f64>,
+    pub fps: Option<f64>,
+    pub tbr: Option<f64>,
     #[serde(default)]
     pub vcodec: String,
     #[serde(default)]
@@ -55,6 +59,31 @@ impl Format {
     pub fn is_audio(&self) -> bool {
         !self.is_video() && self.acodec != "none" && !self.acodec.is_empty()
     }
+
+    pub fn needs_audio(&self) -> bool {
+        self.acodec == "none" || self.acodec.is_empty()
+    }
+}
+
+pub fn video_formats(info: &Info) -> Vec<&Format> {
+    let mut formats: Vec<_> = info.formats.iter().filter(|format| format.is_video()).collect();
+    // yt-dlp supplies equally ranked formats from worst to best.
+    formats.reverse();
+    formats.sort_by(|a, b| {
+        b.height.cmp(&a.height)
+            .then_with(|| b.fps.unwrap_or(0.0).total_cmp(&a.fps.unwrap_or(0.0)))
+            .then_with(|| b.tbr.unwrap_or(0.0).total_cmp(&a.tbr.unwrap_or(0.0)))
+    });
+    formats
+}
+
+pub fn audio_formats(info: &Info) -> Vec<&Format> {
+    let mut formats: Vec<_> = info.formats.iter().filter(|format| format.is_audio()).collect();
+    formats.reverse();
+    formats.sort_by(|a, b| {
+        b.abr.or(b.tbr).unwrap_or(0.0).total_cmp(&a.abr.or(a.tbr).unwrap_or(0.0))
+    });
+    formats
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -147,7 +176,8 @@ pub fn destination(dir: &Path, info: &Info, choice: &Choice) -> Result<PathBuf, 
     let base = folder_name(info);
     let Choice::Bundle = choice else {
         let tag = match choice {
-            Choice::Format(id) => format!("format {id}"),
+            Choice::Best => "best video and audio".into(),
+            Choice::Format(id) | Choice::VideoWithAudio(id) => format!("format {id}"),
             Choice::Subtitle(lang, automatic) => {
                 format!("subtitle {lang}{}", if *automatic { " auto" } else { "" })
             }
@@ -237,8 +267,14 @@ fn download_inner(url: &str, destination: &Path, choice: &Choice) -> Result<Path
                 "all",
             ]);
         }
+        Choice::Best => {
+            command.args(["-f", "bestvideo+bestaudio/best"]);
+        }
         Choice::Format(id) => {
             command.args(["-f", id]);
+        }
+        Choice::VideoWithAudio(id) => {
+            command.args(["-f", &format!("{id}+bestaudio/{id}")]);
         }
         Choice::Subtitle(lang, automatic) => {
             command.args([
@@ -311,6 +347,24 @@ mod tests {
         assert_eq!(info.formats[0].label(), "1080p · mp4 · v1");
         assert_eq!(folder_name(&info), "A video [abc]");
         assert!(info.subtitles.contains_key("en"));
+    }
+
+    #[test]
+    fn formats_are_ranked_highest_first() {
+        let info: Info = serde_json::from_str(r#"{
+            "formats":[
+                {"format_id":"v720","height":720,"fps":30,"tbr":2500,"vcodec":"avc1","acodec":"none"},
+                {"format_id":"a128","abr":128,"vcodec":"none","acodec":"mp4a"},
+                {"format_id":"v1080","height":1080,"fps":30,"tbr":4000,"vcodec":"avc1","acodec":"none"},
+                {"format_id":"a256","abr":256,"vcodec":"none","acodec":"mp4a"},
+                {"format_id":"v1080_60","height":1080,"fps":60,"tbr":5000,"vcodec":"avc1","acodec":"none"}
+            ]
+        }"#).unwrap();
+        let videos: Vec<_> = video_formats(&info).iter().map(|format| format.format_id.as_str()).collect();
+        let audios: Vec<_> = audio_formats(&info).iter().map(|format| format.format_id.as_str()).collect();
+        assert_eq!(videos, ["v1080_60", "v1080", "v720"]);
+        assert_eq!(audios, ["a256", "a128"]);
+        assert!(video_formats(&info)[0].needs_audio());
     }
 
     #[test]

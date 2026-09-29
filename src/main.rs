@@ -117,7 +117,8 @@ use extensions::{ExtensionEvent, Extensions};
 use favicon::{Favicon, Favicons};
 use gpui::{
     Animation, AnimationExt, AnyElement, App, Bounds, Context, Div, ElementId, Entity, FontWeight,
-    KeyBinding, KeyDownEvent, Menu, MenuItem, MouseButton, MouseDownEvent, Rgba, ScrollHandle,
+    KeyBinding, KeyDownEvent, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Point, Rgba, ScrollHandle,
     Stateful, SystemMenuType, Task, TitlebarOptions, Window, WindowBounds, WindowOptions, actions,
     canvas, div, img, linear_color_stop, linear_gradient, point, prelude::*, px, size,
 };
@@ -174,7 +175,7 @@ enum BrowserEvent {
     /// A site's icon arrived from the network, as PNG, or it has none.
     Favicon(String, Option<Vec<u8>>),
     /// A download began, from tab (first).
-    DownloadStarted(String, PathBuf, bool),
+    DownloadStarted(String, PathBuf, PathBuf, bool),
     DownloadFinished(String, Option<PathBuf>, bool),
     DownloadDragStarted,
     DownloadDragSnapshot(u64, std::time::Instant, Option<Vec<u8>>),
@@ -228,6 +229,8 @@ enum BrowserEvent {
     Notice(String),
     /// What's in the find bar changed.
     FindEdited,
+    /// The page's text changed while find is open, after a short throttle.
+    FindDirty(u64, u64),
     /// A search in tab (first) numbered (second): whether it found a
     /// match, or how many there are.
     Found(u64, u64, Option<bool>, Option<usize>),
@@ -250,6 +253,7 @@ impl BrowserEvent {
             | BrowserEvent::LoadStarted(id)
             | BrowserEvent::AudioChanged(id, ..)
             | BrowserEvent::PageEditing(id, _)
+            | BrowserEvent::FindDirty(id, _)
             | BrowserEvent::Popup(id, _)
             | BrowserEvent::LinkInNewTab(id, ..)
             | BrowserEvent::Upgrade(id, _)
@@ -714,9 +718,11 @@ fn install_shortcut_monitor(
 }
 
 const TOOLBAR_HEIGHT: f32 = 52.0;
+const COMPACT_HEADER_HEIGHT: f32 = 34.0;
 /// Where the close, minimise and zoom buttons sit: the close button's left
 /// and top, in points, inside the toolbar.
 const TRAFFIC_LIGHTS: (f32, f32) = (18.0, 19.0);
+const COMPACT_TRAFFIC_LIGHTS: (f32, f32) = (18.0, 10.0);
 /// How long the caret stays shown, and then hidden, as it blinks.
 const CARET_BLINK: Duration = Duration::from_millis(530);
 
@@ -1040,34 +1046,48 @@ fn revealed(row: impl IntoElement, height: f32, gap: f32, t: f32) -> AnyElement 
         .into_any_element()
 }
 
-/// The × on a tab: shown on the active tab and on whichever tab is hovered.
-fn close_button(
-    id: impl Into<ElementId>,
+/// The × takes the favicon's place while the pointer is over a tab.
+fn tab_icon_with_close(
+    favicon: AnyElement,
     tab: u64,
-    shown: bool,
+    size: f32,
     palette: Palette,
     cx: &mut Context<Browser>,
-) -> Stateful<Div> {
-    // Away from the pointer it takes no room, so the title has it all.
+) -> Div {
     div()
-        .id(id)
-        .h(px(18.0))
-        .w(px(if shown { 18.0 } else { 0.0 }))
+        .relative()
+        .size(px(size))
         .flex_none()
-        .overflow_hidden()
         .flex()
         .items_center()
         .justify_center()
-        .rounded(px(5.0))
-        .opacity(if shown { 1.0 } else { 0.0 })
-        .group_hover("tab", |style| style.opacity(1.0).w(px(18.0)))
-        .hover(move |style| style.bg(palette.row_hover))
-        .cursor_pointer()
-        .child(icon(Icon::Close, 11.0, palette.text_secondary))
-        .on_click(cx.listener(move |this, _, window, cx| {
-            cx.stop_propagation();
-            this.close_tab_by_pointer(tab, window, cx);
-        }))
+        .child(
+            div()
+                .group_hover("tab", |style| style.opacity(0.0))
+                .child(favicon),
+        )
+        .child(
+            div()
+                .id(("tab-close", tab))
+                .absolute()
+                .top(px((size - 18.0) / 2.0))
+                .left(px((size - 18.0) / 2.0))
+                .size(px(18.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(5.0))
+                .opacity(0.0)
+                .group_hover("tab", |style| style.opacity(1.0))
+                .hover(move |style| style.bg(palette.row_hover))
+                .cursor_pointer()
+                .child(icon(Icon::Close, 11.0, palette.text_secondary))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.close_tab_by_pointer(tab, window, cx);
+                })),
+        )
 }
 
 /// A speaker on tabs that are playing sound or have been muted.
@@ -1442,6 +1462,8 @@ struct Common {
     checking_updates: Cell<Option<std::time::Instant>>,
     /// Set on Quit, so windows closing on the way out stay in the session.
     quitting: Cell<bool>,
+    /// The installer asks for a one-time session restore on this launch.
+    restore_session_on_launch: bool,
     /// Keep a web view alive while any of its downloads are running.
     download_keepers: DownloadKeepers,
     /// Where pages on old devices' servers found this run load, until the
@@ -1497,6 +1519,8 @@ impl Common {
             handoff: RefCell::default(),
             checking_updates: Cell::new(None),
             quitting: Cell::new(false),
+            restore_session_on_launch: std::env::args_os()
+                .any(|arg| arg == "--restore-session"),
             closed_windows: RefCell::new(closed_windows),
             download_keepers: Rc::default(),
             waiting_loads: RefCell::default(),
@@ -1693,6 +1717,9 @@ impl PingTarget {
 struct Browser {
     controls: ControlState,
     address: Entity<TextInput>,
+    /// First press on an unfocused address; a click selects all on release,
+    /// while a drag is left to the text input's selection handler.
+    address_press: Option<Point<gpui::Pixels>>,
     tab_scroll: ScrollHandle,
     /// The selected tab should be scrolled into view once it has been laid
     /// out.
@@ -1737,6 +1764,9 @@ struct Browser {
     ns_view: usize,
     /// Clips the native WebKit view beneath minimal mode's revealed controls.
     page_clip: Retained<objc2_app_kit::NSView>,
+    /// The child WebKit frame last applied by the page canvas. Most chrome
+    /// animation frames only move its clip and need no WebKit layout call.
+    page_view_bounds: Rc<Cell<Option<(usize, f64, f64, f64, f64)>>>,
     /// Numbers windows in the order they opened, for the session.
     serial: u64,
     /// A tab being pressed or dragged.
@@ -1788,6 +1818,10 @@ struct Browser {
     _persist_later: Option<Task<()>>,
     /// A redraw on its way, and when it's due; see `redraw_soon`.
     redraw_later: Option<(std::time::Instant, Task<()>)>,
+    /// A selected sleeping web view is scheduled after the UI's next frame.
+    wake_pending: bool,
+    /// Keep the downloads page quick to open even with a long history.
+    download_page_offset: usize,
     recently_closed: Vec<ClosedTab>,
     palette: Option<PaletteState>,
     palette_open: Rc<Cell<bool>>,
@@ -2068,6 +2102,15 @@ impl Browser {
         let serial = common.next_window.get();
         common.next_window.set(serial + 1);
         let (ns_window, ns_view) = ns_window_of(window);
+        if compact && ns_window != 0 {
+            // An external link opens on the current Space rather than taking
+            // the user to the Space holding an existing browser window.
+            let native = unsafe { &*(ns_window as *const objc2_app_kit::NSWindow) };
+            native.setCollectionBehavior(
+                native.collectionBehavior()
+                    | objc2_app_kit::NSWindowCollectionBehavior::MoveToActiveSpace,
+            );
+        }
         let page_clip = objc2_app_kit::NSView::new(
             objc2::MainThreadMarker::new().expect("browser on main thread"),
         );
@@ -2173,6 +2216,7 @@ impl Browser {
         let mut browser = Self {
             controls,
             address,
+            address_press: None,
             tab_scroll: ScrollHandle::new(),
             reveal_selected: true,
             strip_children: Vec::new(),
@@ -2197,6 +2241,7 @@ impl Browser {
             ns_window,
             ns_view,
             page_clip,
+            page_view_bounds: Rc::new(Cell::new(None)),
             serial,
             tab_drag: None,
             download_drag: None,
@@ -2224,6 +2269,8 @@ impl Browser {
             window_bounds: None,
             _persist_later: None,
             redraw_later: None,
+            wake_pending: false,
+            download_page_offset: 0,
             recently_closed: Vec::new(),
             palette: None,
             palette_open: palette_open.clone(),
@@ -2320,12 +2367,16 @@ impl Browser {
             this.reset_address(cx);
             cx.notify();
         }));
-        // The first web tab starts WebKit and its shared rules. Native pages
-        // can open without a WebKit process or extension backgrounds.
+        // The first web tab starts WebKit and its shared rules after the
+        // window has drawn. Native pages need no WebKit process.
         // What the settings say to start with applies at launch; a window
         // reopened, or opened for links, has exactly its tabs.
         let startup = if launch {
-            browser.settings.startup
+            if common.restore_session_on_launch {
+                Startup::Restore
+            } else {
+                browser.settings.startup
+            }
         } else {
             Startup::Restore
         };
@@ -2349,7 +2400,10 @@ impl Browser {
             browser.adopt_tab(tab, 0, cx);
         } else if restored.is_empty() {
             let target = browser.new_tab_target();
-            browser.open_tab(target, private, true, window, cx);
+            match target {
+                TabTarget::Url(url) => browser.push_unloaded_tab(url, String::new(), private),
+                target => browser.open_tab(target, private, true, window, cx),
+            }
         }
         // Restored tabs wait to load until they're shown, so a big session
         // doesn't start every page (and its memory) at once.
@@ -2462,7 +2516,6 @@ impl Browser {
         let https_only = live.https_only.clone();
         let download_dir = live.download_dir.clone();
         let reserved = live.reserved_downloads.clone();
-        let released = live.reserved_downloads.clone();
         let permissions = live.permissions.clone();
         let site_controls = if private {
             Arc::new(std::sync::RwLock::new(SiteControls::default()))
@@ -2522,6 +2575,10 @@ impl Browser {
                     editing_sender.send(BrowserEvent::TrustCertificate(id, token.to_owned()));
                 } else if request.body() == "url-changed" {
                     editing_sender.send(BrowserEvent::UrlChanged(id));
+                } else if let Some(serial) = request.body().strip_prefix("find-dirty:")
+                    && let Ok(serial) = serial.parse()
+                {
+                    editing_sender.send(BrowserEvent::FindDirty(id, serial));
                 }
             })
             .with_document_title_changed_handler(move |title| {
@@ -2575,8 +2632,13 @@ impl Browser {
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "download".into());
-                *path = downloads::unique_path(&dir, &name, &reserved.borrow());
-                reserved.borrow_mut().insert(path.clone(), url.clone());
+                let (final_path, temporary_path) =
+                    downloads::unique_download_paths(&dir, &name, &reserved.borrow());
+                *path = temporary_path.clone();
+                let mut reserved = reserved.borrow_mut();
+                reserved.insert(final_path.clone(), url.clone());
+                reserved.insert(temporary_path, url.clone());
+                drop(reserved);
                 if let Some(view) = started_view.borrow().upgrade() {
                     let mut keepers = keep_on_start.borrow_mut();
                     let keeper = keepers.entry(view_token).or_insert((view, 0));
@@ -2584,6 +2646,7 @@ impl Browser {
                 }
                 let _ = started_sender.try_send(BrowserEvent::DownloadStarted(
                     url,
+                    final_path,
                     path.clone(),
                     private,
                 ));
@@ -2598,14 +2661,6 @@ impl Browser {
                     }
                 }
                 drop(keepers);
-                let mut released = released.borrow_mut();
-                if let Some(path) = &path {
-                    released.remove(path);
-                }
-                // Wry reports no path on macOS even for successful downloads.
-                // Keep ambiguous reservations until this run ends; releasing
-                // one by URL could reuse another in-progress download's path.
-                drop(released);
                 let _ =
                     finished_sender.try_send(BrowserEvent::DownloadFinished(url, path, success));
             })
@@ -2731,6 +2786,10 @@ impl Browser {
             self.compact = false;
             if self.ns_window != 0 {
                 let native = unsafe { &*(self.ns_window as *const objc2_app_kit::NSWindow) };
+                native.setCollectionBehavior(
+                    native.collectionBehavior()
+                        & !objc2_app_kit::NSWindowCollectionBehavior::MoveToActiveSpace,
+                );
                 native.setMinSize(objc2_foundation::NSSize::new(700.0, 460.0));
                 native.setContentSize(objc2_foundation::NSSize::new(1100.0, 760.0));
             }
@@ -2743,14 +2802,20 @@ impl Browser {
             TabTarget::Page(page) => (page, page.internal_url().to_owned(), None),
             TabTarget::Url(url) => {
                 self.favicons().load(&url);
-                match self.create_webview(id, &url, private, media_suspended, window) {
-                    Ok(view) => {
-                        self.report_opened(id, &view, private);
-                        (Page::Web, url, Some(view))
-                    }
-                    Err(err) => {
-                        eprintln!("Could not open WebKit tab: {err}");
-                        return None;
+                if !background && !self.common.store_ready.get() {
+                    // The first WebView is expensive. Let the new tab draw
+                    // before wake_current constructs it.
+                    (Page::Web, url, None)
+                } else {
+                    match self.create_webview(id, &url, private, media_suspended, window) {
+                        Ok(view) => {
+                            self.report_opened(id, &view, private);
+                            (Page::Web, url, Some(view))
+                        }
+                        Err(err) => {
+                            eprintln!("Could not open WebKit tab: {err}");
+                            return None;
+                        }
                     }
                 }
             }
@@ -3785,7 +3850,7 @@ impl Browser {
         cx.notify();
     }
 
-    fn load_in(&mut self, index: usize, url: &str, window: &Window, cx: &mut Context<Self>) {
+    fn load_in(&mut self, index: usize, url: &str, _window: &Window, cx: &mut Context<Self>) {
         let id = self.tabs[index].id;
         if self.auth_forms.remove(&id).is_some() {
             if let Some(view) = &self.tabs[index].view {
@@ -3825,25 +3890,10 @@ impl Browser {
             return;
         }
         self.favicons().load(url);
-        let id = self.tabs[index].id;
-        let private = self.tabs[index].private;
-        if self.tabs[index].view.is_none() {
-            match self.create_webview(id, url, private, false, window) {
-                Ok(view) => {
-                    self.report_opened(id, &view, private);
-                    self.tabs[index].audio_observer = Some(self.observe_tab_audio(id, &view));
-                    self.tabs[index].url_observer = Some(self.observe_tab_url(id, &view));
-                    self.tabs[index].view = Some(view);
-                }
-                Err(err) => {
-                    eprintln!("Could not open WebKit tab: {err}");
-                    return;
-                }
+        if let Some(view) = &self.tabs[index].view {
+            if let Err(err) = view.load_url(url) {
+                eprintln!("Could not load {url}: {err}");
             }
-        } else if let Some(view) = &self.tabs[index].view
-            && let Err(err) = view.load_url(url)
-        {
-            eprintln!("Could not load {url}: {err}");
         }
         let tab = &mut self.tabs[index];
         tab.page = Page::Web;
@@ -3957,6 +4007,9 @@ impl Browser {
                         self.sample_tint(index);
                         self.discover_icons(index);
                         self.report_updated(index);
+                        if index == self.selected && self.find.open {
+                            self.find_step(false, cx);
+                        }
                         changed = true;
                     }
                 }
@@ -4050,8 +4103,8 @@ impl Browser {
                         self.load_in(index, &url, window, cx);
                     }
                 }
-                BrowserEvent::DownloadStarted(url, path, private) => {
-                    self.downloads().started(url, path, private, self.serial);
+                BrowserEvent::DownloadStarted(url, final_path, temporary_path, private) => {
+                    self.downloads().started_with_temporary(url, final_path, Some(temporary_path), private, self.serial);
                     self.controls
                         .scroll("download-shelf-items")
                         .set_offset(point(px(0.0), px(0.0)));
@@ -4059,7 +4112,11 @@ impl Browser {
                     cx.notify();
                 }
                 BrowserEvent::DownloadFinished(url, path, success) => {
-                    self.downloads().finished(&url, path, success);
+                    if let Some((final_path, temporary_path)) = self.downloads().finished(&url, path, success) {
+                        let mut reserved = self.common.live.reserved_downloads.borrow_mut();
+                        reserved.remove(&final_path);
+                        reserved.remove(&temporary_path);
+                    }
                     self.refresh_other_windows(cx);
                     cx.notify();
                 }
@@ -4244,6 +4301,7 @@ impl Browser {
                     }
                 }
                 BrowserEvent::FindEdited => self.find_step(false, cx),
+                BrowserEvent::FindDirty(tab, serial) => self.find_dirty(tab, serial, cx),
                 BrowserEvent::Found(tab, serial, found, count) => {
                     self.found(tab, serial, found, count, cx)
                 }
@@ -4611,6 +4669,15 @@ impl Browser {
     }
 
     fn focus_address(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus_address_with_selection(true, window, cx);
+    }
+
+    fn focus_address_with_selection(
+        &mut self,
+        select_all: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.ping = (Some(PingTarget::Omnibox), self.ping.1 + 1);
         // The switcher would otherwise keep the arrows, Enter and Escape.
         self.close_palette(cx);
@@ -4620,11 +4687,13 @@ impl Browser {
         keyboard_to_gpui(self.ns_window, self.ns_view);
         let focus = self.address.read(cx).focus_handle.clone();
         window.focus(&focus, cx);
-        // While unfocused the field shows a styled label, not the input, so
-        // select once the next frame has drawn the input.
-        cx.on_next_frame(window, move |_, window, cx| {
-            focus.dispatch_action(&vampir::text_input::SelectAll, window, cx);
-        });
+        if select_all {
+            // While unfocused the field shows a styled label, not the input,
+            // so select once the next frame has drawn the input.
+            cx.on_next_frame(window, move |_, window, cx| {
+                focus.dispatch_action(&vampir::text_input::SelectAll, window, cx);
+            });
+        }
         cx.notify();
     }
 
@@ -5015,37 +5084,34 @@ impl Browser {
         let id = self.current().id;
         let title = self.current().title.clone();
         div()
-            .h(px(TOOLBAR_HEIGHT))
+            .id("compact-titlebar")
+            .relative()
+            .h(px(COMPACT_HEADER_HEIGHT))
             .w_full()
             .flex_none()
             .flex()
             .items_center()
             .pl(px(TRAFFIC_LIGHT_INSET))
             .pr(px(12.0))
-            .gap(px(8.0))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, window, _| {
+                    if event.click_count >= 2 {
+                        window.titlebar_double_click();
+                    } else {
+                        this.begin_tab_drag(id, event.position);
+                    }
+                }),
+            )
+            .child(tabdrag::record_bounds(self.tab_bounds.clone(), id))
             .child(
                 div()
-                    .id("compact-drag")
-                    .relative()
+                    .id("compact-title")
                     .flex_1()
                     .min_w(px(0.0))
-                    .h_full()
-                    .flex()
-                    .items_center()
-                    .cursor_pointer()
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, event: &MouseDownEvent, _, _| {
-                            this.begin_tab_drag(id, event.position);
-                        }),
-                    )
-                    .child(tabdrag::record_bounds(self.tab_bounds.clone(), id))
-                    .child(
-                        div()
-                            .truncate()
-                            .text_color(palette.text_primary)
-                            .child(title),
-                    ),
+                    .truncate()
+                    .text_color(palette.text_primary)
+                    .child(title),
             )
             .child(
                 div()
@@ -5059,6 +5125,7 @@ impl Browser {
                     .hover(|style| style.bg(palette.row_hover))
                     .cursor_pointer()
                     .child("Expand")
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(|this, _, window, cx| this.expand_compact(window, cx))),
             )
     }
@@ -5071,6 +5138,10 @@ impl Browser {
         window.resize(size(px(1100.0), px(760.0)));
         if self.ns_window != 0 {
             let native = unsafe { &*(self.ns_window as *const objc2_app_kit::NSWindow) };
+            native.setCollectionBehavior(
+                native.collectionBehavior()
+                    & !objc2_app_kit::NSWindowCollectionBehavior::MoveToActiveSpace,
+            );
             native.setMinSize(objc2_foundation::NSSize::new(700.0, 460.0));
         }
         self.persist();
@@ -5465,6 +5536,7 @@ impl Browser {
                 MouseButton::Left,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                     if focused {
+                        this.address_press = None;
                         if let Some(view) = &webview {
                             let _ = view.focus_parent();
                         }
@@ -5472,8 +5544,29 @@ impl Browser {
                             input.handle_chrome_click(event.position, window, cx)
                         });
                     } else {
-                        this.focus_address(window, cx);
-                        window.prevent_default();
+                        this.address_press = Some(event.position);
+                        this.focus_address_with_selection(false, window, cx);
+                    }
+                }),
+            )
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, _| {
+                if let Some(start) = this.address_press
+                    && event.pressed_button == Some(MouseButton::Left)
+                    && ((event.position.x - start.x).abs() > px(2.0)
+                        || (event.position.y - start.y).abs() > px(2.0))
+                {
+                    this.address_press = None;
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                    if this.address_press.take().is_some_and(|start| {
+                        (event.position.x - start.x).abs() <= px(2.0)
+                            && (event.position.y - start.y).abs() <= px(2.0)
+                    }) {
+                        let focus = this.address.read(cx).focus_handle.clone();
+                        focus.dispatch_action(&vampir::text_input::SelectAll, window, cx);
                     }
                 }),
             )
@@ -5553,20 +5646,6 @@ impl Browser {
                     .flex_1()
                     .min_w(px(0.0))
                     .overflow_hidden()
-                    // The first click selects the whole address, so typing
-                    // replaces it. Taken before the field sees the press,
-                    // or it would place a caret and a drag would undo it.
-                    .when(!focused, |el| {
-                        el.capture_any_mouse_down(cx.listener(
-                            |this, event: &MouseDownEvent, window, cx| {
-                                if event.button == MouseButton::Left {
-                                    this.focus_address(window, cx);
-                                    window.prevent_default();
-                                    cx.stop_propagation();
-                                }
-                            },
-                        ))
-                    })
                     .relative()
                     // The input stays rendered, so focus and select-all
                     // always have somewhere to land; while the field is idle
@@ -6077,7 +6156,13 @@ impl Browser {
                         .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                             this.hover_label(id, *hovered, cx)
                         }))
-                        .child(self.tab_icon(tab, 16.0, active, palette))
+                        .child(tab_icon_with_close(
+                            self.tab_icon(tab, 16.0, active, palette),
+                            id,
+                            18.0,
+                            palette,
+                            cx,
+                        ))
                         .child(marquee::label(
                             tab.title.clone(),
                             id,
@@ -6086,14 +6171,7 @@ impl Browser {
                         ))
                         .when(tab.playing_audio || tab.muted, |row| {
                             row.child(tab_sound_button(tab, palette, hint::Side::Below, cx))
-                        })
-                        .child(close_button(
-                            ("horizontal-close", tab.id),
-                            id,
-                            active,
-                            palette,
-                            cx,
-                        ));
+                        });
                     let row = self.tab_row_events(row, index, id, cx);
                     let element = row.into_any_element();
                     (tab.id, element)
@@ -6261,7 +6339,13 @@ impl Browser {
                         .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                             this.hover_label(id, *hovered, cx)
                         }))
-                        .child(self.tab_icon(tab, 18.0, active, palette))
+                        .child(tab_icon_with_close(
+                            self.tab_icon(tab, 18.0, active, palette),
+                            id,
+                            18.0,
+                            palette,
+                            cx,
+                        ))
                         .child(marquee::label(
                             tab.title.clone(),
                             id,
@@ -6270,8 +6354,7 @@ impl Browser {
                         ))
                         .when(tab.playing_audio || tab.muted, |row| {
                             row.child(tab_sound_button(tab, palette, hint::Side::Right, cx))
-                        })
-                        .child(close_button(("close", tab.id), id, active, palette, cx));
+                        });
                     let row = self.tab_row_events(row, index, id, cx);
                     revealed(row, 30.0, ROW_GAP, arrival)
                 }
@@ -6374,6 +6457,7 @@ impl Browser {
                     let id = tab.id;
                     let row = div()
                         .id(("compact-tab", tab.id))
+                        .group("tab")
                         .relative()
                         .w(px(34.0))
                         .h(px(34.0))
@@ -6392,7 +6476,13 @@ impl Browser {
                         })
                         .with_hint(Hint::new(tab.title.clone()), hint::Side::Right, cx)
                         .on_click(cx.listener(move |this, _, _, cx| this.select_id(id, cx)))
-                        .child(self.tab_icon(tab, 20.0, active, palette))
+                        .child(tab_icon_with_close(
+                            self.tab_icon(tab, 20.0, active, palette),
+                            id,
+                            20.0,
+                            palette,
+                            cx,
+                        ))
                         .when(tab.playing_audio || tab.muted, |row| {
                             row.child(
                                 tab_sound_button(tab, palette, hint::Side::Right, cx)
@@ -6465,12 +6555,32 @@ impl Render for Browser {
             window.remove_window();
             return div().into_any_element();
         }
-        self.wake_current(window);
-        if self.focused_selection_generation != self.selection_generation && self.palette.is_none()
+        if !self.wake_pending
+            && self.current().page == Page::Web
+            && self.current().view.is_none()
+            && !self.current().url.is_empty()
+        {
+            self.wake_pending = true;
+            cx.spawn_in(window, async move |this, cx| {
+                // Give GPUI a frame to paint before the main-thread-only
+                // WKWebView constructor and WebKit setup run.
+                cx.background_executor()
+                    .timer(Duration::from_millis(32))
+                    .await;
+                let _ = this.update_in(cx, |browser, window, cx| {
+                    browser.wake_pending = false;
+                    browser.wake_current(window);
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+        if self.focused_selection_generation != self.selection_generation
+            && self.palette.is_none()
+            && (self.current().page != Page::Web || self.current().view.is_some())
         {
             self.focused_selection_generation = self.selection_generation;
-            // Restored pages are created by wake_current above. Give the
-            // newly selected page the keyboard once it exists, and clear
+            // Give the newly selected page the keyboard once it exists, and clear
             // GPUI's tab focus so its arrow handler cannot steal page keys.
             // An explicitly opened browser field keeps its own focus.
             if !self.text_field_focused(window, cx)
@@ -6535,8 +6645,11 @@ impl Render for Browser {
         if self.reveal_selected
             && !self.vertical_tabs
             && self.strip_frames > 1
-            && self.reveal_selected_tab()
         {
+            // Two laid-out frames are enough to locate the selected tab.
+            // If it still has no bounds, more identical redraws cannot
+            // make it appear and would keep this window rendering forever.
+            let _ = self.reveal_selected_tab();
             self.reveal_selected = false;
         }
         let bookmarks_target = if self.bookmarks_bar && !self.compact {
@@ -6587,19 +6700,25 @@ impl Render for Browser {
         }
         let page_hold = self.page_hold.clone();
         let page_clip = self.page_clip.clone();
+        let page_view_bounds = self.page_view_bounds.clone();
+        let minimal_bar_height = if self.minimal {
+            self.controls.tween(
+                "minimal-bar",
+                if self.chrome_revealed {
+                    0.0
+                } else {
+                    minimal::MINIMAL_BAR
+                },
+                minimal::REVEAL,
+            )
+        } else {
+            0.0
+        };
         let peek_top = TOOLBAR_HEIGHT * reveal + bookmarks_height + strip_height;
         let clip_top = if self.minimal {
-            self.controls
-                .tween(
-                    "minimal-bar",
-                    if self.chrome_revealed {
-                        0.0
-                    } else {
-                        minimal::MINIMAL_BAR
-                    },
-                    minimal::REVEAL,
-                )
-                .max(peek_top)
+            // The page starts below the peeking bar. Clip only the part
+            // covered by the controls as they slide over that inset.
+            (peek_top - minimal_bar_height).max(0.0)
         } else {
             0.0
         };
@@ -6665,6 +6784,7 @@ impl Render for Browser {
                                         .is_none_or(|parent| !std::ptr::eq(&**parent, &*page_clip))
                                     {
                                         page_clip.addSubview(&webview);
+                                        page_view_bounds.set(None);
                                     }
                                     let width = f64::from(size.width);
                                     let height = f64::from(size.height);
@@ -6672,29 +6792,41 @@ impl Render for Browser {
                                     let left = f64::from(clip_left).min(width);
                                     let parent_height = unsafe { page_clip.superview() }
                                         .map_or(0.0, |parent| parent.frame().size.height);
-                                    page_clip.setFrame(objc2_foundation::NSRect::new(
+                                    let clip_frame = objc2_foundation::NSRect::new(
                                         objc2_foundation::NSPoint::new(
                                             f64::from(bounds.origin.x) + left,
                                             parent_height - f64::from(bounds.origin.y) - height,
                                         ),
                                         objc2_foundation::NSSize::new(width - left, height - top),
-                                    ));
-                                    if view
-                                        .set_bounds(Rect {
-                                            position: dpi::Position::Logical(
-                                                dpi::LogicalPosition::new(-left, -top),
-                                            ),
-                                            size: dpi::Size::Logical(dpi::LogicalSize::new(
-                                                width, height,
-                                            )),
-                                        })
-                                        .is_ok()
-                                        && !covered
+                                    );
+                                    if page_clip.frame() != clip_frame {
+                                        page_clip.setFrame(clip_frame);
+                                    }
+                                    let native_id = Retained::as_ptr(&webview) as usize;
+                                    let desired = (native_id, left, top, width, height);
+                                    if page_view_bounds.get() != Some(desired)
+                                        && view
+                                            .set_bounds(Rect {
+                                                position: dpi::Position::Logical(
+                                                    dpi::LogicalPosition::new(-left, -top),
+                                                ),
+                                                size: dpi::Size::Logical(dpi::LogicalSize::new(
+                                                    width, height,
+                                                )),
+                                            })
+                                            .is_ok()
                                     {
-                                        page_clip.setHidden(false);
-                                        // Keep a new view hidden until its
-                                        // first real page bounds are applied.
-                                        let _ = view.set_visible(true);
+                                        page_view_bounds.set(Some(desired));
+                                    }
+                                    if !covered && page_view_bounds.get() == Some(desired) {
+                                        if page_clip.isHidden() {
+                                            page_clip.setHidden(false);
+                                        }
+                                        // Keep a new view hidden until its first
+                                        // real page bounds are applied.
+                                        if webview.isHidden() {
+                                            let _ = view.set_visible(true);
+                                        }
                                     }
                                 }
                             }
@@ -6761,7 +6893,9 @@ impl Render for Browser {
             || self.suggest.is_some()
             || self.bookmark_menu.is_some()
         {
-            self.page_clip.setHidden(true);
+            if !self.page_clip.isHidden() {
+                self.page_clip.setHidden(true);
+            }
         }
         let mut root = vampir::root(div().id("root"), self, cx)
             .relative()
@@ -6837,8 +6971,10 @@ impl Render for Browser {
             self.tab_scroll.set_offset(point(px(0.0), px(0.0)));
         }
         if self.minimal {
-            root = root.child(body);
-            if let Some(bar) = self.minimal_bar(palette) {
+            root = root
+                .child(div().h(px(minimal_bar_height)).flex_none())
+                .child(body);
+            if let Some(bar) = self.minimal_bar(palette, minimal_bar_height) {
                 root = root.child(div().absolute().top_0().left_0().w_full().child(bar));
             }
             root = root.child(top_chrome.absolute().top_0().left_0());
@@ -6911,14 +7047,16 @@ impl Render for Browser {
         // of the load, busy.
         let fading = progress.is_some_and(|(fraction, opacity)| fraction >= 1.0 || opacity < 1.0);
         if self.controls.animating()
-            || (self.reveal_selected && !self.vertical_tabs)
+            || (self.reveal_selected && !self.vertical_tabs && strip_height > 0.5)
             || fading
             // The switcher's fade in and out; open, it sits still.
             || self.palette_animating()
         {
             window.request_animation_frame();
-        } else if progress.is_some() || downloads::sizes_pending() {
+        } else if progress.is_some() {
             self.redraw_soon(Duration::from_millis(66), cx);
+        } else if downloads::sizes_pending() {
+            self.redraw_soon(Duration::from_millis(250), cx);
         } else if downloading {
             self.redraw_soon(Duration::from_millis(250), cx);
         }
@@ -7166,10 +7304,17 @@ fn open_compact_window(cx: &mut App, common: Rc<Common>, url: String) {
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         window_min_size: Some(size(px(360.0), px(260.0))),
+        // Configure the native window for the current Space before showing
+        // it. GPUI otherwise orders it front while constructing it, before
+        // Browser::new can set MoveToActiveSpace.
+        show: false,
         titlebar: Some(TitlebarOptions {
             title: Some("Vamprowser".into()),
             appears_transparent: true,
-            traffic_light_position: Some(point(px(TRAFFIC_LIGHTS.0), px(TRAFFIC_LIGHTS.1))),
+            traffic_light_position: Some(point(
+                px(COMPACT_TRAFFIC_LIGHTS.0),
+                px(COMPACT_TRAFFIC_LIGHTS.1),
+            )),
         }),
         app_owns_titlebar_drag: true,
         ..Default::default()
@@ -7181,7 +7326,31 @@ fn open_compact_window(cx: &mut App, common: Rc<Common>, url: String) {
     if let Ok(handle) = cx.open_window(options, move |window, cx| {
         cx.new(|cx| Browser::new(window, cx, common, false, Some(restore), false, None, true))
     }) {
-        let _ = handle.update(cx, |_, window, _| window.activate_window());
+        let _ = handle.update(cx, |browser, _, _| {
+            if browser.ns_window != 0 {
+                let native = unsafe { &*(browser.ns_window as *const objc2_app_kit::NSWindow) };
+                let mouse = NSEvent::mouseLocation();
+                if let Some(mtm) = objc2::MainThreadMarker::new() {
+                    for screen in objc2_app_kit::NSScreen::screens(mtm).iter() {
+                        let frame = screen.frame();
+                        if mouse.x >= frame.origin.x
+                            && mouse.x < frame.origin.x + frame.size.width
+                            && mouse.y >= frame.origin.y
+                            && mouse.y < frame.origin.y + frame.size.height
+                        {
+                            let visible = screen.visibleFrame();
+                            let size = native.frame().size;
+                            native.setFrameTopLeftPoint(objc2_foundation::NSPoint::new(
+                                visible.origin.x + (visible.size.width - size.width) / 2.0,
+                                visible.origin.y + (visible.size.height + size.height) / 2.0,
+                            ));
+                            break;
+                        }
+                    }
+                }
+                native.makeKeyAndOrderFront(None);
+            }
+        });
     }
 }
 
@@ -7384,7 +7553,9 @@ fn main() {
             saved.windows.clone()
         };
         let settings = Settings::load();
-        if settings.startup == Startup::Restore && !windows.is_empty() {
+        if (settings.startup == Startup::Restore || common.restore_session_on_launch)
+            && !windows.is_empty()
+        {
             for window in windows {
                 open_browser_window(cx, common.clone(), false, Some(window), true, None);
             }

@@ -27,6 +27,9 @@ pub struct Download {
     pub id: u64,
     pub url: String,
     pub path: PathBuf,
+    /// WebKit writes here until it reports that the download finished.
+    #[serde(skip)]
+    pub temporary_path: Option<PathBuf>,
     pub state: DownloadState,
     /// Seconds since the Unix epoch.
     pub started: u64,
@@ -61,12 +64,17 @@ impl Download {
     /// the pages showing it are drawn often, and a download folder on a
     /// sleeping drive or a network share can take seconds to answer.
     pub fn file_size(&self) -> Option<Option<u64>> {
+        let path = if self.state == DownloadState::InProgress {
+            self.temporary_path.as_ref().unwrap_or(&self.path)
+        } else {
+            &self.path
+        };
         let mut sizes = sizes().lock().ok()?;
-        let seen = sizes.entry(self.path.clone()).or_insert(Seen { looked: None, pending: false, size: None });
+        let seen = sizes.entry(path.clone()).or_insert(Seen { looked: None, pending: false, size: None });
         let due = seen.looked.is_none_or(|at| at.elapsed() > RECHECK);
         if due && !seen.pending {
             seen.pending = true;
-            look_up(self.path.clone());
+            look_up(path.clone());
         }
         seen.size
     }
@@ -164,6 +172,26 @@ pub fn unique_path<T>(dir: &Path, name: &str, reserved: &std::collections::HashM
         .expect("some number is free")
 }
 
+/// Reserve both the eventual filename and WebKit's temporary filename.
+pub fn unique_download_paths<T>(dir: &Path, name: &str, reserved: &HashMap<PathBuf, T>) -> (PathBuf, PathBuf) {
+    let mut occupied = HashMap::<PathBuf, ()>::new();
+    for path in reserved.keys() {
+        occupied.insert(path.clone(), ());
+    }
+    loop {
+        let final_path = unique_path(dir, name, &occupied);
+        let mut temporary_name = final_path.as_os_str().to_os_string();
+        temporary_name.push(".download");
+        let temporary = PathBuf::from(temporary_name);
+        if fs::symlink_metadata(&temporary).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+            && !occupied.contains_key(&temporary)
+        {
+            return (final_path, temporary);
+        }
+        occupied.insert(final_path, ());
+    }
+}
+
 impl Downloads {
     pub fn load() -> Self {
         let items: Vec<Download> = crate::state::load_json(downloads_path()).unwrap_or_default();
@@ -195,6 +223,10 @@ impl Downloads {
     }
 
     pub fn started(&mut self, url: String, path: PathBuf, private: bool, window: u64) -> u64 {
+        self.started_with_temporary(url, path, None, private, window)
+    }
+
+    pub fn started_with_temporary(&mut self, url: String, path: PathBuf, temporary_path: Option<PathBuf>, private: bool, window: u64) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
         self.items.insert(
@@ -203,6 +235,7 @@ impl Downloads {
                 id,
                 url,
                 path,
+                temporary_path,
                 state: DownloadState::InProgress,
                 started: now_secs(),
                 private,
@@ -213,30 +246,59 @@ impl Downloads {
         id
     }
 
-    /// Marks a download finished: the one saving to `path`, if WebKit says,
-    /// since the same address can be downloading twice; else the newest of
-    /// `url`.
-    pub fn finished(&mut self, url: &str, path: Option<PathBuf>, success: bool) {
-        let running = |d: &&mut Download| d.state == DownloadState::InProgress;
+    /// Marks a download finished: the one saving to `path`, if WebKit says;
+    /// otherwise the sole matching temporary file, or the newest matching
+    /// URL when WebKit leaves the path out.
+    pub fn finished(&mut self, url: &str, path: Option<PathBuf>, success: bool) -> Option<(PathBuf, PathBuf)> {
         let at = path
             .as_ref()
-            .and_then(|path| self.items.iter().position(|d| d.state == DownloadState::InProgress && &d.path == path))
-            .or_else(|| self.items.iter_mut().position(|d| running(&d) && d.url == url));
+            .and_then(|path| self.items.iter().position(|d| d.state == DownloadState::InProgress && (d.temporary_path.as_ref() == Some(path) || &d.path == path)))
+            .or_else(|| {
+                if !success { return None; }
+                let present: Vec<_> = self.items.iter().enumerate().filter(|(_, d)|
+                    d.state == DownloadState::InProgress && d.url == url
+                        && d.temporary_path.as_ref().is_some_and(|path| path.exists())
+                ).map(|(at, _)| at).collect();
+                if present.len() == 1 { present.first().copied() } else { None }
+            })
+            .or_else(|| self.items.iter().position(|d| d.state == DownloadState::InProgress && d.url == url));
+        let reserved: HashMap<_, _> = self.items.iter().filter(|d| d.state == DownloadState::InProgress)
+            .flat_map(|d| std::iter::once(d.path.clone()).chain(d.temporary_path.clone()).map(|path| (path, ())))
+            .collect();
+        let mut release = None;
         if let Some(item) = at.map(|at| &mut self.items[at]) {
-            item.state = if success {
-                DownloadState::Done
+            if let Some(temporary) = item.temporary_path.take() {
+                release = Some((item.path.clone(), temporary.clone()));
+                if success {
+                    let name = item.name();
+                    let dir = item.path.parent().unwrap_or(Path::new("."));
+                    let mut taken = reserved;
+                    taken.remove(&item.path);
+                    taken.remove(&temporary);
+                    let final_path = unique_path(dir, &name, &taken);
+                    if fs::rename(&temporary, &final_path).is_ok() {
+                        item.path = final_path;
+                        item.state = DownloadState::Done;
+                    } else {
+                        item.path = temporary;
+                        item.state = DownloadState::Failed;
+                    }
+                } else {
+                    item.path = temporary;
+                    item.state = DownloadState::Failed;
+                }
             } else {
-                DownloadState::Failed
-            };
-            if let Some(path) = path {
-                item.path = path;
+                item.state = if success { DownloadState::Done } else { DownloadState::Failed };
+                if let Some(path) = path { item.path = path; }
             }
             // Looked at while it was still being written: look again.
             if let Ok(mut sizes) = sizes().lock() {
                 sizes.remove(&item.path);
+                if let Some((_, temporary)) = &release { sizes.remove(temporary); }
             }
         }
         self.save();
+        release
     }
 
     /// Completes a yt-dlp job, whose final extension is known only after it runs.
@@ -309,6 +371,50 @@ mod tests {
     }
 
     #[test]
+    fn web_download_stays_temporary_until_finished() {
+        let dir = std::env::temp_dir().join(format!("vamp-temp-dl-{}-{}", std::process::id(), now_secs()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("file.zip.download"), b"old partial").unwrap();
+        let (final_path, temporary) = unique_download_paths::<()>(&dir, "file.zip", &HashMap::new());
+        assert_eq!(final_path, dir.join("file 2.zip"));
+        assert_eq!(temporary, dir.join("file 2.zip.download"));
+        fs::write(&temporary, b"complete").unwrap();
+        let mut downloads = Downloads::default();
+        downloads.started_with_temporary("https://example.test/file".into(), final_path.clone(), Some(temporary.clone()), false, 1);
+        assert!(!final_path.exists());
+        assert_eq!(downloads.finished("https://example.test/file", None, true), Some((final_path.clone(), temporary.clone())));
+        assert_eq!(downloads.all()[0].state, DownloadState::Done);
+        assert_eq!(fs::read(final_path).unwrap(), b"complete");
+        assert!(!temporary.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_web_download_keeps_partial_file_marked() {
+        let dir = std::env::temp_dir().join(format!("vamp-failed-dl-{}-{}", std::process::id(), now_secs()));
+        fs::create_dir_all(&dir).unwrap();
+        let final_path = dir.join("file.zip");
+        let temporary = dir.join("file.zip.download");
+        fs::write(&temporary, b"partial").unwrap();
+        let mut downloads = Downloads::default();
+        downloads.started_with_temporary("https://example.test/file".into(), final_path.clone(), Some(temporary.clone()), false, 1);
+        downloads.finished("https://example.test/file", None, false);
+        assert_eq!(downloads.all()[0].state, DownloadState::Failed);
+        assert_eq!(downloads.all()[0].path, temporary);
+        assert!(!final_path.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn completion_without_a_saved_file_does_not_stay_in_progress() {
+        let mut downloads = Downloads::default();
+        let temporary = std::env::temp_dir().join(format!("vamp-missing-{}.download", std::process::id()));
+        downloads.started_with_temporary("https://example.test/missing".into(), temporary.with_extension("zip"), Some(temporary), false, 1);
+        downloads.finished("https://example.test/missing", None, true);
+        assert_eq!(downloads.all()[0].state, DownloadState::Failed);
+    }
+
+    #[test]
     fn finishing_marks_the_newest_matching_download() {
         let mut downloads = Downloads::default();
         downloads.started("https://a/x".into(), "/tmp/x".into(), false, 1);
@@ -353,5 +459,25 @@ mod tests {
         fs::write(dir.join("subtitles/en.vtt"), b"123").unwrap();
         assert_eq!(size_on_disk(&dir), Some(8));
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn active_web_download_reads_temporary_file_size() {
+        let dir = std::env::temp_dir().join(format!("vamp-active-size-{}-{}", std::process::id(), now_secs()));
+        fs::create_dir_all(&dir).unwrap();
+        let final_path = dir.join("file.zip");
+        let temporary = dir.join("file.zip.download");
+        fs::write(&temporary, b"12345").unwrap();
+        let mut downloads = Downloads::default();
+        downloads.started_with_temporary("https://example.test/file".into(), final_path, Some(temporary), false, 1);
+        let item = &downloads.all()[0];
+        for _ in 0..100 {
+            if item.file_size() == Some(Some(5)) {
+                fs::remove_dir_all(dir).unwrap();
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("active download size was not read from the temporary file");
     }
 }
