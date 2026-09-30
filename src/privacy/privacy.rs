@@ -4,13 +4,19 @@
 
 use std::{
     cell::{Cell, RefCell},
+    collections::HashMap,
     rc::Rc,
 };
 
 use block2::RcBlock;
-use objc2::{MainThreadMarker, Message, rc::Retained};
+use objc2::{
+    MainThreadMarker, Message,
+    rc::{Retained, Weak},
+};
 use objc2_foundation::{NSError, NSString};
-use objc2_web_kit::{WKContentRuleList, WKContentRuleListStore, WKWebView};
+use objc2_web_kit::{
+    WKContentRuleList, WKContentRuleListStore, WKUserContentController, WKWebView,
+};
 use serde_json::{Value, json};
 
 use crate::{
@@ -206,7 +212,11 @@ pub fn rules_for(settings: &Settings, controls: &SiteControls) -> Option<String>
     let base_trackers = settings.protection != Protection::Off;
     let base_ads = settings.protection == Protection::Strict;
     let base_cookies = settings.block_third_party_cookies || base_ads;
-    for (host, site) in &controls.0 {
+    // Stable order keeps semantically identical settings from recompiling
+    // when unrelated site permissions change the HashMap's iteration order.
+    let mut sites: Vec<_> = controls.0.iter().collect();
+    sites.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+    for (host, site) in sites {
         let top = format!("^https?://{}[/:?]", regex_escape(host));
         let protection = site.protection.unwrap_or(settings.protection);
         let trackers = protection != Protection::Off;
@@ -287,9 +297,12 @@ pub struct ContentRules {
     /// latest may take effect.
     generation: Rc<Cell<u64>>,
     ublock_generation: Rc<Cell<u64>>,
-    /// Every list ever put on a page, to take off again: only ours, as
-    /// WebKit also adds extensions' own rule lists to pages.
-    applied: RefCell<Vec<Retained<WKContentRuleList>>>,
+    /// Only the lists currently installed in each controller. A weak
+    /// controller does not keep closed tabs alive; retired lists are released
+    /// when replaced instead of accumulating for the entire browser session.
+    applied: RefCell<HashMap<usize, AppliedRules>>,
+    /// Changes when a completed update actually replaces the active lists.
+    revision: Rc<Cell<u64>>,
     /// Lists still being compiled or looked up since launch; pages wait
     /// for them before loading (see [`ContentRules::ready`]).
     outstanding: Rc<Cell<u32>>,
@@ -297,6 +310,12 @@ pub struct ContentRules {
     primed: bool,
     /// Pages stopped waiting, ready or not.
     gave_up: bool,
+}
+
+struct AppliedRules {
+    controller: Weak<WKUserContentController>,
+    revision: u64,
+    lists: Vec<Retained<WKContentRuleList>>,
 }
 
 impl ContentRules {
@@ -316,11 +335,13 @@ impl ContentRules {
         }
         self.source = source.clone();
         let current = self.current.clone();
+        let revision = self.revision.clone();
         let generation = self.generation.clone();
         generation.set(generation.get() + 1);
         let mine = generation.get();
         let Some(source) = source else {
             *current.borrow_mut() = None;
+            revision.set(revision.get().wrapping_add(1));
             ready();
             return;
         };
@@ -352,6 +373,7 @@ impl ContentRules {
                 return;
             }
             *current.borrow_mut() = list;
+            revision.set(revision.get().wrapping_add(1));
             ready();
         });
         // SAFETY: arguments are valid NSStrings and a block with the
@@ -413,6 +435,7 @@ impl ContentRules {
                 generation.clone(),
             );
             let target = self.ublock.clone();
+            let revision = self.revision.clone();
             let looked_up =
                 RcBlock::new(move |list: *mut WKContentRuleList, _error: *mut NSError| {
                     // SAFETY: WebKit passes a valid list or null.
@@ -429,6 +452,7 @@ impl ContentRules {
                         // through what the rest were written around.
                         if lists.iter().all(Option::is_some) {
                             *target.borrow_mut() = lists.into_iter().flatten().collect();
+                            revision.set(revision.get().wrapping_add(1));
                         }
                     }
                     ready();
@@ -451,20 +475,36 @@ impl ContentRules {
         unsafe {
             let controller = webview.configuration().userContentController();
             let mut applied = self.applied.borrow_mut();
-            for list in applied.iter() {
+            let key = std::ptr::from_ref(&*controller) as usize;
+            let revision = self.revision.get();
+            if applied
+                .get(&key)
+                .is_some_and(|old| old.revision == revision && old.controller.load().is_some())
+            {
+                return;
+            }
+            // Run cleanup when a controller or rule revision changes, not
+            // for every no-op application to an existing page.
+            applied.retain(|_, old| old.controller.load().is_some());
+            let previous = applied.remove(&key);
+            for list in previous.iter().flat_map(|old| &old.lists) {
                 controller.removeContentRuleList(list);
             }
             let current = self.current.borrow();
             let ublock = self.ublock.borrow();
+            let mut lists = Vec::with_capacity(usize::from(current.is_some()) + ublock.len());
             for list in current.iter().chain(ublock.iter()) {
                 controller.addContentRuleList(list);
-                // By identifier: WebKit removes by it, and hands out a new
-                // object for the same list.
-                let identifier = list.identifier();
-                if !applied.iter().any(|seen| seen.identifier() == identifier) {
-                    applied.push(list.clone());
-                }
+                lists.push(list.clone());
             }
+            applied.insert(
+                key,
+                AppliedRules {
+                    controller: Weak::from_retained(&controller),
+                    revision,
+                    lists,
+                },
+            );
         }
     }
 
@@ -493,11 +533,13 @@ impl ContentRules {
         };
         forget_stale_lists(&store, &fingerprints);
         let target = self.ublock.clone();
+        let revision = self.revision.clone();
         let generation = self.ublock_generation.clone();
         generation.set(generation.get() + 1);
         let mine = generation.get();
         if chunks.is_empty() {
             target.borrow_mut().clear();
+            revision.set(revision.get().wrapping_add(1));
             crate::filters::save_enforced(&[]);
             ready();
             return;
@@ -516,6 +558,7 @@ impl ContentRules {
                 let ready = ready.clone();
                 let generation = generation.clone();
                 let fingerprints_kept = fingerprints_kept.clone();
+                let revision = revision.clone();
                 move |list: Option<Retained<WKContentRuleList>>| {
                     compiled.borrow_mut()[index] = list;
                     remaining.set(remaining.get() - 1);
@@ -528,6 +571,7 @@ impl ContentRules {
                             crate::filters::save_enforced(&fingerprints_kept);
                         }
                         *target.borrow_mut() = lists.into_iter().flatten().collect();
+                        revision.set(revision.get().wrapping_add(1));
                         ready();
                     }
                 }
@@ -648,6 +692,26 @@ mod tests {
     fn domains_are_escaped_into_anchored_filters() {
         let list = rules(&Settings::default()).unwrap();
         assert!(list.contains(r#"^https?://([^/:]*\\.)?doubleclick\\.net[/:?]"#));
+    }
+
+    #[test]
+    fn site_rule_source_is_stable_across_insertion_orders() {
+        let mut forward = SiteControls::default();
+        let mut backward = SiteControls::default();
+        let hosts = ["a.example", "b.example", "c.example", "d.example"];
+        for host in hosts {
+            forward.change(host, |site| site.protection = Some(Protection::Off));
+        }
+        for host in hosts.into_iter().rev() {
+            backward.change(host, |site| site.protection = Some(Protection::Off));
+        }
+        let settings = Settings::default();
+        let source = rules_for(&settings, &forward).unwrap();
+        assert_eq!(Some(source.clone()), rules_for(&settings, &backward));
+        backward.change("unrelated.example", |site| {
+            site.camera = Some(crate::settings::SitePermission::Allow);
+        });
+        assert_eq!(Some(source), rules_for(&settings, &backward));
     }
 
     #[test]

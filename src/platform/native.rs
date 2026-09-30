@@ -9,7 +9,7 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{
     NSCalendar, NSCalendarUnit, NSDate, NSDateFormatter, NSDateFormatterStyle, NSDictionary,
-    NSError, NSString,
+    NSError, NSNumber, NSString,
 };
 use objc2_web_kit::{WKSnapshotConfiguration, WKWebView};
 
@@ -179,7 +179,63 @@ pub fn snapshot(webview: &WKWebView, done: impl FnOnce(Option<Vec<u8>>) + 'stati
     // WebKit calls it once on the main thread.
     unsafe {
         let configuration = WKSnapshotConfiguration::new(mtm);
+        let bounds = webview.bounds();
+        let scale = webview
+            .window()
+            .map_or(1.0, |window| window.backingScaleFactor());
+        if let Some(width) = snapshot_width(bounds.size.width, bounds.size.height, scale) {
+            configuration.setSnapshotWidth(Some(&NSNumber::new_f64(width)));
+        }
+        // These images temporarily stand in for the already-painted page
+        // under browser overlays. Waiting for another page paint adds latency.
+        configuration.setAfterScreenUpdates(false);
         webview.takeSnapshotWithConfiguration_completionHandler(Some(&configuration), &handler);
+    }
+}
+
+/// Bound transient overlay images to approximately one 1080p frame. A
+/// Retina or very large window otherwise multiplies JPEG work and GPU memory.
+fn snapshot_width(width: f64, height: f64, scale: f64) -> Option<f64> {
+    if !width.is_finite()
+        || !height.is_finite()
+        || !scale.is_finite()
+        || width <= 0.0
+        || height <= 0.0
+        || scale <= 0.0
+    {
+        return None;
+    }
+    let pixels_wide = width * scale;
+    let pixels_high = height * scale;
+    let ratio = (2048.0 / pixels_wide.max(pixels_high))
+        .min((2_097_152.0 / (pixels_wide * pixels_high)).sqrt())
+        .min(1.0);
+    Some(width * ratio)
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::snapshot_width;
+
+    #[test]
+    fn bounds_retina_and_large_overlay_images_without_upscaling() {
+        for (width, height, scale) in [
+            (900.0, 600.0, 1.0),
+            (900.0, 600.0, 2.0),
+            (2560.0, 1440.0, 2.0),
+            (900.0, 2400.0, 2.0),
+        ] {
+            let snapshot = snapshot_width(width, height, scale).unwrap();
+            let pixels_wide = snapshot * scale;
+            let pixels_high = pixels_wide * height / width;
+            assert!(snapshot <= width);
+            assert!(pixels_wide.max(pixels_high) <= 2048.0001);
+            assert!(pixels_wide * pixels_high <= 2_097_152.001);
+        }
+        assert_eq!(snapshot_width(900.0, 600.0, 1.0), Some(900.0));
+        assert_eq!(snapshot_width(800.0, 600.0, 2.0), Some(800.0));
+        assert_eq!(snapshot_width(0.0, 600.0, 2.0), None);
+        assert_eq!(snapshot_width(900.0, f64::NAN, 2.0), None);
     }
 }
 

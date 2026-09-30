@@ -4,11 +4,20 @@
 //! searches: what you typed, and your search engine's suggestions. Like the tab switcher, the list covers the page with a still
 //! of it, because GPUI can't draw over a live WebKit view.
 
-use std::{collections::HashMap, ops::Range, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    ops::Range,
+    rc::Rc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use gpui::{
-    Animation, AnimationExt, AnyElement, Bounds, Context, FontWeight, Image, ImageFormat, MouseButton, Pixels, SharedString, StyledText, Window,
-    div, img, prelude::*, px,
+    Animation, AnimationExt, AnyElement, Bounds, Context, FontWeight, Image, ImageFormat,
+    MouseButton, Pixels, SharedString, StyledText, Task, Window, div, img, prelude::*, px,
 };
 use unicode_segmentation::UnicodeSegmentation;
 use vampir::{Palette, color, lighting};
@@ -23,6 +32,7 @@ use crate::{
 /// Search suggestions shown at most, and history and bookmarks.
 const REMOTE_ROWS: usize = 4;
 const LOCAL_ROWS: usize = 5;
+const REMOTE_DELAY: Duration = Duration::from_millis(180);
 
 #[derive(Clone, PartialEq)]
 pub(crate) enum Suggestion {
@@ -47,6 +57,11 @@ pub(crate) struct SuggestState {
     /// Whatever the search engine suggested, and for what.
     remote: Vec<String>,
     remote_for: String,
+    /// Keep local matches when only the network suggestions change.
+    local: Vec<Suggestion>,
+    remote_worker: Option<RemoteWorker>,
+    /// Replacing this task cancels the previous debounce timer.
+    remote_later: Option<Task<()>>,
     rows: Vec<Suggestion>,
     highlight: Option<usize>,
     /// The highlight was moved there with the arrow keys, rather than being
@@ -63,18 +78,13 @@ pub(crate) struct SuggestState {
 /// An address without its scheme and `www.`, as it's matched against what's
 /// typed and completed.
 fn bare(url: &str) -> &str {
-    let rest = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-        .unwrap_or(url);
-    rest.strip_prefix("www.").unwrap_or(rest)
+    crate::history::bare_address(url)
 }
 
 /// Relevance before visit frequency: a word at the start of a title or
 /// hostname should beat an unrelated page that happens to contain the same
 /// letters in a long path. A subsequence still finds abbreviated names.
 fn field_score(word: &str, field: &str) -> Option<i32> {
-    let field = field.to_lowercase();
     if field.starts_with(word) {
         return Some(120);
     }
@@ -89,13 +99,30 @@ fn field_score(word: &str, field: &str) -> Option<i32> {
     if word.chars().count() < 2 {
         return None;
     }
-    vampir::fuzzy_score(word, &field).map(|score| (35 + score).clamp(1, 65))
+    vampir::fuzzy_score(word, field).map(|score| (35 + score).clamp(1, 65))
 }
 
-pub(crate) fn page_score(query: &str, title: &str, url: &str) -> Option<i32> {
+#[cfg(test)]
+fn page_score(query: &str, title: &str, url: &str) -> Option<i32> {
+    // Fold each field once per page, rather than again for every query word.
+    let title = title.to_lowercase();
+    let address = bare(url).to_lowercase();
+    page_score_fields(query, &title, &address)
+}
+
+pub(crate) fn page_score_fields(query: &str, title: &str, address: &str) -> Option<i32> {
     query.split_whitespace().try_fold(0, |total, word| {
         let title = field_score(word, title);
-        let address = field_score(word, bare(url)).map(|score| score - 8);
+        // Address scores carry an eight-point penalty. A title prefix
+        // already wins, and a title word boundary only loses to an address
+        // prefix; avoid the slower address/fuzzy scan in those cases.
+        if title == Some(120) {
+            return Some(total + 120);
+        }
+        if title == Some(105) {
+            return Some(total + if address.starts_with(word) { 112 } else { 105 });
+        }
+        let address = field_score(word, address).map(|score| score - 8);
         Some(total + title.into_iter().chain(address).max()?)
     })
 }
@@ -221,12 +248,8 @@ pub(crate) fn parse(body: &str) -> Vec<String> {
     strings(&value["data"]["items"], Some("value"))
 }
 
-fn fetch(template: &str, query: &str) -> Vec<String> {
+fn fetch(agent: &ureq::Agent, template: &str, query: &str) -> Vec<String> {
     let url = template.replace("%s", &settings::encode(query));
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(std::time::Duration::from_secs(3)))
-        .build()
-        .into();
     agent
         .get(&url)
         .call()
@@ -234,6 +257,223 @@ fn fetch(template: &str, query: &str) -> Vec<String> {
         .and_then(|mut response| response.body_mut().read_to_string().ok())
         .map(|body| parse(&body))
         .unwrap_or_default()
+}
+
+/// A suggestion session has one worker and one reusable HTTP client.
+/// While a request is in flight, later edits replace queued work; typing
+/// quickly never creates one thread and connection pool per character.
+struct RemoteWorker {
+    requests: Rc<crate::background::LatestWorker<(String, String)>>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl RemoteWorker {
+    fn new(sender: async_channel::Sender<BrowserEvent>) -> Self {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = cancelled.clone();
+        let mut agent = None;
+        let requests = Rc::new(crate::background::LatestWorker::new(
+            "search-suggestions",
+            move |(template, query): (String, String)| {
+                if worker_cancelled.load(Ordering::Acquire) {
+                    return;
+                }
+                let agent = agent.get_or_insert_with(|| {
+                    ureq::Agent::config_builder()
+                        .timeout_global(Some(Duration::from_secs(3)))
+                        .build()
+                        .into()
+                });
+                let found = fetch(agent, &template, &query);
+                if !worker_cancelled.load(Ordering::Acquire) {
+                    let _ = sender.try_send(BrowserEvent::Suggestions(query, found));
+                }
+            },
+        ));
+        Self {
+            requests,
+            cancelled,
+        }
+    }
+}
+
+impl Drop for RemoteWorker {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+}
+
+fn local_matches(
+    typed: &str,
+    bookmarks: &crate::bookmarks::Bookmarks,
+    history: &crate::history::History,
+) -> (Option<(String, String, String)>, Vec<Suggestion>) {
+    let lower = typed.to_lowercase();
+    let words: Vec<&str> = lower.split_whitespace().collect();
+    if words.is_empty() {
+        return (None, Vec::new());
+    }
+    struct Found<'a> {
+        url: &'a str,
+        title: &'a str,
+        bookmark: bool,
+        score: i32,
+        visits: u32,
+        recent: u64,
+        order: usize,
+        address: &'a str,
+    }
+    let mut found: Vec<Found> = Vec::new();
+    // Where each address is in `found`, to combine a bookmark and its visits.
+    let mut at: HashMap<&str, usize> = HashMap::new();
+    fn entry<'a>(
+        url: &'a str,
+        title: &'a str,
+        bookmark: bool,
+        score: i32,
+        visits: u32,
+        recent: u64,
+        order: usize,
+        address: &'a str,
+    ) -> Found<'a> {
+        Found {
+            url,
+            title,
+            bookmark,
+            score,
+            visits,
+            recent,
+            order,
+            address,
+        }
+    }
+    let bookmark_fields = bookmarks.scoring_fields();
+    for (bookmark, (title_lower, address_lower)) in
+        bookmarks.links().into_iter().zip(bookmark_fields.iter())
+    {
+        let Some(url) = bookmark.url.as_deref() else {
+            continue;
+        };
+        if let Some(score) = page_score_fields(&lower, title_lower, address_lower)
+            && !at.contains_key(url)
+        {
+            at.insert(url, found.len());
+            found.push(entry(
+                url,
+                &bookmark.title,
+                true,
+                score,
+                0,
+                0,
+                found.len(),
+                address_lower,
+            ));
+        }
+    }
+    for visit in history.recent(usize::MAX) {
+        let (title_lower, address_lower) = visit.search_fields();
+        let Some(score) = page_score_fields(&lower, title_lower, address_lower) else {
+            continue;
+        };
+        match at.get(visit.url.as_str()) {
+            Some(&index) => {
+                let item = &mut found[index];
+                if score > item.score {
+                    item.title = &visit.title;
+                    item.score = score;
+                }
+                item.visits = visit.visits;
+                item.recent = visit.last_visit;
+            }
+            None => {
+                at.insert(&visit.url, found.len());
+                found.push(entry(
+                    &visit.url,
+                    &visit.title,
+                    false,
+                    score,
+                    visit.visits,
+                    visit.last_visit,
+                    found.len(),
+                    address_lower,
+                ));
+            }
+        }
+    }
+    let compare = |a: &Found<'_>, b: &Found<'_>| {
+        page_rank(b.score, b.bookmark, b.visits, b.recent)
+            .cmp(&page_rank(a.score, a.bookmark, a.visits, a.recent))
+            .then(a.order.cmp(&b.order))
+    };
+    let bookmarked = |url: &str| found.iter().any(|f| f.url == url && f.bookmark);
+
+    // Completing: a single word the start of an address, finishing at
+    // the host unless what's typed already reaches into the path.
+    let completion = if words.len() == 1 && !typed.contains(char::is_whitespace) {
+        found
+            .iter()
+            .filter(|entry| {
+                let address = bare(entry.url);
+                let end = if lower.contains('/') {
+                    address.len()
+                } else {
+                    address.find('/').unwrap_or(address.len())
+                };
+                address[..end].trim_end_matches('/').len() >= typed.len()
+                    && entry.address.starts_with(&lower)
+            })
+            .min_by(|a, b| compare(a, b))
+            .map(|entry| {
+                let address = bare(entry.url);
+                let end = if lower.contains('/') {
+                    address.len()
+                } else {
+                    address.find('/').unwrap_or(address.len())
+                };
+                let full = address[..end].trim_end_matches('/');
+                let target = if lower.contains('/') {
+                    entry.url.to_owned()
+                } else {
+                    url::Url::parse(entry.url)
+                        .map(|u| match u.scheme() {
+                            "http" | "https" => format!("{}/", u.origin().ascii_serialization()),
+                            scheme => format!("{scheme}://{}/", u.host_str().unwrap_or_default()),
+                        })
+                        .unwrap_or_else(|_| entry.url.to_owned())
+                };
+                (full.to_owned(), target, entry.title.to_owned())
+            })
+    } else {
+        None
+    };
+    // The page the field completes to leads, then the rest.
+    let mut rows: Vec<Suggestion> = completion
+        .as_ref()
+        .map(|(_, target, title)| Suggestion::Page {
+            url: target.clone(),
+            title: title.clone(),
+            bookmark: bookmarked(target),
+        })
+        .into_iter()
+        .collect();
+    found.retain(|entry| {
+        completion.as_ref().is_none_or(|(_, target, _)| {
+            target.trim_end_matches('/') != entry.url.trim_end_matches('/')
+        })
+    });
+    // Only five rows will be drawn. Select those before sorting so a large
+    // history does not need a full sort on every address-field edit.
+    if found.len() > LOCAL_ROWS {
+        found.select_nth_unstable_by(LOCAL_ROWS, compare);
+        found.truncate(LOCAL_ROWS);
+    }
+    found.sort_unstable_by(compare);
+    rows.extend(found.into_iter().map(|entry| Suggestion::Page {
+        url: entry.url.to_owned(),
+        title: entry.title.to_owned(),
+        bookmark: entry.bookmark,
+    }));
+    (completion, rows)
 }
 
 impl Browser {
@@ -248,127 +488,7 @@ impl Browser {
     /// Pages from history and bookmarks matching `typed`, best first, and
     /// what the field should complete to, if one's address starts with it.
     fn local_matches(&self, typed: &str) -> (Option<(String, String, String)>, Vec<Suggestion>) {
-        let lower = typed.to_lowercase();
-        let words: Vec<&str> = lower.split_whitespace().collect();
-        if words.is_empty() {
-            return (None, Vec::new());
-        }
-        struct Found {
-            url: String,
-            title: String,
-            bookmark: bool,
-            score: i32,
-            visits: u32,
-            recent: u64,
-            /// The address without its scheme and `www.`, lowercased.
-            address: String,
-        }
-        let bookmarks = self.bookmarks();
-        let history = self.history();
-        let mut found: Vec<Found> = Vec::new();
-        // Where each address is in `found`, to combine a bookmark and its visits.
-        let mut at: HashMap<String, usize> = HashMap::new();
-        let entry = |url: &str, title: &str, bookmark: bool, score: i32, visits: u32, recent: u64| Found {
-            url: url.to_owned(),
-            title: title.to_owned(),
-            bookmark,
-            score,
-            visits,
-            recent,
-            address: bare(url).to_lowercase(),
-        };
-        for bookmark in bookmarks.links() {
-            let Some(url) = bookmark.url.as_deref() else {
-                continue;
-            };
-            if let Some(score) = page_score(&lower, &bookmark.title, url)
-                && !at.contains_key(url)
-            {
-                at.insert(url.to_owned(), found.len());
-                found.push(entry(url, &bookmark.title, true, score, 0, 0));
-            }
-        }
-        for visit in history.recent(usize::MAX) {
-            let Some(score) = page_score(&lower, &visit.title, &visit.url) else {
-                continue;
-            };
-            match at.get(visit.url.as_str()) {
-                Some(&index) => {
-                    let item = &mut found[index];
-                    if score > item.score {
-                        item.title = visit.title.clone();
-                        item.score = score;
-                    }
-                    item.visits = visit.visits;
-                    item.recent = visit.last_visit;
-                }
-                None => {
-                    at.insert(visit.url.clone(), found.len());
-                    found.push(entry(&visit.url, &visit.title, false, score, visit.visits, visit.last_visit));
-                }
-            }
-        }
-        found.sort_by_key(|item| std::cmp::Reverse(page_rank(item.score, item.bookmark, item.visits, item.recent)));
-        let bookmarked = |url: &str| found.iter().any(|f| f.url == url && f.bookmark);
-
-        // Completing: a single word the start of an address, finishing at
-        // the host unless what's typed already reaches into the path.
-        let mut completion = None;
-        if words.len() == 1 && !typed.contains(char::is_whitespace) {
-            for entry in &found {
-                if !entry.address.starts_with(&lower) {
-                    continue;
-                }
-                let address = bare(&entry.url);
-                let end = if lower.contains('/') {
-                    address.len()
-                } else {
-                    address.find('/').unwrap_or(address.len())
-                };
-                let full = address[..end].trim_end_matches('/');
-                if full.len() >= typed.len() {
-                    let target = if lower.contains('/') {
-                        entry.url.clone()
-                    } else {
-                        url::Url::parse(&entry.url)
-                            // The site's front page, port and all.
-                            .map(|u| match u.scheme() {
-                                "http" | "https" => format!("{}/", u.origin().ascii_serialization()),
-                                scheme => format!("{scheme}://{}/", u.host_str().unwrap_or_default()),
-                            })
-                            .unwrap_or_else(|_| entry.url.clone())
-                    };
-                    completion = Some((full.to_owned(), target, entry.title.clone()));
-                    break;
-                }
-            }
-        }
-        // The page the field completes to leads, then the rest.
-        let mut rows: Vec<Suggestion> = completion
-            .as_ref()
-            .map(|(_, target, title)| Suggestion::Page {
-                url: target.clone(),
-                title: title.clone(),
-                bookmark: bookmarked(target),
-            })
-            .into_iter()
-            .collect();
-        rows.extend(
-            found
-                .into_iter()
-                .filter(|entry| {
-                    completion.as_ref().is_none_or(|(_, target, _)| {
-                        target.trim_end_matches('/') != entry.url.trim_end_matches('/')
-                    })
-                })
-                .take(LOCAL_ROWS)
-                .map(|entry| Suggestion::Page {
-                    url: entry.url,
-                    title: entry.title,
-                    bookmark: entry.bookmark,
-                }),
-        );
-        (completion, rows)
+        local_matches(typed, &self.bookmarks(), &self.history())
     }
 
     /// The rows for what's typed: history and bookmarks, then searches.
@@ -442,6 +562,9 @@ impl Browser {
             typed: String::new(),
             remote: Vec::new(),
             remote_for: String::new(),
+            local: Vec::new(),
+            remote_worker: None,
+            remote_later: None,
             rows: Vec::new(),
             highlight: None,
             picked: false,
@@ -452,15 +575,26 @@ impl Browser {
         state.typed = text.clone();
         state.highlight = highlight;
         state.picked = false;
+        state.local = rows
+            .iter()
+            .take_while(|row| matches!(row, Suggestion::Page { .. }))
+            .cloned()
+            .collect();
         state.rows = rows;
+        state.remote_later = None;
         if remote_wanted && state.remote_for != text {
             let template = endpoint(&self.settings);
-            let sender = self.sender.clone();
+            let worker = state
+                .remote_worker
+                .get_or_insert_with(|| RemoteWorker::new(self.sender.clone()));
+            let requests = worker.requests.clone();
             let query = text.clone();
-            std::thread::spawn(move || {
-                let found = fetch(&template, &query);
-                let _ = sender.try_send(BrowserEvent::Suggestions(query, found));
-            });
+            state.remote_later = Some(cx.spawn(async move |_, cx| {
+                cx.background_executor().timer(REMOTE_DELAY).await;
+                requests.submit((template, query));
+            }));
+        } else if !remote_wanted {
+            state.remote_worker = None;
         }
         self.cover_page_for_suggestions();
         cx.notify();
@@ -483,7 +617,14 @@ impl Browser {
         }
         state.remote = found;
         state.remote_for = query;
-        self.rebuild_suggestions(cx);
+        let typed = state.typed.clone();
+        let local = state.local.clone();
+        let rows = self.rows_for(&typed, local);
+        if let Some(state) = &mut self.suggest {
+            state.rows = rows;
+            state.highlight = state.highlight.filter(|&h| h < state.rows.len());
+        }
+        cx.notify();
     }
 
     /// The rows again for what's typed, without completing again.
@@ -492,8 +633,9 @@ impl Browser {
             return;
         };
         let (_, local) = self.local_matches(&typed);
-        let rows = self.rows_for(&typed, local);
+        let rows = self.rows_for(&typed, local.clone());
         if let Some(state) = &mut self.suggest {
+            state.local = local;
             state.rows = rows;
             state.highlight = state.highlight.filter(|&h| h < state.rows.len());
         }
@@ -846,12 +988,81 @@ mod tests {
     }
 
     #[test]
+    fn local_ranking_keeps_ties_in_tree_order_and_merges_history() {
+        let bookmarks = crate::bookmarks::Bookmarks::new(
+            (0..12)
+                .map(|i| {
+                    crate::bookmarks::Node::link("Rust Docs", format!("https://example.org/{i}"))
+                })
+                .collect(),
+        );
+        let mut history = crate::history::History::default();
+        history.record("https://example.org/8", "Rust Docs");
+        let (completion, rows) = local_matches("rust docs", &bookmarks, &history);
+        assert!(completion.is_none());
+        let urls: Vec<&str> = rows.iter().map(Suggestion::fill).collect();
+        assert_eq!(
+            urls,
+            [
+                "https://example.org/8",
+                "https://example.org/0",
+                "https://example.org/1",
+                "https://example.org/2",
+                "https://example.org/3"
+            ]
+        );
+        assert!(
+            rows.iter()
+                .all(|row| matches!(row, Suggestion::Page { bookmark: true, .. }))
+        );
+    }
+
+    #[test]
+    fn address_completion_finds_prefix_beyond_the_top_local_rows() {
+        let mut nodes: Vec<_> = (0..12)
+            .map(|i| crate::bookmarks::Node::link("Rust", format!("https://example.org/{i}")))
+            .collect();
+        nodes.push(crate::bookmarks::Node::link(
+            "Documentation",
+            "https://rust-lang.org/learn",
+        ));
+        let bookmarks = crate::bookmarks::Bookmarks::new(nodes);
+        let history = crate::history::History::default();
+        let (completion, rows) = local_matches("rust", &bookmarks, &history);
+        assert_eq!(
+            completion,
+            Some((
+                "rust-lang.org".into(),
+                "https://rust-lang.org/".into(),
+                "Documentation".into()
+            ))
+        );
+        assert_eq!(rows.len(), LOCAL_ROWS + 1);
+        assert_eq!(rows[0].fill(), "https://rust-lang.org/");
+        let (completion, rows) = local_matches("rust-lang.org/le", &bookmarks, &history);
+        assert_eq!(completion.unwrap().1, "https://rust-lang.org/learn");
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
     fn fuzzy_pages_rank_title_and_host_prefixes() {
         assert!(page_score("hack", "Hacker News", "https://news.ycombinator.com/")
             > page_score("hack", "Unrelated", "https://example.org/a-hack"));
         assert!(page_score("hn", "Hacker News", "https://news.ycombinator.com/").is_some());
         assert!(page_score("hacker news", "Hacker News", "https://news.ycombinator.com/").is_some());
         assert!(page_score("xyz", "Hacker News", "https://news.ycombinator.com/").is_none());
+        assert_eq!(
+            page_score("rust", "Rust documentation", "https://rust-lang.org/"),
+            Some(120)
+        );
+        assert_eq!(
+            page_score("rust", "Learn Rust", "https://rust-lang.org/"),
+            Some(112)
+        );
+        assert_eq!(
+            page_score("rust", "Learn Rust", "https://example.org/rust"),
+            Some(105)
+        );
     }
 
     #[test]

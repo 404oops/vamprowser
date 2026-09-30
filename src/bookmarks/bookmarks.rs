@@ -7,6 +7,8 @@
 //! and export.
 
 use std::{
+    cell::{Ref, RefCell},
+    collections::HashMap,
     fmt::Write as _,
     path::{Path, PathBuf},
 };
@@ -63,11 +65,20 @@ pub type Folder = Option<u64>;
 pub struct Bookmarks {
     root: Vec<Node>,
     next_id: u64,
+    /// The toolbar asks whether the current URL is bookmarked each frame.
+    /// Rebuild only after the tree's URLs or order change.
+    url_ids: RefCell<Option<HashMap<String, u64>>>,
+    scoring_fields: RefCell<Option<Vec<(String, String)>>>,
+    revision: u64,
 }
 
 impl Bookmarks {
     pub fn new(root: Vec<Node>) -> Self {
-        let mut this = Self { root, next_id: 1 };
+        let mut this = Self {
+            root,
+            next_id: 1,
+            ..Self::default()
+        };
         let mut next = this.next_id;
         number(&mut this.root, &mut next);
         this.next_id = next;
@@ -81,6 +92,40 @@ impl Bookmarks {
 
     pub fn is_empty(&self) -> bool {
         self.root.is_empty()
+    }
+
+    fn changed(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+        self.url_ids.get_mut().take();
+        self.scoring_fields.get_mut().take();
+    }
+
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Lowercased title/URL fields in the same depth-first order as links.
+    /// History and bookmark suggestions reuse these across typed queries.
+    pub(crate) fn scoring_fields(&self) -> Ref<'_, [(String, String)]> {
+        let mut fields = self.scoring_fields.borrow_mut();
+        if fields.is_none() {
+            *fields = Some(
+                self.links()
+                    .into_iter()
+                    .map(|node| {
+                        (
+                            node.title.to_lowercase(),
+                            crate::history::bare_address(node.url.as_deref().unwrap_or_default())
+                                .to_lowercase(),
+                        )
+                    })
+                    .collect(),
+            );
+        }
+        drop(fields);
+        Ref::map(self.scoring_fields.borrow(), |fields| {
+            fields.as_deref().expect("initialized above")
+        })
     }
 
     /// Every link, depth first, in order.
@@ -158,15 +203,61 @@ impl Bookmarks {
     /// The link to `url`, anywhere in the tree.
     pub fn find_url(&self, url: &str) -> Option<u64> {
         let url = url.trim_end_matches('/');
-        self.links()
-            .into_iter()
-            .find(|node| node.url.as_deref().is_some_and(|u| u.trim_end_matches('/') == url))
-            .map(|node| node.id)
+        let mut cache = self.url_ids.borrow_mut();
+        if cache.is_none() {
+            let mut ids = HashMap::new();
+            walk(&self.root, &mut |node, _| {
+                if let Some(url) = &node.url {
+                    ids.entry(url.trim_end_matches('/').to_owned())
+                        .or_insert(node.id);
+                }
+            });
+            *cache = Some(ids);
+        }
+        cache.as_ref().and_then(|ids| ids.get(url)).copied()
+    }
+
+    /// Matching links, their folder paths and parents, in tree order.
+    /// Carrying the parent while walking avoids searching the whole tree
+    /// again for each result in the bookmark manager.
+    pub fn search_with_paths(&self, words: &[&str]) -> Vec<(&Node, String, Folder)> {
+        fn go<'a>(
+            nodes: &'a [Node],
+            path: &str,
+            parent: Folder,
+            words: &[&str],
+            haystack: &mut String,
+            out: &mut Vec<(&'a Node, String, Folder)>,
+        ) {
+            for node in nodes {
+                if node.is_folder() {
+                    let inner = if path.is_empty() {
+                        node.title.clone()
+                    } else {
+                        format!("{path} › {}", node.title)
+                    };
+                    go(&node.children, &inner, Some(node.id), words, haystack, out);
+                } else {
+                    crate::history::haystack_into(
+                        haystack,
+                        &node.title,
+                        node.url.as_deref().unwrap_or_default(),
+                    );
+                    if crate::history::matches_words(haystack, words) {
+                        out.push((node, path.to_owned(), parent));
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        go(&self.root, "", None, words, &mut String::new(), &mut out);
+        out
     }
 
     /// Adds `node` (and anything in it) to a folder, at `index` or at the
     /// end. Returns its id.
     pub fn add(&mut self, folder: Folder, index: Option<usize>, mut node: Node) -> u64 {
+        self.changed();
         let mut next = self.next_id;
         number(std::slice::from_mut(&mut node), &mut next);
         self.next_id = next;
@@ -188,17 +279,29 @@ impl Bookmarks {
             }
             nodes.iter_mut().find_map(|node| go(&mut node.children, id))
         }
-        go(&mut self.root, id)
+        let removed = go(&mut self.root, id);
+        if removed.is_some() {
+            self.changed();
+        }
+        removed
     }
 
     pub fn rename(&mut self, id: u64, title: &str) -> bool {
-        self.get_mut(id).map(|node| node.title = title.to_owned()).is_some()
+        let renamed = self
+            .get_mut(id)
+            .map(|node| node.title = title.to_owned())
+            .is_some();
+        if renamed {
+            self.changed();
+        }
+        renamed
     }
 
     pub fn set_url(&mut self, id: u64, url: &str) -> bool {
         match self.get_mut(id) {
             Some(node) if !node.is_folder() => {
                 node.url = Some(url.to_owned());
+                self.changed();
                 true
             }
             _ => false,
@@ -273,6 +376,7 @@ impl Bookmarks {
         }
         let node = list.remove(from);
         list.insert(to as usize, node);
+        self.changed();
         true
     }
 
@@ -663,6 +767,59 @@ mod tests {
         let docs = b.folders().iter().find(|f| f.1 == "Docs").unwrap().0;
         assert_eq!(b.parent_of(c), Some(Some(docs)));
         assert_eq!(b.folders().iter().map(|f| f.2).collect::<Vec<_>>(), [0, 1]);
+    }
+
+    #[test]
+    fn search_reports_paths_and_parents_without_relooking_up_nodes() {
+        let b = tree();
+        let docs = b.folders()[1].0;
+        let found = b.search_with_paths(&["c.example"]);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0.title, "C");
+        assert_eq!(found[0].1, "Work › Docs");
+        assert_eq!(found[0].2, Some(docs));
+        assert!(b.search_with_paths(&["c.example", "missing"]).is_empty());
+        assert_eq!(b.search_with_paths(&[]).len(), 4);
+    }
+
+    #[test]
+    fn cached_scoring_fields_follow_renames_urls_and_tree_order() {
+        let mut b = tree();
+        let a = b.root()[0].id;
+        assert_eq!(b.scoring_fields()[0].0, "a");
+        let revision = b.revision();
+        b.rename(a, "ΟΣ İ");
+        assert!(b.revision() > revision);
+        assert_eq!(b.scoring_fields()[0].0, "ος i\u{307}");
+        b.set_url(a, "https://www.renamed.example/");
+        assert_eq!(b.scoring_fields()[0].1, "renamed.example/");
+        b.shift(a, 1);
+        assert_eq!(b.scoring_fields()[0].0, "b");
+        b.remove(a);
+        assert_eq!(b.scoring_fields().len(), 3);
+    }
+
+    #[test]
+    fn url_lookup_follows_edits_removals_and_duplicate_order() {
+        let mut b = Bookmarks::new(vec![
+            Node::link("First", "https://same.example/"),
+            Node::folder("Folder", vec![Node::link("Second", "https://same.example")]),
+        ]);
+        let first = b.root()[0].id;
+        let folder = b.root()[1].id;
+        let second = b.children(Some(folder))[0].id;
+        assert_eq!(b.find_url("https://same.example///"), Some(first));
+        assert!(b.shift(first, 1));
+        assert_eq!(b.find_url("https://same.example"), Some(second));
+        assert!(b.set_url(second, "https://different.example/"));
+        assert_eq!(b.find_url("https://same.example"), Some(first));
+        assert_eq!(b.find_url("https://different.example"), Some(second));
+        b.remove(first).unwrap();
+        assert_eq!(b.find_url("https://same.example"), None);
+        let added = b.add(None, None, Node::link("Added", "https://same.example"));
+        assert_eq!(b.find_url("https://same.example/"), Some(added));
+        assert!(b.move_to(added, Some(folder), Some(0)));
+        assert_eq!(b.find_url("https://same.example"), Some(added));
     }
 
     #[test]

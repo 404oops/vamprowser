@@ -20,7 +20,7 @@ use std::{
 use serde_json::Value;
 
 /// Bumped whenever [`apply`] learns something new.
-const VERSION: u32 = 18;
+const VERSION: u32 = 19;
 const MARKER: &str = ".vamprowser-compat";
 const SCRIPT_FILE: &str = "vamprowser-compat.js";
 const WORKER_FILE: &str = "vamprowser-worker.js";
@@ -494,9 +494,20 @@ fn files(dir: &Path) -> io::Result<Vec<PathBuf>> {
 /// that use idle callbacks: those include web-accessible scripts an add-on
 /// injects into pages (Proton Pass's autofill dropdown), where [`SCRIPT`]
 /// never loads.
-const IDLE_POLYFILL: &str = "/*vamprowser-idle*/if(typeof requestIdleCallback!=='function'){\
+const PREVIOUS_IDLE_POLYFILL: &str = "/*vamprowser-idle*/if(typeof requestIdleCallback!=='function'){\
 globalThis.requestIdleCallback=function(c){var s=Date.now();return setTimeout(function(){\
 c({didTimeout:false,timeRemaining:function(){return Math.max(0,50-(Date.now()-s))}})},1)};\
+globalThis.cancelIdleCallback=function(i){clearTimeout(i)}}\n";
+
+// WebKit has no native idle callback in some extension contexts. Yield a
+// frame between batches and keep each batch below a typical frame. The deadline
+// starts when the callback runs, so time spent queued cannot starve an
+// extension into an endless stream of zero-budget callbacks.
+const IDLE_POLYFILL: &str = "/*vamprowser-idle*/if(typeof requestIdleCallback!=='function'){\
+globalThis.requestIdleCallback=function(c,o){var q=Date.now(),t=o&&typeof o.timeout==='number'\
+&&isFinite(o.timeout)?Math.max(0,o.timeout):Infinity;return setTimeout(function(){\
+var s=Date.now(),d=s-q>=t;c({didTimeout:d,timeRemaining:function(){\
+return d?0:Math.max(0,8-(Date.now()-s))}})},Math.min(16,t))};\
 globalThis.cancelIdleCallback=function(i){clearTimeout(i)}}\n";
 
 /// Prepends a UTF-8 byte-order mark to a non-ASCII script or style sheet
@@ -506,11 +517,18 @@ fn prepare_source(file: &Path, script: bool) -> io::Result<()> {
     let data = fs::read(file)?;
     let marked = data.starts_with(BOM);
     let body = data.strip_prefix(BOM).unwrap_or(&data);
+    let previous = if script {
+        body.strip_prefix(PREVIOUS_IDLE_POLYFILL.as_bytes())
+    } else {
+        None
+    };
+    let body = previous.unwrap_or(body);
     let polyfill = script
-        && !body.starts_with(b"/*vamprowser-idle*/")
-        && body
-            .windows(b"requestIdleCallback".len())
-            .any(|w| w == b"requestIdleCallback");
+        && !body.starts_with(IDLE_POLYFILL.as_bytes())
+        && (previous.is_some()
+            || body
+                .windows(b"requestIdleCallback".len())
+                .any(|w| w == b"requestIdleCallback"));
     // Plain ASCII decodes the same either way; it gets no mark.
     let mark = !marked && !body.is_ascii();
     if !polyfill && !mark {
@@ -631,6 +649,19 @@ fn fill_empty_commands(manifest: &mut Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upgrades_idle_callback_budget_without_changing_extension_code() {
+        let file = std::env::temp_dir().join(format!("vamp-idle-upgrade-{}.js", std::process::id()));
+        let source = "requestIdleCallback(run); // ©";
+        fs::write(&file, [BOM, PREVIOUS_IDLE_POLYFILL.as_bytes(), source.as_bytes()].concat()).unwrap();
+        prepare_source(&file, true).unwrap();
+        let once = fs::read(&file).unwrap();
+        assert_eq!(once, [BOM, IDLE_POLYFILL.as_bytes(), source.as_bytes()].concat());
+        prepare_source(&file, true).unwrap();
+        assert_eq!(fs::read(&file).unwrap(), once);
+        let _ = fs::remove_file(file);
+    }
 
     fn temp_extension(manifest: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

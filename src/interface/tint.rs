@@ -119,7 +119,10 @@ pub fn dominant_tint(pixels: impl Iterator<Item = [u8; 4]>) -> Option<Tint> {
 
 /// OKLCH chroma and hue in degrees of an sRGB colour.
 fn oklch(r: u8, g: u8, b: u8) -> (f64, f64) {
-    let [r, g, b] = [r, g, b].map(|v| srgb_to_linear(f64::from(v) / 255.0));
+    static LINEAR: std::sync::OnceLock<[f64; 256]> = std::sync::OnceLock::new();
+    let linear =
+        LINEAR.get_or_init(|| std::array::from_fn(|value| srgb_to_linear(value as f64 / 255.0)));
+    let [r, g, b] = [r, g, b].map(|value| linear[usize::from(value)]);
     let l = (0.412_221_470_8 * r + 0.536_332_536_3 * g + 0.051_445_992_9 * b).cbrt();
     let m = (0.211_903_498_2 * r + 0.680_699_545_1 * g + 0.107_396_956_6 * b).cbrt();
     let s = (0.088_302_461_9 * r + 0.281_718_837_6 * g + 0.629_978_700_5 * b).cbrt();

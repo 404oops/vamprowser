@@ -2165,6 +2165,14 @@ impl Browser {
 
     // ---- Downloads ----------------------------------------------------------
 
+    fn download_file_size(&self, item: &crate::downloads::Download) -> Option<Option<u64>> {
+        let size = item.file_size();
+        if size.is_none() {
+            self.download_sizes_pending.set(true);
+        }
+        size
+    }
+
     /// A download's right-click menu, built when it's asked for, so the
     /// rows drawing it needn't keep a copy of the download.
     fn download_menu(&self, id: u64) -> Vec<(MenuEntry, Option<Command>)> {
@@ -2274,10 +2282,10 @@ impl Browser {
         for item in downloads.shelf(self.serial).take(8) {
             let id = item.id;
             let status = match item.state {
-                DownloadState::InProgress => item.file_size().flatten()
+                DownloadState::InProgress => self.download_file_size(item).flatten()
                     .map(|size| file_size(size))
                     .unwrap_or_else(|| "Starting…".to_owned()),
-                DownloadState::Done => match item.file_size() {
+                DownloadState::Done => match self.download_file_size(item) {
                     Some(Some(size)) => file_size(size),
                     Some(None) => "Moved or deleted".to_owned(),
                     None => String::new(),
@@ -2513,7 +2521,7 @@ impl Browser {
             }
             let id = item.id;
             // For active downloads, read WebKit's temporary file.
-            let looked = item.file_size();
+            let looked = self.download_file_size(item);
             let size = looked.flatten();
             let exists = if item.state == DownloadState::InProgress {
                 size.is_some()

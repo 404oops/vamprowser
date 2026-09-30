@@ -685,6 +685,10 @@ impl Browser {
                 |this, cx| this.clear_website_data(cx),
             ),
             Command::ExportBrowserData => {
+                self.persist();
+                self.for_other_windows(cx, |browser, _| browser.persist());
+                self.history().save();
+                self.common.state_writer.flush();
                 let sender = self.common.anywhere.clone();
                 cx.spawn_in(window, async move |_, _| {
                     let Some(path) = crate::native::choose_save_path("Vamprowser Data.zip") else {

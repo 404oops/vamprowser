@@ -130,6 +130,7 @@ struct Shared {
     _delegate: Retained<ControllerDelegate>,
     window: Retained<ExtensionWindow>,
     state: RefCell<State>,
+    background_timer: RefCell<Option<Retained<NSTimer>>>,
     events: Box<dyn Fn(ExtensionEvent)>,
 }
 
@@ -181,6 +182,10 @@ struct Entry {
     /// The action icon rendered for each tab (`None` for no tab), since the
     /// toolbar asks for it every frame.
     action_icons: HashMap<Option<u64>, ActionIcon>,
+    /// The remaining action properties also stay unchanged between WebKit's
+    /// action notifications. Avoid Objective-C calls and string conversion
+    /// on every toolbar render.
+    action_info: HashMap<Option<u64>, ActionInfo>,
 }
 
 impl Entry {
@@ -202,6 +207,7 @@ impl Entry {
             context: None,
             load_error,
             action_icons: HashMap::new(),
+            action_info: HashMap::new(),
         }
     }
 
@@ -216,11 +222,15 @@ impl Entry {
         };
         match tab {
             Some(tab) => {
+                self.action_info.remove(&Some(tab));
                 if !self.action_icons.get(&Some(tab)).is_some_and(same) {
                     self.action_icons.remove(&Some(tab));
                 }
             }
-            None => self.action_icons.retain(|_, cached| same(cached)),
+            None => {
+                self.action_info.clear();
+                self.action_icons.retain(|_, cached| same(cached));
+            }
         }
     }
 }
@@ -230,6 +240,15 @@ struct ActionIcon {
     /// it: WebKit caches its icons, and the same object means the same icon.
     source: Option<Retained<NSImage>>,
     image: Option<Arc<gpui::Image>>,
+}
+
+enum ActionCandidate {
+    Cached(ActionInfo),
+    Read {
+        id: String,
+        context: Retained<WKWebExtensionContext>,
+        icon: Option<Option<Arc<gpui::Image>>>,
+    },
 }
 
 /// `extensions.json`: which extensions are enabled, in list order.
@@ -378,12 +397,12 @@ impl Extensions {
                 _delegate: delegate,
                 window: ExtensionWindow::new(mtm, weak.clone()),
                 state: RefCell::default(),
+                background_timer: RefCell::default(),
                 events: Box::new(events),
             }
         });
         let this = Self { shared };
         this.load_installed(background);
-        this.keep_backgrounds_awake();
         this
     }
 
@@ -651,6 +670,7 @@ impl Extensions {
             }
             entry.enabled = enabled;
             entry.action_icons.clear();
+            entry.action_info.clear();
             Some(entry.context.clone())
         });
         let Some(context) = changed.flatten() else {
@@ -695,13 +715,26 @@ impl Extensions {
                 .iter()
                 .filter(|e| e.enabled && e.manifest.has_action)
                 .filter_map(|e| {
-                    let cached = e.action_icons.get(&tab_id).map(|icon| icon.image.clone());
-                    Some((e.id.clone(), e.context.clone()?, cached))
+                    if let Some(info) = e.action_info.get(&tab_id) {
+                        return Some(ActionCandidate::Cached(info.clone()));
+                    }
+                    Some(ActionCandidate::Read {
+                        id: e.id.clone(),
+                        context: e.context.clone()?,
+                        icon: e.action_icons.get(&tab_id).map(|icon| icon.image.clone()),
+                    })
                 })
                 .collect()
         };
         let mut actions = Vec::new();
-        for (id, context, cached) in candidates {
+        for candidate in candidates {
+            let (id, context, cached) = match candidate {
+                ActionCandidate::Cached(info) => {
+                    actions.push(info);
+                    continue;
+                }
+                ActionCandidate::Read { id, context, icon } => (id, context, icon),
+            };
             // SAFETY: reads on a live context; the tab is ours.
             let action = unsafe {
                 if !context.isLoaded() {
@@ -731,13 +764,17 @@ impl Extensions {
             // SAFETY: plain property reads.
             let (label, badge, enabled) =
                 unsafe { (action.label(), action.badgeText(), action.isEnabled()) };
-            actions.push(ActionInfo {
+            let info = ActionInfo {
                 extension_id: id,
                 label: label.to_string(),
                 icon,
                 badge: badge.to_string(),
                 enabled,
+            };
+            self.shared.with_entry(&info.extension_id, |entry| {
+                entry.action_info.insert(tab_id, info.clone());
             });
+            actions.push(info);
         }
         actions
     }
@@ -789,50 +826,6 @@ impl Extensions {
         // SAFETY: a live context and a block of the documented type, called
         // once on the main thread.
         unsafe { context.loadBackgroundContentWithCompletionHandler(&run) };
-    }
-
-    /// WebKit unloads an idle Manifest V3 background, then turns away the
-    /// next runtime.connect from a page or popup instead of waking it —
-    /// Proton Pass's autofill and popup both connect first. Firefox add-ons
-    /// don't expect that, so backgrounds are kept loaded. Persistent ones
-    /// (Manifest V2 background pages) stay loaded anyway.
-    fn keep_backgrounds_awake(&self) {
-        let shared = Rc::downgrade(&self.shared);
-        let done = RcBlock::new(|_error: *mut NSError| {});
-        let tick = RcBlock::new(move |timer: std::ptr::NonNull<NSTimer>| {
-            let Some(shared) = shared.upgrade() else {
-                // SAFETY: the timer is live during its own callback.
-                unsafe { timer.as_ref() }.invalidate();
-                return;
-            };
-            let contexts: Vec<_> = shared
-                .state
-                .borrow()
-                .entries
-                .iter()
-                .filter_map(|e| e.context.clone())
-                .collect();
-            for context in contexts {
-                // SAFETY: plain reads, then as in `perform_action`; loading
-                // is a no-op when the background already runs. A disabled
-                // extension's context isn't loaded.
-                unsafe {
-                    let extension = context.webExtension();
-                    if context.isLoaded()
-                        && extension.hasBackgroundContent()
-                        && !extension.hasPersistentBackgroundContent()
-                    {
-                        context.loadBackgroundContentWithCompletionHandler(&done);
-                    }
-                }
-            }
-        });
-        // SAFETY: a repeating main-run-loop timer with a block of the
-        // documented type.
-        let timer =
-            unsafe { NSTimer::scheduledTimerWithTimeInterval_repeats_block(15.0, true, &tick) };
-        // Nothing needs it on the dot; slack lets the system batch wakeups.
-        timer.setTolerance(3.0);
     }
 
     /// The browser opened a tab, whose page is in `webview` (made from
@@ -898,6 +891,7 @@ impl Extensions {
             }
             for entry in &mut state.entries {
                 entry.action_icons.remove(&Some(tab_id));
+                entry.action_info.remove(&Some(tab_id));
             }
             state.tabs.remove(index)
         };
@@ -928,6 +922,9 @@ impl Extensions {
                 return;
             };
             state.active = Some(tab_id);
+            for entry in &mut state.entries {
+                entry.action_info.remove(&Some(tab_id));
+            }
             (tab, previous)
         };
         // SAFETY: tabs WebKit was told about.
@@ -955,6 +952,9 @@ impl Extensions {
             changed |= WKWebExtensionTabChangedProperties::URL;
         }
         if changed != WKWebExtensionTabChangedProperties::None {
+            for entry in &mut self.shared.state.borrow_mut().entries {
+                entry.action_info.remove(&Some(tab_id));
+            }
             // SAFETY: a tab WebKit was told about.
             unsafe {
                 self.shared
@@ -1065,7 +1065,7 @@ impl Shared {
     /// Makes a context for a freshly read extension, grants it what it asks
     /// for, and loads it if enabled.
     fn finish_loading(
-        &self,
+        self: &Rc<Self>,
         id: &str,
         generation: u64,
         extension: Option<Retained<WKWebExtension>>,
@@ -1117,6 +1117,8 @@ impl Shared {
         let found = self.with_entry(id, |entry| {
             entry.context = Some(context.clone());
             entry.load_error = None;
+            entry.action_icons.clear();
+            entry.action_info.clear();
             if icon.is_some() {
                 entry.manifest.icon_png = icon;
             }
@@ -1131,7 +1133,7 @@ impl Shared {
     }
 
     /// Starts an extension running, noting any failure against it.
-    fn load(&self, id: &str, context: &WKWebExtensionContext) {
+    fn load(self: &Rc<Self>, id: &str, context: &WKWebExtensionContext) {
         // SAFETY: WebKit calls the delegate and the tab/window objects from
         // inside; nothing is borrowed across it.
         let result = unsafe { self.controller.loadExtensionContext_error(context) };
@@ -1139,13 +1141,89 @@ impl Shared {
             .err()
             .map(|error| error.localizedDescription().to_string());
         self.with_entry(id, |entry| entry.load_error = error);
+        self.update_background_timer();
     }
 
-    fn unload(&self, context: &WKWebExtensionContext) {
+    fn unload(self: &Rc<Self>, context: &WKWebExtensionContext) {
+        if let Some(id) = self.id_of(context) {
+            self.with_entry(&id, |entry| entry.action_info.clear());
+        }
         // SAFETY: as in `load`. Unloading one that isn't loaded is a
         // harmless error.
         let _ = unsafe { self.controller.unloadExtensionContext_error(context) };
+        self.update_background_timer();
         self.emit(ExtensionEvent::Changed);
+    }
+
+    fn transient_backgrounds(&self) -> Vec<Retained<WKWebExtensionContext>> {
+        let contexts: Vec<_> = self
+            .state
+            .borrow()
+            .entries
+            .iter()
+            .filter(|entry| entry.enabled)
+            .filter_map(|entry| entry.context.clone())
+            .collect();
+        contexts
+            .into_iter()
+            .filter(|context| {
+                // SAFETY: plain property reads, with no state borrow held.
+                unsafe {
+                    let extension = context.webExtension();
+                    context.isLoaded()
+                        && extension.hasBackgroundContent()
+                        && !extension.hasPersistentBackgroundContent()
+                }
+            })
+            .collect()
+    }
+
+    /// WebKit does not wake some MV3 backgrounds for runtime.connect.
+    /// Keep that workaround only while an enabled extension needs it;
+    /// browsers without one should have no periodic extension wakeups.
+    fn update_background_timer(self: &Rc<Self>) {
+        if self.transient_backgrounds().is_empty() {
+            if let Some(timer) = self.background_timer.borrow_mut().take() {
+                timer.invalidate();
+            }
+            return;
+        }
+        if self.background_timer.borrow().is_some() {
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        let done = RcBlock::new(|_error: *mut NSError| {});
+        let tick = RcBlock::new(move |timer: std::ptr::NonNull<NSTimer>| {
+            let Some(shared) = weak.upgrade() else {
+                // SAFETY: the timer stays live during its callback.
+                unsafe { timer.as_ref() }.invalidate();
+                return;
+            };
+            let contexts = shared.transient_backgrounds();
+            if contexts.is_empty() {
+                shared.background_timer.borrow_mut().take();
+                // SAFETY: as above.
+                unsafe { timer.as_ref() }.invalidate();
+                return;
+            }
+            for context in contexts {
+                // SAFETY: live, loaded contexts; no state borrow is held.
+                unsafe { context.loadBackgroundContentWithCompletionHandler(&done) };
+            }
+        });
+        // SAFETY: main run-loop timer with the documented block signature.
+        let timer =
+            unsafe { NSTimer::scheduledTimerWithTimeInterval_repeats_block(15.0, true, &tick) };
+        timer.setTolerance(3.0);
+        *self.background_timer.borrow_mut() = Some(timer);
+    }
+}
+
+impl Drop for Shared {
+    fn drop(&mut self) {
+        if let Some(timer) = self.background_timer.get_mut().take() {
+            timer.invalidate();
+        }
     }
 }
 
@@ -1237,6 +1315,46 @@ fn png_from_image(image: &NSImage) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn action_changes_invalidate_only_the_affected_tab_until_defaults_change() {
+        let mut entry = Entry::new(
+            "example".into(),
+            "origin".into(),
+            true,
+            Vec::new(),
+            Manifest::default(),
+            None,
+        );
+        for tab in [None, Some(1), Some(2)] {
+            entry.action_info.insert(
+                tab,
+                ActionInfo {
+                    extension_id: entry.id.clone(),
+                    label: "action".into(),
+                    icon: None,
+                    badge: "1".into(),
+                    enabled: true,
+                },
+            );
+            entry.action_icons.insert(
+                tab,
+                ActionIcon {
+                    source: None,
+                    image: None,
+                },
+            );
+        }
+        entry.action_updated(Some(1), None);
+        assert!(!entry.action_info.contains_key(&Some(1)));
+        assert!(entry.action_info.contains_key(&Some(2)));
+        assert!(entry.action_info.contains_key(&None));
+        // A badge/title change keeps the already rendered, unchanged icon.
+        assert_eq!(entry.action_icons.len(), 3);
+        entry.action_updated(None, None);
+        assert!(entry.action_info.is_empty());
+        assert_eq!(entry.action_icons.len(), 3);
+    }
 
     #[test]
     fn old_extension_registry_has_no_implicit_approvals() {

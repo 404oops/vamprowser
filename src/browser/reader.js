@@ -6,6 +6,17 @@
   }
 
   const cleanText = (text) => (text || '').replace(/\s+/g, ' ').trim();
+  // Nested article/main candidates share paragraphs and links. Reading
+  // innerText repeatedly forces WebKit to traverse the same rendered text.
+  let texts = new WeakMap();
+  const renderedText = (element) => {
+    if (!element) return '';
+    const cached = texts.get(element);
+    if (cached !== undefined) return cached;
+    const text = cleanText(element.innerText);
+    texts.set(element, text);
+    return text;
+  };
   const rejected = /(^|[\s_-])(ad|ads|advert|banner|breadcrumb|comment|cookie|footer|header|menu|nav|newsletter|paywall|promo|related|share|sidebar|social|subscribe|toolbar)([\s_-]|$)/i;
   const isRejected = (element) => rejected.test(`${element.id} ${typeof element.className === 'string' ? element.className : ''} ${element.getAttribute('role') || ''}`);
   const visible = (element) => {
@@ -15,11 +26,11 @@
   };
   const score = (element) => {
     if (!visible(element) || isRejected(element)) return -1;
-    const text = cleanText(element.innerText);
+    const text = renderedText(element);
     if (text.length < 160) return -1;
-    const paragraphs = [...element.querySelectorAll('p')].filter((p) => cleanText(p.innerText).length >= 40);
-    const paragraphLength = paragraphs.reduce((sum, p) => sum + cleanText(p.innerText).length, 0);
-    const linkLength = [...element.querySelectorAll('a')].reduce((sum, a) => sum + cleanText(a.innerText).length, 0);
+    const paragraphs = [...element.querySelectorAll('p')].filter((p) => renderedText(p).length >= 40);
+    const paragraphLength = paragraphs.reduce((sum, p) => sum + renderedText(p).length, 0);
+    const linkLength = [...element.querySelectorAll('a')].reduce((sum, a) => sum + renderedText(a).length, 0);
     const density = 1 - Math.min(1, linkLength / Math.max(text.length, 1));
     let bonus = element.matches('article, [itemprop="articleBody"]') ? 600 : 0;
     if (element.matches('main, [role="main"]')) bonus += 250;
@@ -70,13 +81,15 @@
   if (cleanText(article.textContent).length < 160) return;
 
   const title = cleanText(document.querySelector('meta[property="og:title"]')?.content)
-    || cleanText(source.element.querySelector('h1')?.innerText)
-    || cleanText(document.querySelector('h1')?.innerText)
+    || renderedText(source.element.querySelector('h1'))
+    || renderedText(document.querySelector('h1'))
     || cleanText(document.title);
   const articleHeading = article.querySelector('h1');
   if (articleHeading && cleanText(articleHeading.textContent) === title) articleHeading.remove();
   const byline = cleanText(document.querySelector('meta[name="author"]')?.content)
-    || cleanText(document.querySelector('[rel="author"], [itemprop="author"]')?.innerText);
+    || renderedText(document.querySelector('[rel="author"], [itemprop="author"]'));
+  // The remaining reader callbacks only need the extracted article.
+  texts = null;
   const host = document.createElement('div');
   host.id = 'vamprowser-reader';
   const shadow = host.attachShadow({ mode: 'closed' });

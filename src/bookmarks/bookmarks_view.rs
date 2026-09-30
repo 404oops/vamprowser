@@ -4,6 +4,8 @@
 //! folder's contents, search across everything, and dragging to reorder
 //! and file.
 
+use std::{collections::HashSet, sync::Arc};
+
 use gpui::{
     AnyElement, Bounds, Context, DispatchPhase, FontWeight, KeyDownEvent, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, SharedString, Stateful,
@@ -49,7 +51,7 @@ impl Item {
 /// it), and what they look like under the pointer.
 #[derive(Clone)]
 pub(crate) struct DraggedBookmark {
-    ids: Vec<u64>,
+    ids: Arc<[u64]>,
     title: SharedString,
     palette: Palette,
 }
@@ -59,7 +61,8 @@ impl DraggedBookmark {
         Self::of(vec![id], title, palette)
     }
 
-    fn of(ids: Vec<u64>, title: String, palette: Palette) -> Self {
+    fn of(ids: impl Into<Arc<[u64]>>, title: String, palette: Palette) -> Self {
+        let ids = ids.into();
         let title = match ids.len() {
             0 | 1 => title,
             count => format!("{count} items"),
@@ -580,11 +583,15 @@ impl Browser {
         row: Stateful<gpui::Div>,
         item: &Item,
         parent: Folder,
-        with: Vec<u64>,
+        with: Arc<[u64]>,
         palette: Palette,
         cx: &mut Context<Self>,
     ) -> Stateful<gpui::Div> {
-        let ids = if with.contains(&item.id) { with } else { vec![item.id] };
+        let ids = if with.is_empty() {
+            Arc::from([item.id])
+        } else {
+            with
+        };
         let dragged = DraggedBookmark::of(ids, item.title.clone(), palette);
         let id = item.id;
         let folder = item.url.is_none();
@@ -593,7 +600,7 @@ impl Browser {
                 style.bg(color::with_alpha(palette.accent, 0.22))
             })
             .on_drop(cx.listener(move |this, dragged: &DraggedBookmark, _, cx| {
-                if dragged.ids == [id] {
+                if dragged.ids.as_ref() == [id] {
                     return;
                 }
                 let moved = if folder && !dragged.ids.contains(&id) {
@@ -707,7 +714,7 @@ impl Browser {
                     .child(crate::bookmark_menu::anchor(&self.menu_anchors, id))
                     .on_click(cx.listener(move |this, _, window, cx| this.toggle_bookmark_menu(id, window, cx))),
             };
-            bar = bar.child(self.bookmark_dnd(item, node, None, Vec::new(), palette, cx));
+            bar = bar.child(self.bookmark_dnd(item, node, None, Arc::from([]), palette, cx));
         }
         // Dropped past the last one: to the end of the bar.
         bar = bar.child(
@@ -955,40 +962,38 @@ impl Browser {
     ) -> AnyElement {
         let chrome = Chrome::new(palette);
         let folder = self.bookmark_folder;
-        let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
-        // (item, where it is, its folder, its place there)
-        let rows: Vec<(Item, String, Folder, usize)> = {
+        let lower = query.to_lowercase();
+        let words: Vec<&str> = lower.split_whitespace().collect();
+        // (item, where it is, its folder)
+        let rows: Vec<(Item, String, Folder)> = {
             let bookmarks = self.bookmarks();
             if words.is_empty() {
                 bookmarks
                     .children(folder)
                     .iter()
-                    .enumerate()
-                    .map(|(i, node)| (Item::of(node), String::new(), folder, i))
+                    .map(|node| (Item::of(node), String::new(), folder))
                     .collect()
             } else {
                 bookmarks
-                    .links_with_paths()
+                    .search_with_paths(&words)
                     .into_iter()
-                    .filter(|(node, _)| {
-                        let haystack = format!("{} {}", node.title, node.url.as_deref().unwrap_or_default()).to_lowercase();
-                        words.iter().all(|w| haystack.contains(w.as_str()))
-                    })
-                    .map(|(node, path)| {
-                        let parent = bookmarks.parent_of(node.id).flatten();
-                        let index = bookmarks.children(parent).iter().position(|n| n.id == node.id).unwrap_or(0);
-                        (Item::of(node), path, parent, index)
-                    })
+                    .map(|(node, path, parent)| (Item::of(node), path, parent))
                     .collect()
             }
         };
         // What's selected, kept to what's listed, in the order it's listed.
-        let order: Vec<u64> = rows.iter().map(|(node, ..)| node.id).collect();
+        let order: Arc<[u64]> = rows.iter().map(|(node, ..)| node.id).collect();
         if self.bookmark_selection.band.is_none() {
             let selection = &mut self.bookmark_selection;
-            selection.ids = order.iter().copied().filter(|id| selection.ids.contains(id)).collect();
+            let selected: HashSet<u64> = selection.ids.iter().copied().collect();
+            selection.ids = order
+                .iter()
+                .copied()
+                .filter(|id| selected.contains(id))
+                .collect();
         }
-        let selected = self.bookmark_selection.ids.clone();
+        let selected: Arc<[u64]> = self.bookmark_selection.ids.clone().into();
+        let selected_ids: HashSet<u64> = selected.iter().copied().collect();
         self.bookmark_selection.rows.borrow_mut().clear();
         let focus = self.controls.focus("bookmark-list", cx);
         let keys_order = order.clone();
@@ -1009,7 +1014,7 @@ impl Browser {
                 let platform = keystroke.modifiers.platform;
                 match keystroke.key.as_str() {
                     "a" if platform => {
-                        this.bookmark_selection.ids = keys_order.clone();
+                        this.bookmark_selection.ids = keys_order.to_vec();
                         cx.stop_propagation();
                         cx.notify();
                     }
@@ -1046,7 +1051,7 @@ impl Browser {
                     .child(message),
             );
         }
-        for (node, path, parent, index) in &rows {
+        for (node, path, parent) in &rows {
             let id = node.id;
             let (leading, detail): (AnyElement, String) = match &node.url {
                 Some(url) => (
@@ -1076,7 +1081,7 @@ impl Browser {
                 ),
             };
             let key = marquee::bookmark_key(id) | (1 << 41);
-            let is_selected = selected.contains(&id);
+            let is_selected = selected_ids.contains(&id);
             let record = self.bookmark_selection.rows.clone();
             let row = div()
                 .id(("bookmark-row", id))
@@ -1177,8 +1182,12 @@ impl Browser {
                 ),
                 None => row,
             };
-            let _ = index;
-            list = list.child(self.bookmark_dnd(row, node, *parent, selected.clone(), palette, cx));
+            let dragged_ids = if is_selected {
+                selected.clone()
+            } else {
+                Arc::from([])
+            };
+            list = list.child(self.bookmark_dnd(row, node, *parent, dragged_ids, palette, cx));
         }
         // Below the last: dropped on, to the end of this folder; pressed
         // on, where a box is dragged out to select what it touches.
@@ -1310,10 +1319,10 @@ impl Browser {
         };
         band.current = to;
         let area = band.bounds();
-        let mut ids = band.base.clone();
+        let mut ids: HashSet<u64> = band.base.iter().copied().collect();
         for (id, bounds) in selection.rows.borrow().iter() {
-            if bounds.intersects(&area) && !ids.contains(id) {
-                ids.push(*id);
+            if bounds.intersects(&area) {
+                ids.insert(*id);
             }
         }
         let order: Vec<u64> = selection.rows.borrow().iter().map(|(id, _)| *id).collect();

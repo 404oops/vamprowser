@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.4.10 — 2026-10-01
+
+- The omnibox pulse now stays visible across the whole address field when a link is copied or another address action runs. Focusing a text field also makes its selection and input handler ready immediately.
+- Address suggestions and the tab switcher reuse history, bookmark, and tab results between edits. Remote suggestions share a worker and connection pool, while large result sets rank only the rows that can be shown.
+- Context menus warm their content before appearing and animate inside a fixed native popup. A local GPUI patch keeps their animations smooth while the browser window holds keyboard focus.
+- Session saves and filter-list builds run in background workers. Download size lookups, favicon requests, find-in-page counting, and Reader extraction do less repeated work.
+- Extension action labels and icons are cached until they change, and the background wake timer runs only when an enabled extension needs it. Site filter rules are applied only when their revision changes.
+
 ## v0.4.9 — 2026-09-29
 
 - Media downloads pair video choices with the best separate audio track when one is available. Combined downloads use the separate audio stream and finish at the video's length.

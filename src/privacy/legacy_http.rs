@@ -125,9 +125,6 @@ unsafe extern "C" {
 /// other request straight on, as before; only before the store is first
 /// used (WebKit keeps what it had then). Needs macOS 14.
 pub fn route(store: &WKWebsiteDataStore) {
-    let Some(port) = port() else {
-        return;
-    };
     let hosts: Vec<String> = hosts().lock().map(|h| h.iter().cloned().collect()).unwrap_or_default();
     if hosts.is_empty() {
         return;
@@ -136,6 +133,9 @@ pub fn route(store: &WKWebsiteDataStore) {
     if !store.respondsToSelector(selector) {
         return;
     }
+    let Some(port) = port() else {
+        return;
+    };
     let (Ok(address), Ok(port)) = (CString::new("127.0.0.1"), CString::new(port.to_string())) else {
         return;
     };

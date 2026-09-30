@@ -21,7 +21,7 @@ use crate::{
     history,
     icons::{Icon, icon},
     native, site_icon, text_input,
-    suggest::{page_rank, page_score},
+    suggest::{page_rank, page_score_fields},
 };
 
 /// What a row does when chosen.
@@ -33,6 +33,7 @@ enum Choice {
     Run(Command),
 }
 
+#[derive(Clone)]
 struct Row {
     choice: Choice,
     title: String,
@@ -43,12 +44,87 @@ struct Row {
     glyph: Icon,
 }
 
-struct RankedPage {
-    row: Row,
+struct RankedPage<'a> {
+    url: &'a str,
+    title: &'a str,
+    path: String,
     score: i32,
     bookmark: bool,
     visits: u32,
     recent: u64,
+    order: usize,
+}
+
+fn rank_pages(mut pages: Vec<RankedPage<'_>>, count: usize) -> Vec<Row> {
+    let compare = |a: &RankedPage<'_>, b: &RankedPage<'_>| {
+        page_rank(b.score, b.bookmark, b.visits, b.recent)
+            .cmp(&page_rank(a.score, a.bookmark, a.visits, a.recent))
+            .then(a.order.cmp(&b.order))
+    };
+    if pages.len() > count {
+        if count == 0 {
+            pages.clear();
+        } else {
+            pages.select_nth_unstable_by(count, compare);
+            pages.truncate(count);
+        }
+    }
+    pages.sort_unstable_by(compare);
+    pages
+        .into_iter()
+        .map(|page| Row {
+            choice: Choice::Link(page.url.to_owned()),
+            title: page.title.to_owned(),
+            detail: if page.path.is_empty() {
+                page.url.to_owned()
+            } else {
+                format!("{} — {}", page.path, page.url)
+            },
+            kind: if page.bookmark { "Bookmark" } else { "History" },
+            url: Some(page.url.to_owned()),
+            glyph: if page.bookmark {
+                Icon::Bookmark
+            } else {
+                Icon::File
+            },
+        })
+        .collect()
+}
+
+struct CachedTab {
+    id: u64,
+    title: String,
+    url: String,
+    page: Page,
+    private: bool,
+}
+
+pub(crate) struct RowsCache {
+    query: SharedString,
+    history: u64,
+    bookmarks: u64,
+    selected: usize,
+    tabs: Vec<CachedTab>,
+    settings: crate::settings::Settings,
+    rows: Arc<[Row]>,
+}
+
+impl RowsCache {
+    fn fresh(&self, browser: &Browser, query: &str, history: u64, bookmarks: u64) -> bool {
+        self.query.as_ref() == query
+            && self.history == history
+            && self.bookmarks == bookmarks
+            && self.selected == browser.selected
+            && self.settings == browser.settings
+            && self.tabs.len() == browser.tabs.len()
+            && self.tabs.iter().zip(&browser.tabs).all(|(cached, tab)| {
+                cached.id == tab.id
+                    && cached.title == tab.title
+                    && cached.url == tab.url
+                    && cached.page == tab.page
+                    && cached.private == tab.private
+            })
+    }
 }
 
 const MAX_ROWS: usize = 12;
@@ -88,22 +164,20 @@ impl Browser {
             opened: request,
             closing: None,
             _changes: changes,
+            rows: Default::default(),
         });
         self.palette_open.set(true);
         let tab = self.current();
         // The live page stays up until its still arrives, so nothing
         // flashes blank.
         if let (Some(view), Page::Web) = (&tab.view, tab.page) {
-            let _ = view.focus_parent();
             let sender = self.sender.clone();
             let id = tab.id;
             native::snapshot(&view.webview(), move |jpeg| {
                 let _ = sender.try_send(BrowserEvent::Snapshot(id, request, jpeg));
             });
         }
-        let focus = input.read(cx).focus_handle.clone();
-        window.focus(&focus, cx);
-        cx.notify();
+        self.focus_text_input(input, false, window, cx);
     }
 
     /// The page's still has arrived (or couldn't be taken): swap the live
@@ -187,7 +261,7 @@ impl Browser {
 
     fn choose_row(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let rows = self.palette_rows(cx);
-        let Some(row) = rows.into_iter().nth(index) else {
+        let Some(choice) = rows.get(index).map(|row| row.choice.clone()) else {
             return;
         };
         self.close_palette(cx);
@@ -197,7 +271,7 @@ impl Browser {
         } else {
             Place::NewTab
         };
-        match row.choice {
+        match choice {
             Choice::Tab(id) => self.run(Command::SelectTabId(id), window, cx),
             Choice::Link(url) => self.open_link(&url, place, window, cx),
             Choice::Search(text) => {
@@ -208,12 +282,19 @@ impl Browser {
         }
     }
 
-    fn palette_rows(&self, cx: &Context<Self>) -> Vec<Row> {
+    fn palette_rows(&self, cx: &Context<Self>) -> Arc<[Row]> {
         let Some(palette) = &self.palette else {
-            return Vec::new();
+            return Arc::from([]);
         };
         let content = palette.input.read(cx).content.clone();
         let query = content.trim();
+        let bookmarks = self.bookmarks();
+        let history = self.history();
+        if let Some(cache) = palette.rows.borrow().as_ref()
+            && cache.fresh(self, &content, history.revision(), bookmarks.revision())
+        {
+            return cache.rows.clone();
+        }
         let lower = query.to_lowercase();
         let words: Vec<&str> = lower.split_whitespace().collect();
         // One buffer for every entry's lowercased text, as this runs on
@@ -223,10 +304,13 @@ impl Browser {
             history::haystack_into(&mut haystack, title, url);
             history::matches_words(&haystack, &words)
         };
-        let bookmarks = self.bookmarks();
-        let history = self.history();
         let mut rows = Vec::new();
         let mut seen: HashSet<&str> = HashSet::new();
+        let tab_limit = if query.is_empty() {
+            MAX_ROWS
+        } else {
+            MAX_ROWS - 1
+        };
         for (index, tab) in self.tabs.iter().enumerate() {
             if !matches(&tab.title, &tab.url) {
                 continue;
@@ -256,79 +340,78 @@ impl Browser {
                     Page::Bookmarks => Icon::Bookmark,
                 },
             });
+            if rows.len() == tab_limit {
+                break;
+            }
         }
         if !query.is_empty() {
             let mut pages: Vec<RankedPage> = Vec::new();
-            let mut at: HashMap<&str, usize> = HashMap::new();
-            for (bookmark, path) in bookmarks.links_with_paths() {
-                let Some(url) = bookmark.url.as_deref() else {
-                    continue;
-                };
-                let Some(score) = page_score(&lower, &bookmark.title, url) else {
-                    continue;
-                };
-                if seen.contains(url) || at.contains_key(url) {
-                    continue;
-                }
-                at.insert(url, pages.len());
-                pages.push(RankedPage {
-                    row: Row {
-                        choice: Choice::Link(url.to_owned()),
-                        title: bookmark.title.clone(),
-                        // Where it's filed, if not on the bar.
-                        detail: if path.is_empty() { url.to_owned() } else { format!("{path} — {url}") },
-                        kind: "Bookmark",
-                        url: Some(url.to_owned()),
-                        glyph: Icon::Bookmark,
-                    },
-                    score,
-                    bookmark: true,
-                    visits: 0,
-                    recent: 0,
-                });
-            }
-            for visit in history.recent(usize::MAX) {
-                let Some(score) = page_score(&lower, &visit.title, &visit.url) else {
-                    continue;
-                };
-                if seen.contains(visit.url.as_str()) {
-                    continue;
-                }
-                if let Some(&index) = at.get(visit.url.as_str()) {
-                    let page = &mut pages[index];
-                    if score > page.score {
-                        page.score = score;
-                        page.row.title = visit.title.clone();
+            let count = (MAX_ROWS - 1).saturating_sub(rows.len());
+            if count > 0 {
+                let bookmark_fields = bookmarks.scoring_fields();
+                let mut at: HashMap<&str, usize> = HashMap::new();
+                for ((bookmark, path), (title_lower, address_lower)) in bookmarks
+                    .links_with_paths()
+                    .into_iter()
+                    .zip(bookmark_fields.iter())
+                {
+                    let Some(url) = bookmark.url.as_deref() else {
+                        continue;
+                    };
+                    let Some(score) = page_score_fields(&lower, title_lower, address_lower) else {
+                        continue;
+                    };
+                    if seen.contains(url) || at.contains_key(url) {
+                        continue;
                     }
-                    page.visits = visit.visits;
-                    page.recent = visit.last_visit;
-                } else {
-                    at.insert(&visit.url, pages.len());
+                    at.insert(url, pages.len());
                     pages.push(RankedPage {
-                        row: Row {
-                            choice: Choice::Link(visit.url.clone()),
-                            title: if visit.title.is_empty() { visit.url.clone() } else { visit.title.clone() },
-                            detail: visit.url.clone(),
-                            kind: "History",
-                            url: Some(visit.url.clone()),
-                            glyph: Icon::File,
-                        },
+                        url,
+                        title: &bookmark.title,
+                        path,
+                        order: pages.len(),
                         score,
-                        bookmark: false,
-                        visits: visit.visits,
-                        recent: visit.last_visit,
+                        bookmark: true,
+                        visits: 0,
+                        recent: 0,
                     });
                 }
+                for visit in history.recent(usize::MAX) {
+                    let (title_lower, address_lower) = visit.search_fields();
+                    let Some(score) = page_score_fields(&lower, title_lower, address_lower) else {
+                        continue;
+                    };
+                    if seen.contains(visit.url.as_str()) {
+                        continue;
+                    }
+                    if let Some(&index) = at.get(visit.url.as_str()) {
+                        let page = &mut pages[index];
+                        if score > page.score {
+                            page.score = score;
+                            page.title = &visit.title;
+                        }
+                        page.visits = visit.visits;
+                        page.recent = visit.last_visit;
+                    } else {
+                        at.insert(&visit.url, pages.len());
+                        pages.push(RankedPage {
+                            url: &visit.url,
+                            title: if visit.title.is_empty() {
+                                &visit.url
+                            } else {
+                                &visit.title
+                            },
+                            path: String::new(),
+                            order: pages.len(),
+                            score,
+                            bookmark: false,
+                            visits: visit.visits,
+                            recent: visit.last_visit,
+                        });
+                    }
+                }
             }
-            pages.sort_by_key(|page| {
-                std::cmp::Reverse(page_rank(page.score, page.bookmark, page.visits, page.recent))
-            });
-            rows.extend(
-                pages
-                    .into_iter()
-                    .take((MAX_ROWS - 1).saturating_sub(rows.len()))
-                    .map(|page| page.row),
-            );
+            rows.extend(rank_pages(pages, count));
             for command in Command::palette() {
                 if let Some(label) = command.palette_label()
                     && history::matches_words(&label.to_lowercase(), &words)
@@ -367,6 +450,26 @@ impl Browser {
             });
         }
         rows.truncate(MAX_ROWS);
+        let rows: Arc<[Row]> = rows.into();
+        *palette.rows.borrow_mut() = Some(RowsCache {
+            query: content,
+            history: history.revision(),
+            bookmarks: bookmarks.revision(),
+            selected: self.selected,
+            tabs: self
+                .tabs
+                .iter()
+                .map(|tab| CachedTab {
+                    id: tab.id,
+                    title: tab.title.clone(),
+                    url: tab.url.clone(),
+                    page: tab.page,
+                    private: tab.private,
+                })
+                .collect(),
+            settings: self.settings.clone(),
+            rows: rows.clone(),
+        });
         rows
     }
 
@@ -544,5 +647,60 @@ impl Browser {
                     .child(card),
             )
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn partial_page_ranking_keeps_frequency_and_stable_ties() {
+        let names = [
+            "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q",
+            "r", "s", "t",
+        ];
+        let pages = names
+            .into_iter()
+            .enumerate()
+            .map(|(order, name)| RankedPage {
+                url: name,
+                title: name,
+                path: String::new(),
+                score: 120,
+                bookmark: false,
+                visits: (order % 3) as u32,
+                recent: 0,
+                order,
+            })
+            .collect();
+        let rows = rank_pages(pages, 6);
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.title.as_str())
+                .collect::<Vec<_>>(),
+            ["c", "f", "i", "l", "o", "r"]
+        );
+    }
+
+    #[test]
+    fn full_tab_list_leaves_no_page_rows_and_bookmark_details_survive() {
+        let make = || {
+            vec![RankedPage {
+                url: "https://example.org/",
+                title: "Example",
+                path: "Work › Docs".into(),
+                score: 120,
+                bookmark: true,
+                visits: 0,
+                recent: 0,
+                order: 0,
+            }]
+        };
+        assert!(rank_pages(make(), 0).is_empty());
+        let rows = rank_pages(make(), 12);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, "Bookmark");
+        assert_eq!(rows[0].detail, "Work › Docs — https://example.org/");
     }
 }

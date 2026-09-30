@@ -2,13 +2,15 @@
 //! on their font's baseline and land a pixel or two off centre in a square
 //! button; paths are centred exactly.
 
+use std::{cell::RefCell, collections::HashMap};
+
 use gpui::{
-    Bounds, IntoElement, PathBuilder, PathStyle, Pixels, Point, Rgba, StrokeOptions, Styled,
+    Bounds, IntoElement, Path, PathBuilder, PathStyle, Pixels, Point, Rgba, StrokeOptions, Styled,
     Window, canvas, point, px,
 };
 use lyon_tessellation::{LineCap, LineJoin};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Icon {
     Back,
     Forward,
@@ -70,7 +72,44 @@ pub fn icon(icon: Icon, size: f32, color: Rgba) -> impl IntoElement {
     .flex_none()
 }
 
+thread_local! {
+    /// Geometry is independent of position and colour. Keep tessellation off
+    /// animation frames, with a bound for unusual continuously changing sizes.
+    static PATHS: RefCell<HashMap<(Icon, u32), Vec<Path<Pixels>>>> = RefCell::default();
+}
+
+fn translated_paths(icon: Icon, bounds: Bounds<Pixels>) -> Vec<Path<Pixels>> {
+    let size = f32::from(bounds.size.width);
+    let mut paths = PATHS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let key = (icon, size.to_bits());
+        if !cache.contains_key(&key) {
+            if cache.len() >= 256 {
+                cache.clear();
+            }
+            cache.insert(
+                key,
+                build_paths(icon, Bounds::new(point(px(0.0), px(0.0)), bounds.size)),
+            );
+        }
+        cache[&key].clone()
+    });
+    for path in &mut paths {
+        path.bounds.origin += bounds.origin;
+        for vertex in &mut path.vertices {
+            vertex.xy_position += bounds.origin;
+        }
+    }
+    paths
+}
+
 fn paint(icon: Icon, bounds: Bounds<Pixels>, color: Rgba, window: &mut Window) {
+    for path in translated_paths(icon, bounds) {
+        window.paint_path(path, color);
+    }
+}
+
+fn build_paths(icon: Icon, bounds: Bounds<Pixels>) -> Vec<Path<Pixels>> {
     let scale = f32::from(bounds.size.width) / 16.0;
     let origin = bounds.origin;
     let at = |x: f32, y: f32| -> Point<Pixels> {
@@ -658,11 +697,10 @@ fn paint(icon: Icon, bounds: Bounds<Pixels>, color: Rgba, window: &mut Window) {
             paths.push(path);
         }
     }
-    for path in paths {
-        if let Ok(path) = path.build() {
-            window.paint_path(path, color);
-        }
-    }
+    paths
+        .into_iter()
+        .filter_map(|path| path.build().ok())
+        .collect()
 }
 
 /// Points around an ellipse, closed back at the first.
@@ -692,4 +730,82 @@ fn rounded_rect(
     path.line_to(at(x0, y0 + r));
     path.curve_to(at(x0 + r, y0), at(x0, y0));
     path.close();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cached_geometry_follows_position_and_size() {
+        for icon in [
+            Icon::Back,
+            Icon::Reload,
+            Icon::StarFilled,
+            Icon::Sidebar,
+            Icon::Globe,
+        ] {
+            for size in [12.0, 16.0, 24.0] {
+                let bounds = Bounds::new(point(px(90.0), px(32.0)), gpui::size(px(size), px(size)));
+                let fresh = build_paths(icon, bounds);
+                let cached = translated_paths(icon, bounds);
+                assert_eq!(fresh.len(), cached.len());
+                for (fresh, cached) in fresh.iter().zip(&cached) {
+                    assert_eq!(fresh.vertices.len(), cached.vertices.len());
+                    // Lyon may order fill triangles differently after
+                    // floating-point translation. Compare their positions.
+                    for fresh in &fresh.vertices {
+                        assert!(
+                            cached.vertices.iter().any(|cached| {
+                                (f32::from(fresh.xy_position.x - cached.xy_position.x)).abs()
+                                    < 0.002
+                                    && (f32::from(fresh.xy_position.y - cached.xy_position.y)).abs()
+                                        < 0.002
+                                    && fresh.st_position == cached.st_position
+                            }),
+                            "{icon:?} at {size}: {:?}",
+                            fresh.xy_position
+                        );
+                    }
+                    assert!(
+                        (f32::from(fresh.bounds.origin.x - cached.bounds.origin.x)).abs() < 0.002
+                    );
+                    assert!(
+                        (f32::from(fresh.bounds.origin.y - cached.bounds.origin.y)).abs() < 0.002
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "local performance measurement"]
+    fn benchmark_repeated_icon_geometry() {
+        use std::{hint::black_box, time::Instant};
+        let bounds = Bounds::new(point(px(0.0), px(0.0)), gpui::size(px(16.0), px(16.0)));
+        let icons = [
+            Icon::Reload,
+            Icon::Globe,
+            Icon::Star,
+            Icon::Gear,
+            Icon::Sidebar,
+        ];
+        let began = Instant::now();
+        for _ in 0..2000 {
+            for icon in icons {
+                black_box(build_paths(icon, bounds));
+            }
+        }
+        let fresh = began.elapsed();
+        let began = Instant::now();
+        for _ in 0..2000 {
+            for icon in icons {
+                black_box(translated_paths(icon, bounds));
+            }
+        }
+        eprintln!(
+            "10,000 icon draws: fresh {fresh:?}, cached {:?}",
+            began.elapsed()
+        );
+    }
 }

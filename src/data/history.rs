@@ -3,7 +3,11 @@
 //! `~/Library/Application Support/Vamprowser/history.json`.
 
 use serde::{Deserialize, Serialize};
-use std::{cell::RefCell, collections::HashSet};
+use std::{
+    cell::RefCell,
+    collections::HashSet,
+    sync::{Arc, atomic::{AtomicBool, Ordering}},
+};
 
 use crate::state::{data_path, now_secs, write_atomic};
 
@@ -21,24 +25,53 @@ pub struct Visit {
     /// lowercase thousands of entries on every key.
     #[serde(skip)]
     lower: String,
+    #[serde(skip)]
+    lower_title_end: usize,
 }
 
 impl Visit {
     fn relower(&mut self) {
         let mut lower = std::mem::take(&mut self.lower);
-        haystack_into(&mut lower, &self.title, &self.url);
+        self.lower_title_end = haystack_into(&mut lower, &self.title, &self.url);
         self.lower = lower;
     }
+
+    /// Cached title and URL fields for fuzzy address-field/switcher scoring.
+    pub(crate) fn search_fields(&self) -> (&str, &str) {
+        let prefix = self.url.len() - bare_address(&self.url).len();
+        (
+            &self.lower[..self.lower_title_end],
+            &self.lower[self.lower_title_end + 1 + prefix..],
+        )
+    }
+}
+
+/// An address without the scheme and `www.`, as suggestions complete it.
+pub(crate) fn bare_address(url: &str) -> &str {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    rest.strip_prefix("www.").unwrap_or(rest)
 }
 
 /// "title url" lowercased into `buffer`, replacing what it held: the text
 /// [`matches_words`] looks in. Reusing one buffer spares an allocation per
-/// entry when matching a whole list.
-pub fn haystack_into(buffer: &mut String, title: &str, url: &str) {
+/// entry when matching a whole list. Returns where the title ends.
+pub fn haystack_into(buffer: &mut String, title: &str, url: &str) -> usize {
     buffer.clear();
-    buffer.extend(title.chars().flat_map(char::to_lowercase));
+    if title.is_ascii() && url.is_ascii() {
+        buffer.push_str(title);
+        buffer.push(' ');
+        buffer.push_str(url);
+        buffer.make_ascii_lowercase();
+        return title.len();
+    }
+    buffer.push_str(&title.to_lowercase());
+    let title_end = buffer.len();
     buffer.push(' ');
-    buffer.extend(url.chars().flat_map(char::to_lowercase));
+    buffer.push_str(&url.to_lowercase());
+    title_end
 }
 
 /// Whether `haystack_lower` (already lowercased) contains every one of
@@ -58,6 +91,8 @@ pub struct History {
     /// The last [`History::frequent`] answer: (revision, count, indices
     /// into `entries`). The start page asks for it on every frame.
     frequent: RefCell<Option<(u64, usize, Vec<usize>)>>,
+    writer: Option<crate::background::LatestWorker<Vec<Visit>>>,
+    save_failed: Arc<AtomicBool>,
 }
 
 fn history_path() -> Option<std::path::PathBuf> {
@@ -81,9 +116,21 @@ impl History {
         self.revision += 1;
     }
 
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision
+    }
+
     /// Writes the file if anything changed since the last save.
     pub fn save(&mut self) {
-        if !self.dirty || cfg!(test) {
+        if cfg!(test) {
+            return;
+        }
+        // Quit, export and explicit removals need a durable file. Wait for
+        // older periodic writes first so they cannot resurrect removed rows.
+        if let Some(writer) = &self.writer {
+            writer.flush();
+        }
+        if !self.dirty && !self.save_failed.load(Ordering::Relaxed) {
             return;
         }
         let Some(path) = history_path() else {
@@ -93,7 +140,40 @@ impl History {
             && write_atomic(&path, &data).is_ok()
         {
             self.dirty = false;
+            self.save_failed.store(false, Ordering::Relaxed);
         }
+    }
+
+    /// Periodic serialization and disk work must not interrupt scrolling,
+    /// typing or WebKit callbacks on the foreground thread.
+    pub(crate) fn save_periodically(&mut self) {
+        if cfg!(test) || (!self.dirty && !self.save_failed.load(Ordering::Relaxed)) {
+            return;
+        }
+        let Some(path) = history_path() else { return };
+        let writer = self.writer.get_or_insert_with(|| {
+            let failed = self.save_failed.clone();
+            crate::background::LatestWorker::new("history-writer", move |entries: Vec<Visit>| {
+                let saved = serde_json::to_vec(&entries)
+                    .is_ok_and(|bytes| write_atomic(&path, &bytes).is_ok());
+                failed.store(!saved, Ordering::Relaxed);
+                if !saved {
+                    eprintln!("Could not save browsing history");
+                }
+            })
+        });
+        // Leave the search cache on the main thread: the file stores only
+        // these fields, so duplicating every lowercased string is unnecessary.
+        let entries = self.entries.iter().map(|visit| Visit {
+            url: visit.url.clone(),
+            title: visit.title.clone(),
+            last_visit: visit.last_visit,
+            visits: visit.visits,
+            lower: String::new(),
+            lower_title_end: 0,
+        }).collect();
+        writer.submit(entries);
+        self.dirty = false;
     }
 
     /// Records a visit, moving the page to the top.
@@ -109,6 +189,7 @@ impl History {
                 last_visit: 0,
                 visits: 0,
                 lower: String::new(),
+                lower_title_end: 0,
             },
         };
         visit.visits += 1;
@@ -240,5 +321,16 @@ mod tests {
         history.retitle("https://example.org/", "Welcome Home");
         assert_eq!(history.search("home WELCOME", 10).len(), 1);
         assert!(matches_words("a b", &[]));
+    }
+
+    #[test]
+    fn cached_scoring_fields_preserve_unicode_lowercase_and_title_changes() {
+        let mut history = History::default();
+        history.record("https://www.example.org/İ", "ΟΣ İ");
+        let visit = &history.recent(1)[0];
+        assert_eq!(visit.search_fields(), ("ος i\u{307}", "example.org/i\u{307}"));
+        assert_eq!(history.search("ος", 1).len(), 1);
+        history.retitle("https://www.example.org/İ", "New title");
+        assert_eq!(history.recent(1)[0].search_fields().0, "new title");
     }
 }

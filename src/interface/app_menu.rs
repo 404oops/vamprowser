@@ -21,7 +21,7 @@ use objc2::{
 };
 use objc2_app_kit::{NSEvent, NSEventMask, NSEventType};
 use objc2_foundation::{NSNotificationCenter, NSObjectProtocol};
-use vampir::{ControlHost, ControlState, Palette, color, ui_font};
+use vampir::{ControlHost, ControlState, Palette, color, lighting, ui_font};
 
 use crate::{
     icons::{Icon, icon},
@@ -37,7 +37,11 @@ const SEPARATOR_HEIGHT: f32 = 11.0;
 /// Between the panel's edge and its rows.
 const PADDING: f32 = 6.0;
 const BORDER: f32 = 1.0;
-const RADIUS: f32 = 10.0;
+const RADIUS: f32 = 12.0;
+const ROW_RADIUS: f32 = 7.0;
+/// The shared panel shadow reaches three blur radii (30 points), plus
+/// its two-point downward offset. Keep its tail inside the native popup.
+const EDGE_GUTTER: f32 = 32.0;
 /// Between a row's highlight and what's in it.
 const ROW_INSET: f32 = 8.0;
 const TEXT_SIZE: f32 = 13.0;
@@ -59,6 +63,7 @@ const TITLE_BAND: f32 = 28.0;
 const SWEEP: Duration = Duration::from_millis(190);
 const ROW_SWEEP: Duration = Duration::from_millis(170);
 const RESIZE: Duration = Duration::from_millis(170);
+const HOVER: Duration = Duration::from_millis(120);
 
 /// Which way a menu comes in.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -140,6 +145,9 @@ struct Menu {
     ns_window: usize,
     watch: Option<Watch>,
     done: bool,
+    /// GPUI draws once while the popup is hidden. Warm its text and icons
+    /// before starting the short opening animation.
+    animations_ready: bool,
     sweep: Sweep,
     anchored_above: bool,
     animation_epoch: usize,
@@ -183,15 +191,18 @@ fn row_indices(level: &Level) -> Vec<usize> {
 
 /// The height `level` needs, with its way back if it's nested.
 fn height_of(level: &Level) -> f32 {
-    let rows: f32 = level
-        .entries
+    height_of_entries(&level.entries, level.title.is_some())
+}
+
+fn height_of_entries(entries: &[MenuEntry], has_title: bool) -> f32 {
+    let rows: f32 = entries
         .iter()
         .map(|entry| match entry {
             MenuEntry::Separator => SEPARATOR_HEIGHT,
             _ => ROW_HEIGHT,
         })
         .sum();
-    let back = if level.title.is_some() {
+    let back = if has_title {
         ROW_HEIGHT + SEPARATOR_HEIGHT
     } else {
         0.0
@@ -215,9 +226,16 @@ fn columns(entries: &[MenuEntry]) -> (bool, bool) {
 /// The width that fits `level`'s longest row, given how wide `measure`
 /// finds a label at a weight.
 fn width_of_level(level: &Level, measure: impl Fn(&str, FontWeight) -> f32) -> f32 {
-    let (icons, trailing) = columns(&level.entries);
-    let label = level
-        .entries
+    width_of_entries(&level.entries, level.title.as_deref(), measure)
+}
+
+fn width_of_entries(
+    entries: &[MenuEntry],
+    title: Option<&str>,
+    measure: impl Fn(&str, FontWeight) -> f32,
+) -> f32 {
+    let (icons, trailing) = columns(entries);
+    let label = entries
         .iter()
         .filter_map(|entry| match entry {
             MenuEntry::Item { label, .. } | MenuEntry::Submenu { label, .. } => {
@@ -235,7 +253,7 @@ fn width_of_level(level: &Level, measure: impl Fn(&str, FontWeight) -> f32) -> f
     }
     // The way back keeps the level's columns, with its chevron in the
     // icon's and its title set medium.
-    let back = level.title.as_deref().map_or(0.0, |title| {
+    let back = title.map_or(0.0, |title| {
         let mut back = ICON_SLOT + GAP + measure(title, FontWeight::MEDIUM);
         if trailing {
             back += TRAILING_SLOT + GAP;
@@ -264,19 +282,28 @@ fn measure(cx: &App, text: &str, weight: FontWeight) -> f32 {
         .sum()
 }
 
-/// A transparent popup large enough for any level, so its visible panel can
-/// resize without AppKit stretching or clipping a render in progress.
-fn maximum_size(level: &Level, measure: impl Fn(&str, FontWeight) -> f32 + Copy) -> (f32, f32) {
-    let mut width = width_of_level(level, measure);
-    let mut height = height_of(level);
-    for entry in &level.entries {
+/// A transparent popup large enough for any level, so changing levels does
+/// not resize its native window.
+fn level_sizes(
+    level: &Level,
+    measure: impl Fn(&str, FontWeight) -> f32 + Copy,
+) -> ((f32, f32), (f32, f32)) {
+    let root = (width_of_level(level, measure), height_of(level));
+    (root, maximum_size_from(&level.entries, root, measure))
+}
+
+fn maximum_size_from(
+    entries: &[MenuEntry],
+    (mut width, mut height): (f32, f32),
+    measure: impl Fn(&str, FontWeight) -> f32 + Copy,
+) -> (f32, f32) {
+    for entry in entries {
         if let MenuEntry::Submenu { label, entries, .. } = entry {
-            let child = Level {
-                entries: entries.clone(),
-                base: 0,
-                title: Some(label.clone()),
-            };
-            let (child_width, child_height) = maximum_size(&child, measure);
+            let child = (
+                width_of_entries(entries, Some(label), measure),
+                height_of_entries(entries, true),
+            );
+            let (child_width, child_height) = maximum_size_from(entries, child, measure);
             width = width.max(child_width);
             height = height.max(child_height);
         }
@@ -477,11 +504,14 @@ impl Menu {
     ) -> gpui::Stateful<gpui::Div> {
         let palette = self.palette;
         let hovered = enabled && self.hovered == Some(key);
-        let tint = if hovered {
-            palette.accent
+        let hover = if cx.reduce_motion() {
+            self.controls
+                .snap(("menu-row-hover", key), if hovered { 1.0 } else { 0.0 })
         } else {
-            palette.text_secondary
+            self.controls
+                .blend(("menu-row-hover", key), hovered, crate::slowed(HOVER))
         };
+        let tint = color::lerp(palette.text_secondary, palette.accent, hover);
         div()
             .id(("menu-row", key))
             .flex_none()
@@ -490,8 +520,10 @@ impl Menu {
             .flex()
             .items_center()
             .gap(px(GAP))
-            .rounded(px(6.0))
-            .when(hovered, |el| el.bg(palette.row_hover))
+            .rounded(px(ROW_RADIUS))
+            .when(hover > 0.0, |el| {
+                el.bg(lighting::lit_at(palette.soft_fill, 0.035, hover))
+            })
             .when(enabled, |el| el.cursor_pointer())
             .when(!enabled, |el| el.opacity(0.4))
             .on_hover(cx.listener(move |this, over: &bool, _, cx| {
@@ -542,20 +574,19 @@ impl Drop for Menu {
 impl Render for Menu {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
         let palette = self.palette;
+        let chrome = crate::Chrome::new(palette);
         let sweep = self.sweep;
         let level = self.levels.last().unwrap();
         let columns = columns(&level.entries);
-        let mut rule: gpui::Hsla = color::to_hsla(palette.field_border);
-        rule.alpha = 0.8;
         let separator = move || {
             div()
                 .flex_none()
                 .h(px(1.0))
                 .mx(px(ROW_INSET))
                 .my(px((SEPARATOR_HEIGHT - 1.0) / 2.0))
-                .bg(rule)
+                .bg(color::with_alpha(chrome.line, 0.8))
         };
-        let mut rows = Vec::new();
+        let mut rows = Vec::with_capacity(level.entries.len() + 2);
         if let Some(title) = &level.title {
             // The way back, headed with the row that led here.
             let back = self
@@ -639,8 +670,9 @@ impl Render for Menu {
             .flex()
             .flex_col()
             .overflow_y_scroll()
-            .children(rows)
-            .with_animation(
+            .children(rows);
+        let rows = if self.animations_ready {
+            rows.with_animation(
                 ("menu-level-sweep", self.animation_epoch),
                 Animation::new(crate::slowed(ROW_SWEEP)).with_easing(ease_out),
                 move |rows, t| {
@@ -649,7 +681,11 @@ impl Render for Menu {
                         .top(px(dy * (1.0 - t)))
                         .opacity(t)
                 },
-            );
+            )
+            .into_any_element()
+        } else {
+            rows.into_any_element()
+        };
         let panel = div()
             .id("menu-panel")
             .occlude()
@@ -663,13 +699,13 @@ impl Render for Menu {
             .overflow_hidden()
             .rounded(px(RADIUS))
             .border_1()
-            .border_color(color::with_alpha(palette.field_border_strong, 0.55))
-            .bg(palette.field_surface)
+            .border_color(color::with_alpha(palette.field_border_strong, 0.5))
+            .bg(chrome.raised)
+            .shadow(lighting::panel(palette.is_dark))
             .child(rows);
-        // Opening, the panel unrolls from the pointer's edge while its rows
-        // settle in one after another; into or out of a submenu, it's
-        // already there, and only the rows sweep across.
-        let panel = if sweep.unrolls() {
+        // Keep the native popup fixed; only its visible panel unrolls or
+        // resizes. Animation IDs survive hover redraws and finish once.
+        let panel = if self.animations_ready && sweep.unrolls() {
             panel
                 .with_animation(
                     "menu-unroll",
@@ -687,6 +723,8 @@ impl Render for Menu {
         let root = vampir::root(div().id("app-menu"), self, cx)
             .size_full()
             .pt(px(TITLE_BAND))
+            .pb(px(EDGE_GUTTER))
+            .px(px(EDGE_GUTTER))
             .relative()
             .flex()
             .flex_col()
@@ -726,7 +764,7 @@ pub(crate) fn open(
     entries: Vec<MenuEntry>,
     palette: Palette,
 ) -> Receiver<Option<usize>> {
-    open_at(cx, window, position, entries, palette, Sweep::Down)
+    open_at(cx, window, position, entries, palette, false)
 }
 
 /// Place a shelf menu with its bottom edge at the trigger, above the shelf.
@@ -737,7 +775,7 @@ pub(crate) fn open_above(
     entries: Vec<MenuEntry>,
     palette: Palette,
 ) -> Receiver<Option<usize>> {
-    open_at(cx, window, position, entries, palette, Sweep::Up)
+    open_at(cx, window, position, entries, palette, true)
 }
 
 fn open_at(
@@ -746,7 +784,7 @@ fn open_at(
     position: Point<gpui::Pixels>,
     entries: Vec<MenuEntry>,
     palette: Palette,
-    sweep: Sweep,
+    anchored_above: bool,
 ) -> Receiver<Option<usize>> {
     // One menu at a time.
     dismiss_open();
@@ -764,7 +802,7 @@ fn open_at(
         }],
         sender,
         palette,
-        sweep,
+        anchored_above,
     );
     receiver
 }
@@ -776,20 +814,21 @@ fn open_level(
     levels: Vec<Level>,
     answer: Sender<Option<usize>>,
     palette: Palette,
-    sweep: Sweep,
+    anchored_above: bool,
 ) {
     let Some(level) = levels.last() else {
         return;
     };
-    let height = height_of(level);
-    let width = width_of_level(level, |text, weight| measure(cx, text, weight));
-    let (popup_width, popup_height) = maximum_size(level, |text, weight| measure(cx, text, weight));
-    let popup_height = popup_height + TITLE_BAND;
+    let ((width, height), (popup_width, popup_height)) =
+        level_sizes(level, |text, weight| measure(cx, text, weight));
+    let popup_height = popup_height + TITLE_BAND + EDGE_GUTTER;
+    let popup_width = popup_width + 2.0 * EDGE_GUTTER;
     let initial_row_indices = row_indices(level);
-    // The panel's edge stays at the pointer: below the band opening down,
-    // at the popup's bottom opening up.
-    origin.y -= px(if sweep == Sweep::Up {
-        popup_height
+    // Keep the panel's left and opening edge at the pointer while leaving
+    // transparent space around its rounded border.
+    origin.x -= px(EDGE_GUTTER);
+    origin.y -= px(if anchored_above {
+        popup_height - EDGE_GUTTER
     } else {
         TITLE_BAND
     });
@@ -813,7 +852,7 @@ fn open_level(
         // window it's for look inactive.
         kind: WindowKind::PopUp,
         focus: false,
-        // Clear around the panel's rounded corners, and while it unrolls.
+        // Clear around the panel's rounded corners and while it unrolls.
         window_background: WindowBackgroundAppearance::Transparent,
         show: false,
         titlebar: None,
@@ -847,8 +886,13 @@ fn open_level(
                 ns_window,
                 watch: Some(watch),
                 done: false,
-                sweep,
-                anchored_above: sweep == Sweep::Up,
+                animations_ready: false,
+                sweep: if anchored_above {
+                    Sweep::Up
+                } else {
+                    Sweep::Down
+                },
+                anchored_above,
                 animation_epoch: 0,
                 depth,
                 width,
@@ -874,7 +918,14 @@ fn open_level(
         menu
     });
     if let Ok(handle) = result {
-        let _ = handle.update(cx, |_, window, _| {
+        let _ = handle.update(cx, |menu, _, cx| {
+            menu.animations_ready = true;
+            cx.notify();
+        });
+        // End the Menu borrow before drawing it. Its required hidden draw
+        // has warmed text and icons; replace that scene with the animation's
+        // first frame before AppKit makes the popup visible.
+        let _ = cx.update_window(handle.into(), |_, window, cx| {
             let (ns_window, _) = crate::ns_window_of(window);
             if ns_window == 0 {
                 return;
@@ -882,9 +933,10 @@ fn open_level(
             // SAFETY: the native window belongs to this live GPUI window.
             let ns_window = unsafe { &*(ns_window as *const objc2_app_kit::NSWindow) };
             // The popup reserves transparent space for wider/taller
-            // submenus. A native shadow outlines that invisible space.
+            // submenus and the edge gutter. A native shadow would outline it.
             ns_window.setHasShadow(false);
             never_key(ns_window);
+            window.draw(cx).clear(cx);
             ns_window.orderFront(None);
         });
     }
@@ -1038,8 +1090,86 @@ mod tests {
             base: 0,
             title: None,
         };
-        let (width, height) = maximum_size(&level, |text, _| text.len() as f32 * 7.0);
+        let (_, (width, height)) = level_sizes(&level, |text, _| text.len() as f32 * 7.0);
         assert!(width > width_of_level(&level, |text, _| text.len() as f32 * 7.0));
         assert!(height > height_of(&level));
+    }
+
+    #[test]
+    fn preparation_borrows_nested_labels_and_measures_each_level_once() {
+        let level = Level {
+            entries: vec![
+                MenuEntry::item("Open"),
+                MenuEntry::Separator,
+                MenuEntry::Submenu {
+                    label: "Move to".into(),
+                    entries: vec![
+                        MenuEntry::checked(
+                            "A destination with a label wide enough to fill the panel",
+                            true,
+                        )
+                        .with_icon(Icon::Folder),
+                        MenuEntry::Submenu {
+                            label: "Nested".into(),
+                            entries: vec![MenuEntry::Separator, MenuEntry::item("Here")],
+                            icon: None,
+                        },
+                    ],
+                    icon: Some(Icon::Folder),
+                },
+            ],
+            base: 0,
+            title: Some("Parent".into()),
+        };
+        let MenuEntry::Item { label: open, .. } = &level.entries[0] else {
+            unreachable!()
+        };
+        let MenuEntry::Submenu {
+            label: move_to,
+            entries,
+            ..
+        } = &level.entries[2]
+        else {
+            unreachable!()
+        };
+        let MenuEntry::Item {
+            label: destination, ..
+        } = &entries[0]
+        else {
+            unreachable!()
+        };
+        let MenuEntry::Submenu {
+            label: nested,
+            entries,
+            ..
+        } = &entries[1]
+        else {
+            unreachable!()
+        };
+        let MenuEntry::Item { label: here, .. } = &entries[1] else {
+            unreachable!()
+        };
+        let parent = level.title.as_deref().unwrap();
+        let calls = RefCell::new(Vec::new());
+        let (root, maximum) = level_sizes(&level, |text, weight| {
+            calls.borrow_mut().push((text.as_ptr(), weight));
+            text.len() as f32 * 7.0
+        });
+        let expected_height = 3.0 * ROW_HEIGHT + 2.0 * SEPARATOR_HEIGHT + 2.0 * (PADDING + BORDER);
+        assert_eq!(root, (MIN_WIDTH, expected_height));
+        assert_eq!(maximum, (MAX_WIDTH, expected_height));
+        assert_eq!(
+            *calls.borrow(),
+            vec![
+                (open.as_ptr(), FontWeight::NORMAL),
+                (move_to.as_ptr(), FontWeight::NORMAL),
+                (parent.as_ptr(), FontWeight::MEDIUM),
+                (destination.as_ptr(), FontWeight::NORMAL),
+                (nested.as_ptr(), FontWeight::NORMAL),
+                (move_to.as_ptr(), FontWeight::MEDIUM),
+                (here.as_ptr(), FontWeight::NORMAL),
+                (nested.as_ptr(), FontWeight::MEDIUM),
+            ]
+        );
     }
 }

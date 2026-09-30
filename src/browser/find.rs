@@ -24,26 +24,75 @@ pub(crate) const FIND_HEIGHT: f32 = 40.0;
 pub(crate) const FIND_MOVE: Duration = Duration::from_millis(160);
 
 /// Counts the page's matches for a query, as `find` can't.
-const COUNT_SCRIPT: &str = "(q => { const t = (document.body && document.body.innerText || '').toLocaleLowerCase(); \
-    let n = 0, i = 0; while ((i = t.indexOf(q, i)) !== -1) { n++; i += q.length; } return n; })";
+const COUNT_SCRIPT: &str = r#"(q => {
+    if (!q) return 0;
+    const watch = window.__vamprowserFindWatch;
+    let text;
+    if (watch && watch.body === document.body) {
+        // CSSOM edits don't emit DOM mutations. Refresh on the next
+        // search after a short age limit, without an idle polling timer.
+        if (watch.dirty || performance.now() - watch.sampledAt >= 1500) {
+            watch.text = (document.body.innerText || '').toLocaleLowerCase();
+            watch.dirty = false;
+            watch.query = undefined;
+            watch.sampledAt = performance.now();
+        }
+        if (watch.query === q) return watch.count;
+        text = watch.text;
+    } else {
+        text = (document.body && document.body.innerText || '').toLocaleLowerCase();
+    }
+    let n = 0, i = 0;
+    while ((i = text.indexOf(q, i)) !== -1) { n++; i += q.length; }
+    if (watch && watch.body === document.body) {
+        watch.query = q;
+        watch.count = n;
+    }
+    return n;
+})"#;
 
 /// A DOM change costs almost nothing until it settles. During continuous
 /// updates (including generated text), report at most once every 1.5 seconds.
 const WATCH_SCRIPT: &str = r#"(serial => {
+    const previous = window.__vamprowserFindWatch;
+    if (previous && previous.body === document.body) {
+        previous.serial = serial;
+        return;
+    }
     window.__vamprowserFindWatch?.stop();
     if (!document.body) return;
     let timer;
-    const observer = new MutationObserver(() => {
+    const watch = {body: document.body, serial, dirty: true, text: ''};
+    const dirty = () => {
+        watch.dirty = true;
         if (timer) return;
         timer = setTimeout(() => {
             timer = undefined;
-            window.ipc.postMessage('find-dirty:' + serial);
+            window.ipc.postMessage('find-dirty:' + watch.serial);
         }, 1500);
-    });
-    observer.observe(document.body, {subtree: true, childList: true, characterData: true});
-    window.__vamprowserFindWatch = {
-        stop() { observer.disconnect(); clearTimeout(timer); }
     };
+    const observer = new MutationObserver(dirty);
+    observer.observe(document.documentElement, {
+        subtree: true, childList: true, characterData: true,
+        attributes: true, attributeFilter: ['style', 'class', 'hidden', 'aria-hidden', 'open']
+    });
+    addEventListener('resize', dirty);
+    const loaded = event => {
+        if (event.target === window || event.target?.tagName === 'LINK') dirty();
+    };
+    addEventListener('load', loaded, true);
+    addEventListener('transitionend', dirty, true);
+    addEventListener('animationend', dirty, true);
+    document.fonts?.addEventListener('loadingdone', dirty);
+    watch.stop = () => {
+        observer.disconnect(); clearTimeout(timer);
+        removeEventListener('resize', dirty);
+        removeEventListener('load', loaded, true);
+        removeEventListener('transitionend', dirty, true);
+        removeEventListener('animationend', dirty, true);
+        document.fonts?.removeEventListener('loadingdone', dirty);
+    };
+    window.__vamprowserFindWatch = watch;
 })"#;
 const STOP_WATCH_SCRIPT: &str = "window.__vamprowserFindWatch?.stop(); window.__vamprowserFindWatch = undefined";
 
@@ -69,13 +118,7 @@ impl Browser {
         }
         self.close_palette(cx);
         self.find.open = true;
-        crate::keyboard_to_gpui(self.ns_window, self.ns_view);
-        let focus = self.find_input.read(cx).focus_handle.clone();
-        window.focus(&focus, cx);
-        cx.on_next_frame(window, move |_, window, cx| {
-            focus.dispatch_action(&vampir::text_input::SelectAll, window, cx);
-        });
-        self.sync_key_flags(window, cx);
+        self.focus_text_input(self.find_input.clone(), true, window, cx);
         self.find_step(false, cx);
         cx.notify();
     }
@@ -111,8 +154,11 @@ impl Browser {
         self.find.serial += 1;
         let serial = self.find.serial;
         let tab = self.current().id;
-        self.stop_find_watch();
+        if self.find.watching.is_some_and(|watching| watching != tab) {
+            self.stop_find_watch();
+        }
         if query.is_empty() || self.current().page != Page::Web {
+            self.stop_find_watch();
             self.find.found = None;
             self.find.count = None;
             cx.notify();
@@ -192,6 +238,8 @@ impl Browser {
         if serial != self.find.serial || tab != self.current().id || !self.find.open {
             return;
         }
+        let changed = (found.is_some() && found != self.find.found)
+            || (count.is_some() && count != self.find.count);
         if found.is_some() {
             self.find.found = found;
         }
@@ -205,7 +253,9 @@ impl Browser {
                 }
             }
         }
-        cx.notify();
+        if changed {
+            cx.notify();
+        }
     }
 
     pub(crate) fn find_bar(&mut self, height: f32, palette: Palette, window: &Window, cx: &mut Context<Self>) -> AnyElement {

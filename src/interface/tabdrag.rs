@@ -299,6 +299,24 @@ impl Browser {
         });
     }
 
+    /// Cancels a stale press without adopting a carried tab or activating
+    /// a window. A torn-off tab stays in its already-created window.
+    pub(crate) fn cancel_tab_drag(&mut self, cx: &mut Context<Self>) {
+        let drag = self.tab_drag.take();
+        self.hint_drop(None, cx);
+        if let Some(drag) = drag {
+            if let Some(carrier) = drag.carrier
+                && carrier.browser.upgrade().is_some()
+            {
+                set_alpha(carrier.ns_window, 1.0);
+            }
+            if drag.active {
+                self.persist();
+            }
+            cx.notify();
+        }
+    }
+
     pub(crate) fn drag_ended(&mut self, cx: &mut Context<Self>) {
         let Some(drag) = self.tab_drag.take() else {
             return;
@@ -580,9 +598,14 @@ impl Browser {
                         }
                     });
                     let ended = me.clone();
-                    window.on_mouse_event(move |_: &MouseUpEvent, phase, _, cx| {
+                    window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
                         if phase == DispatchPhase::Capture {
-                            let _ = ended.update(cx, |browser, cx| browser.drag_ended(cx));
+                            if crate::is_drag_cancel(event) {
+                                window.release_pointer();
+                                let _ = ended.update(cx, |browser, cx| browser.cancel_tab_drag(cx));
+                            } else {
+                                let _ = ended.update(cx, |browser, cx| browser.drag_ended(cx));
+                            }
                         }
                     });
                 },

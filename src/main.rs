@@ -33,6 +33,8 @@ mod reader;
 mod url_observer;
 
 // Data
+#[path = "data/background.rs"]
+mod background;
 #[path = "data/cache.rs"]
 mod cache;
 #[path = "data/history.rs"]
@@ -515,6 +517,12 @@ fn mouse_navigation(button: isize) -> Option<Command> {
         4 => Some(Command::Forward),
         _ => None,
     }
+}
+
+/// The macOS drag watchdog uses an outside, zero-count release to cancel
+/// a press whose real mouse-up went to a native view or another app.
+fn is_drag_cancel(event: &MouseUpEvent) -> bool {
+    event.click_count == 0 && event.position == point(px(-1.0), px(-1.0))
 }
 
 /// Notices clicks that land in a page. WebKit's views sit on top of GPUI's,
@@ -1360,6 +1368,7 @@ struct ClosedTab {
 struct PaletteState {
     input: Entity<TextInput>,
     highlight: usize,
+    rows: RefCell<Option<palette::RowsCache>>,
     /// A still of the page it covers; the live page is hidden meanwhile,
     /// as GPUI can't paint over it.
     snapshot: Option<Arc<gpui::Image>>,
@@ -1449,6 +1458,7 @@ struct Common {
     sessions: RefCell<Vec<(u64, state::SavedWindow)>>,
     /// The state file as last written, to rewrite with a window gone.
     saved: RefCell<SavedState>,
+    state_writer: background::LatestWorker<SavedState>,
     /// Settings pages read as they load (HTTPS-only, where downloads go,
     /// site permissions), shared by every page in every window, so a tab
     /// dragged to another window keeps following them.
@@ -1490,6 +1500,8 @@ struct Common {
     /// Numbers each build of uBlock Origin's rules, so only the latest
     /// takes effect.
     ublock_build: Cell<u64>,
+    ublock_refreshed: Cell<Option<std::time::Instant>>,
+    ublock_worker: background::LatestWorker<(u64, filters::UblockState)>,
     next_window: Cell<u64>,
 }
 
@@ -1500,6 +1512,25 @@ impl Common {
         // Read the old hosts now; configure WebKit's store when a page first
         // needs it, before WebKit can fix its proxy configuration.
         legacy_http::load_saved();
+        let state_writer = background::LatestWorker::new("session-writer", |state: SavedState| {
+            if let Err(err) = state.save() {
+                eprintln!("Could not save state: {err}");
+            }
+        });
+        let filters_ready = anywhere.clone();
+        let ublock_worker = background::LatestWorker::new(
+            "ublock-builder",
+            move |(build, state): (u64, filters::UblockState)| {
+                let Some(dir) = state::data_path("Extensions").map(|d| d.join(filters::UBLOCK_ID)) else {
+                    return;
+                };
+                if let Some(chunks) = filters::build(&dir, &state) {
+                    let fingerprints = chunks.iter().map(|c| filters::fingerprint(c)).collect();
+                    let rules = chunks.iter().map(|c| c.matches("\"trigger\"").count()).sum();
+                    let _ = filters_ready.try_send(BrowserEvent::UblockRules(build, chunks, fingerprints, rules));
+                }
+            },
+        );
         Rc::new(Self {
             history: RefCell::new(History::load()),
             downloads: RefCell::new(Downloads::load()),
@@ -1515,6 +1546,7 @@ impl Common {
             routes: RefCell::new(HashMap::new()),
             sessions: RefCell::new(Vec::new()),
             saved: RefCell::new(saved),
+            state_writer,
             live: Live::new(&Settings::load()),
             handoff: RefCell::default(),
             checking_updates: Cell::new(None),
@@ -1530,6 +1562,8 @@ impl Common {
             stranded: RefCell::default(),
             ublock_state: RefCell::new(None),
             ublock_build: Cell::new(0),
+            ublock_refreshed: Cell::new(None),
+            ublock_worker,
             next_window: Cell::new(1),
         })
     }
@@ -1618,9 +1652,7 @@ impl Common {
         });
         state.tabs = tabs;
         state.selected = selected;
-        if let Err(err) = state.save() {
-            eprintln!("Could not save state: {err}");
-        }
+        self.state_writer.submit(state.clone());
     }
 
     /// Keeps a window for ⌘⇧T to reopen, the ten closed last; not one
@@ -1822,6 +1854,8 @@ struct Browser {
     wake_pending: bool,
     /// Keep the downloads page quick to open even with a long history.
     download_page_offset: usize,
+    /// An initial file-size lookup requested by this window's visible rows.
+    download_sizes_pending: Cell<bool>,
     recently_closed: Vec<ClosedTab>,
     palette: Option<PaletteState>,
     palette_open: Rc<Cell<bool>>,
@@ -2271,6 +2305,7 @@ impl Browser {
             redraw_later: None,
             wake_pending: false,
             download_page_offset: 0,
+            download_sizes_pending: Cell::new(false),
             recently_closed: Vec::new(),
             palette: None,
             palette_open: palette_open.clone(),
@@ -2323,23 +2358,6 @@ impl Browser {
             _poll: poll,
         };
         browser.controls.observe_appearance(window, cx);
-        // The caret blinks: a redraw every half blink while a field has the
-        // keyboard, nothing otherwise.
-        browser._caret_blink = Some(cx.spawn_in(window, async move |this, cx| {
-            loop {
-                cx.background_executor().timer(CARET_BLINK).await;
-                let alive = this
-                    .update_in(cx, |browser, window, cx| {
-                        if browser.text_field_focused(window, cx) {
-                            cx.notify();
-                        }
-                    })
-                    .is_ok();
-                if !alive {
-                    break;
-                }
-            }
-        }));
         // Once a minute, unload background tabs that have gone unused.
         cx.spawn_in(window, async move |this, cx| {
             loop {
@@ -3968,6 +3986,7 @@ impl Browser {
                 BrowserEvent::Title(id, title) => {
                     if let Some(index) = self.web_index_of(id)
                         && !title.trim().is_empty()
+                        && self.tabs[index].title != title
                     {
                         let tab = &mut self.tabs[index];
                         tab.title = title.clone();
@@ -4065,9 +4084,15 @@ impl Browser {
                     cx.notify();
                 }
                 BrowserEvent::Tint(key, tint) => {
+                    if self.site_tints.get(&key) == Some(&tint) {
+                        continue;
+                    }
+                    let selected_site = favicon::site_key(&self.current().url).as_deref() == Some(key.as_str());
                     self.site_tints.insert(key, tint);
-                    self.apply_theme();
-                    cx.notify();
+                    if selected_site {
+                        self.apply_theme();
+                        cx.notify();
+                    }
                 }
                 BrowserEvent::Popup(id, url) => {
                     let is_web = matches!(url::Url::parse(&url), Ok(u) if matches!(u.scheme(), "http" | "https"));
@@ -4394,6 +4419,32 @@ impl Browser {
         self.finding.set(self.find_focused(window, cx));
     }
 
+    /// Only a focused field in the active window needs a caret clock.
+    /// Starting and cancelling it with focus avoids waking every idle
+    /// browser window twice a second for its entire lifetime.
+    fn sync_caret_blink(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !window.is_window_active() || !self.text_field_focused(window, cx) {
+            self._caret_blink = None;
+        } else if self._caret_blink.is_none() {
+            self._caret_blink = Some(cx.spawn_in(window, async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(CARET_BLINK).await;
+                    let keep = this.update_in(cx, |browser, window, cx| {
+                        let focused = window.is_window_active()
+                            && browser.text_field_focused(window, cx);
+                        if focused {
+                            cx.notify();
+                        } else {
+                            browser._caret_blink = None;
+                        }
+                        focused
+                    }).unwrap_or(false);
+                    if !keep { break; }
+                }
+            }));
+        }
+    }
+
     /// Saves the session a moment from now, once a burst of changes (titles
     /// ticking over, a window being dragged) has settled; a later call
     /// replaces the pending one.
@@ -4672,6 +4723,37 @@ impl Browser {
         self.focus_address_with_selection(true, window, cx);
     }
 
+    /// Makes a newly shown field ready for text before the next native key
+    /// event. GPUI installs its input handler during paint, so focusing the
+    /// handle alone leaves a gap until the next animation frame.
+    fn focus_text_input(
+        &mut self,
+        input: Entity<TextInput>,
+        select_all: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.caret_epoch = std::time::Instant::now();
+        keyboard_to_gpui(self.ns_window, self.ns_view);
+        let focus = input.read(cx).focus_handle.clone();
+        let original = input.read(cx).content.clone();
+        window.focus(&focus, cx);
+        self.sync_key_flags(window, cx);
+        cx.notify();
+        // End this entity update before drawing the root that owns it.
+        // The handler and selection then exist in this effect cycle,
+        // rather than selecting text typed during the following frame.
+        window.defer(cx, move |window, cx| {
+            if !focus.is_focused(window) {
+                return;
+            }
+            window.draw(cx).clear(cx);
+            if select_all && focus.is_focused(window) && input.read(cx).content == original {
+                focus.dispatch_action(&vampir::text_input::SelectAll, window, cx);
+            }
+        });
+    }
+
     fn focus_address_with_selection(
         &mut self,
         select_all: bool,
@@ -4681,51 +4763,23 @@ impl Browser {
         self.ping = (Some(PingTarget::Omnibox), self.ping.1 + 1);
         // The switcher would otherwise keep the arrows, Enter and Escape.
         self.close_palette(cx);
-        self.caret_epoch = std::time::Instant::now();
-        // Whichever page had the keyboard, even a hidden one from the tab
-        // before, gives it up.
-        keyboard_to_gpui(self.ns_window, self.ns_view);
-        let focus = self.address.read(cx).focus_handle.clone();
-        window.focus(&focus, cx);
-        if select_all {
-            // While unfocused the field shows a styled label, not the input,
-            // so select once the next frame has drawn the input.
-            cx.on_next_frame(window, move |_, window, cx| {
-                focus.dispatch_action(&vampir::text_input::SelectAll, window, cx);
-            });
-        }
-        cx.notify();
+        self.focus_text_input(self.address.clone(), select_all, window, cx);
     }
 
     /// Fetches and compiles uBlock Origin's selected filter lists off the
-    /// main thread; the rules come back as `UblockRules`. Each report from
-    /// its bridge triggers this; unchanged lists come from cache, so it's
-    /// cheap when nothing moved.
+    /// main thread; the rules come back as `UblockRules`. Bursts keep only
+    /// the latest pending state, with one build running at a time.
     fn refresh_ublock_filters(&mut self, state: filters::UblockState) {
-        *self.common.ublock_state.borrow_mut() = Some(state.clone());
-        let Some(dir) = state::data_path("Extensions").map(|d| d.join(filters::UBLOCK_ID)) else {
+        let recent = self.common.ublock_refreshed.get()
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(5 * 60));
+        if recent && self.common.ublock_state.borrow().as_ref() == Some(&state) {
             return;
-        };
-        let sender = self.common.anywhere.clone();
-        // Builds run side by side and finish in any order; numbered, so the
-        // rules that take effect are from the latest report.
+        }
+        *self.common.ublock_state.borrow_mut() = Some(state.clone());
+        self.common.ublock_refreshed.set(Some(std::time::Instant::now()));
         let build = self.common.ublock_build.get() + 1;
         self.common.ublock_build.set(build);
-        std::thread::spawn(move || {
-            if let Some(chunks) = filters::build(&dir, &state) {
-                let fingerprints = chunks.iter().map(|c| filters::fingerprint(c)).collect();
-                let rules = chunks
-                    .iter()
-                    .map(|c| c.matches("\"trigger\"").count())
-                    .sum();
-                let _ = sender.try_send(BrowserEvent::UblockRules(
-                    build,
-                    chunks,
-                    fingerprints,
-                    rules,
-                ));
-            }
-        });
+        self.common.ublock_worker.submit((build, state));
     }
 
     fn set_ublock_rules(&mut self, chunks: Vec<String>, fingerprints: Vec<String>) {
@@ -5581,34 +5635,6 @@ impl Browser {
             // How far the page has loaded, along the field's bottom edge,
             // as Safari shows it.
             .relative()
-            .when(ping_omnibox, |el| {
-                let accent = palette.accent;
-                el.child(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .left_0()
-                        .right_0()
-                        .bottom_0()
-                        .rounded(px(10.0))
-                        .with_animation(
-                            ("omnibox-ping", generation),
-                            Animation::new(slowed(Duration::from_millis(520)))
-                                .with_easing(|t: f32| 1.0 - (1.0 - t).powi(3)),
-                            move |ring, t| {
-                                let grow = px(5.0 * t);
-                                ring.top(-grow)
-                                    .left(-grow)
-                                    .right(-grow)
-                                    .bottom(-grow)
-                                    .rounded(px(10.0) + grow)
-                                    .border_2()
-                                    .border_color(color::with_alpha(accent, 0.7 * (1.0 - t)))
-                                    .bg(color::with_alpha(accent, 0.3 * (1.0 - t)))
-                            },
-                        ),
-                )
-            })
             .when_some(self.progress, |el, (fraction, opacity)| {
                 el.child(
                     div()
@@ -5757,6 +5783,36 @@ impl Browser {
                     );
                 }
                 el.child(star.child(button))
+            })
+            // Draw the pulse last so the idle address label's opaque backing
+            // cannot cover its center with a rectangular cutout.
+            .when(ping_omnibox, |el| {
+                let accent = palette.accent;
+                el.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .bottom_0()
+                        .rounded(px(10.0))
+                        .with_animation(
+                            ("omnibox-ping", generation),
+                            Animation::new(slowed(Duration::from_millis(520)))
+                                .with_easing(|t: f32| 1.0 - (1.0 - t).powi(3)),
+                            move |ring, t| {
+                                let grow = px(5.0 * t);
+                                ring.top(-grow)
+                                    .left(-grow)
+                                    .right(-grow)
+                                    .bottom(-grow)
+                                    .rounded(px(10.0) + grow)
+                                    .border_2()
+                                    .border_color(color::with_alpha(accent, 0.7 * (1.0 - t)))
+                                    .bg(color::with_alpha(accent, 0.3 * (1.0 - t)))
+                            },
+                        ),
+                )
             })
     }
 
@@ -6591,7 +6647,9 @@ impl Render for Browser {
             }
         }
         self.sync_key_flags(window, cx);
+        self.sync_caret_blink(window, cx);
         self.show_notice_away_from_settings(cx);
+        self.download_sizes_pending.set(false);
         // Moved or resized: the session keeps where it is.
         let bounds = window.bounds();
         let bounds = Some([
@@ -6668,7 +6726,7 @@ impl Render for Browser {
         let shelf_height =
             self.controls
                 .tween_from("download-shelf-height", 0.0, shelf_target, LAYOUT_MOVE);
-        let web_page = self.current().page == Page::Web && self.palette.is_none();
+        let web_page = self.current().page == Page::Web && !self.palette_open.get();
         let find_target = if self.find.open && web_page {
             find::FIND_HEIGHT
         } else {
@@ -6714,6 +6772,14 @@ impl Render for Browser {
             0.0
         };
         let peek_top = TOOLBAR_HEIGHT * reveal + bookmarks_height + strip_height;
+        // Native pages can move with the controls. In particular, a new
+        // Start Page must not leave its heading behind the revealed tab strip
+        // while the address field has focus in minimal mode.
+        let minimal_page_top = if self.current().page == Page::Web {
+            minimal_bar_height
+        } else {
+            minimal_bar_height.max(peek_top)
+        };
         let clip_top = if self.minimal {
             // The page starts below the peeking bar. Clip only the part
             // covered by the controls as they slide over that inset.
@@ -6845,7 +6911,10 @@ impl Render for Browser {
         };
         let progress = self.progress;
         // The find bar above the page, which gives it the room.
-        let find_bar = (find_height > 0.5).then(|| self.find_bar(find_height, palette, window, cx));
+        // Keep the opening field in the paint tree at height zero as well:
+        // clipping hides it while its text-input handler becomes ready.
+        let find_bar = ((self.find.open && web_page) || find_height > 0.5)
+            .then(|| self.find_bar(find_height, palette, window, cx));
         let web_area = div()
             .flex_1()
             .h_full()
@@ -6896,6 +6965,7 @@ impl Render for Browser {
                 self.page_clip.setHidden(true);
             }
         }
+        let recovery = cx.weak_entity();
         let mut root = vampir::root(div().id("root"), self, cx)
             .relative()
             .size_full()
@@ -6905,11 +6975,46 @@ impl Render for Browser {
             .text_size(px(13.0))
             .bg(chrome.ground)
             .text_color(palette.text_primary)
+            .capture_any_mouse_up(cx.listener(|this, event, window, cx| {
+                if is_drag_cancel(event) {
+                    window.release_pointer();
+                    this.cancel_tab_drag(cx);
+                    this.finish_download_drag(cx);
+                    this.controls.end_drag();
+                    cx.notify();
+                }
+            }))
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
                     this.finish_download_drag(cx);
                 }),
+            )
+            // Outside releases do not hover the root hitbox. Register an
+            // unconditional capture listener before painting descendants,
+            // and let the event continue so GPUI clears their press state.
+            .child(
+                canvas(
+                    |_, _, _| {},
+                    move |_, _, window, _| {
+                        let recovery = recovery.clone();
+                        window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
+                            if phase == gpui::DispatchPhase::Capture && is_drag_cancel(event) {
+                                window.release_pointer();
+                                let _ = recovery.update(cx, |browser, cx| {
+                                    browser.cancel_tab_drag(cx);
+                                    browser.finish_download_drag(cx);
+                                    browser.controls.end_drag();
+                                    cx.notify();
+                                });
+                            }
+                        });
+                    },
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full(),
             );
         let mut top_chrome = div().w_full().flex().flex_col();
         top_chrome = if self.compact {
@@ -6971,7 +7076,7 @@ impl Render for Browser {
         }
         if self.minimal {
             root = root
-                .child(div().h(px(minimal_bar_height)).flex_none())
+                .child(div().h(px(minimal_page_top)).flex_none())
                 .child(body);
             if let Some(bar) = self.minimal_bar(palette, minimal_bar_height) {
                 root = root.child(div().absolute().top_0().left_0().w_full().child(bar));
@@ -7054,7 +7159,7 @@ impl Render for Browser {
             window.request_animation_frame();
         } else if progress.is_some() {
             self.redraw_soon(Duration::from_millis(66), cx);
-        } else if downloads::sizes_pending() {
+        } else if self.download_sizes_pending.get() {
             self.redraw_soon(Duration::from_millis(250), cx);
         } else if downloading {
             self.redraw_soon(Duration::from_millis(250), cx);
@@ -7661,7 +7766,7 @@ fn main() {
                 cx.background_executor()
                     .timer(Duration::from_secs(30))
                     .await;
-                history.history.borrow_mut().save();
+                history.history.borrow_mut().save_periodically();
                 sitedata::keep_cookies();
             }
         })
@@ -7675,6 +7780,7 @@ fn main() {
             for browser in quitting.browsers() {
                 browser.update(cx, |browser, _| browser.persist());
             }
+            quitting.state_writer.flush();
             quitting.history.borrow_mut().save();
             sitedata::keep_cookies();
             async {}
@@ -7739,6 +7845,25 @@ fn main() {
 #[cfg(test)]
 mod browser_input_tests {
     use super::*;
+
+    #[test]
+    fn drag_watchdog_release_cancels_without_treating_native_releases_as_cancellations() {
+        let mut event = MouseUpEvent {
+            position: point(px(-1.0), px(-1.0)),
+            click_count: 0,
+            ..Default::default()
+        };
+        assert!(is_drag_cancel(&event));
+        event.button = MouseButton::Right;
+        assert!(is_drag_cancel(&event));
+        event.click_count = 1;
+        assert!(!is_drag_cancel(&event));
+        event.click_count = 0;
+        event.position = point(px(40.0), px(30.0));
+        assert!(!is_drag_cancel(&event));
+        event.position = point(px(-1.0), px(30.0));
+        assert!(!is_drag_cancel(&event));
+    }
 
     #[test]
     fn command_arrows_navigate_without_option_or_shift() {

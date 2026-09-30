@@ -8,8 +8,8 @@
   <key>CFBundleIdentifier</key><string>dev.oops404.vamprowser</string>
   <key>CFBundleName</key><string>Vamprowser</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.4.9</string>
-  <key>CFBundleVersion</key><string>14</string>
+  <key>CFBundleShortVersionString</key><string>0.4.10</string>
+  <key>CFBundleVersion</key><string>15</string>
   <key>LSApplicationCategoryType</key><string>public.app-category.productivity</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>NSHighResolutionCapable</key><true/>

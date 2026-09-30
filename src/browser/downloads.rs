@@ -97,14 +97,6 @@ fn sizes() -> &'static Mutex<HashMap<PathBuf, Seen>> {
     SIZES.get_or_init(Mutex::default)
 }
 
-/// Whether a file's size is still being looked up for the first time, to
-/// draw again once it's in.
-pub fn sizes_pending() -> bool {
-    sizes()
-        .lock()
-        .is_ok_and(|sizes| sizes.values().any(|seen| seen.pending && seen.size.is_none()))
-}
-
 /// Looks at `path` on a thread kept for it.
 fn look_up(path: PathBuf) {
     static QUEUE: OnceLock<async_channel::Sender<PathBuf>> = OnceLock::new();

@@ -333,14 +333,21 @@ fn is_dark_ink(pixels: &RgbaImage) -> bool {
 }
 
 fn agent() -> ureq::Agent {
-    ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(10)))
-        .user_agent(
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 \
-             (KHTML, like Gecko) Version/18.0 Safari/605.1.15",
-        )
-        .build()
-        .into()
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    // Clones share the connection pool: pages and their icons often use
+    // the same hosts, so don't repeat DNS/TLS setup for every bookmark.
+    AGENT
+        .get_or_init(|| {
+            ureq::Agent::config_builder()
+                .timeout_global(Some(Duration::from_secs(10)))
+                .user_agent(
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 \
+                 (KHTML, like Gecko) Version/18.0 Safari/605.1.15",
+                )
+                .build()
+                .into()
+        })
+        .clone()
 }
 
 /// Finds and fetches the best icon for `page_url`, as normalised PNG.
@@ -418,22 +425,45 @@ fn normalise(bytes: &[u8], mime: Option<&str>) -> Option<Vec<u8>> {
         if mime.is_some_and(|m| m.starts_with("text/")) {
             return None;
         }
-        image::load_from_memory(bytes).ok()?.into_rgba8()
+        let mut reader = image::ImageReader::new(Cursor::new(bytes))
+            .with_guessed_format()
+            .ok()?;
+        let mut limits = image::Limits::default();
+        limits.max_alloc = Some(64 << 20);
+        limits.max_image_width = Some(8192);
+        limits.max_image_height = Some(8192);
+        reader.limits(limits);
+        reader.decode().ok()?.into_rgba8()
     };
     if pixels.width() < 8 || pixels.height() < 8 || pixels.pixels().all(|p| p[3] == 0) {
         return None;
     }
-    let pixels = square(pixels);
-    let pixels = if pixels.width() > ICON_PX {
-        image::imageops::resize(&pixels, ICON_PX, ICON_PX, FilterType::Lanczos3)
+    // Resize before padding: a 4096x1024 image needs a 64x16 thumbnail,
+    // rather than an additional 4096x4096 allocation and filtering pass.
+    let (width, height) = thumbnail_dimensions(pixels.width(), pixels.height());
+    let pixels = if pixels.dimensions() != (width, height) {
+        image::imageops::resize(&pixels, width, height, FilterType::Lanczos3)
     } else {
         pixels
     };
+    let pixels = square(pixels);
     let mut png = Vec::new();
     image::DynamicImage::ImageRgba8(pixels)
         .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
         .ok()?;
     Some(png)
+}
+
+fn thumbnail_dimensions(width: u32, height: u32) -> (u32, u32) {
+    let side = width.max(height);
+    if side <= ICON_PX {
+        return (width, height);
+    }
+    let scaled = |size| {
+        ((u64::from(size) * u64::from(ICON_PX) + u64::from(side) / 2) / u64::from(side)).max(1)
+            as u32
+    };
+    (scaled(width), scaled(height))
 }
 
 /// Centres a non-square image on a transparent square.
@@ -683,6 +713,26 @@ mod tests {
             .write_to(&mut Cursor::new(&mut bytes), image::ImageFormat::Png)
             .unwrap();
         assert_eq!(normalise(&bytes, None), None);
+    }
+
+    #[test]
+    fn scales_wide_and_tall_icons_before_padding_them() {
+        assert_eq!(thumbnail_dimensions(4096, 1024), (64, 16));
+        assert_eq!(thumbnail_dimensions(1024, 4096), (16, 64));
+        assert_eq!(thumbnail_dimensions(8192, 8), (64, 1));
+        assert_eq!(thumbnail_dimensions(24, 16), (24, 16));
+        for (width, height) in [(256, 64), (64, 256)] {
+            let image = RgbaImage::from_pixel(width, height, image::Rgba([180, 20, 40, 255]));
+            let mut bytes = Vec::new();
+            image::DynamicImage::ImageRgba8(image)
+                .write_to(&mut Cursor::new(&mut bytes), image::ImageFormat::Png)
+                .unwrap();
+            let png = normalise(&bytes, None).unwrap();
+            let image = image::load_from_memory(&png).unwrap().into_rgba8();
+            assert_eq!(image.dimensions(), (64, 64));
+            assert_eq!(image.get_pixel(0, 0)[3], 0);
+            assert_eq!(image.get_pixel(32, 32)[3], 255);
+        }
     }
 
     #[test]
