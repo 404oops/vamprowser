@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.4.12 — 2026-10-06
+
+- Proton Pass sign-in now also works in the tab the extension opens. WebKit put its page messaging back on that tab after the page had hidden it, so Proton's page still sent its hand-off to Chrome and Safari extension ids; the names now stay hidden on Proton's pages.
+
 ## v0.4.11 — 2026-10-06
 
 - Typing in web pages no longer passes keys through the browser's own input handling as well. Arrow keys no longer insert square characters, and editors such as X's composer no longer double the first character on a line. The page-specific workarounds for both are removed.

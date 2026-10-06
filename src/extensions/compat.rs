@@ -23,7 +23,7 @@ use std::{
 use serde_json::Value;
 
 /// Bumped whenever [`apply`] learns something new.
-const VERSION: u32 = 20;
+const VERSION: u32 = 21;
 const MARKER: &str = ".vamprowser-compat";
 const SCRIPT_FILE: &str = "vamprowser-compat.js";
 const WORKER_FILE: &str = "vamprowser-worker.js";
@@ -491,14 +491,15 @@ const PROTON_PAGES: [&str; 2] = ["https://account.proton.me/*", "https://pass.pr
 /// Firefox add-on answers to: "An error occurred while communicating with
 /// the extension". Without it the page posts to the add-on's content script
 /// (`external.js`), which forwards to its background, as in Firefox.
+/// WebKit adds `browser` back when a tab an extension opened is handed to
+/// it after loading has started, so deleting it isn't enough: both names
+/// become fixed properties that read as undefined and ignore writes.
 const PROTON_PAGE: &str = r#"/* Vamprowser: Proton's pages talk to Proton Pass through its content script, as in Firefox. */
 (() => {
   for (const name of ['browser', 'chrome']) {
     try {
-      if (!(name in globalThis)) continue;
-      if (!delete globalThis[name]) {
-        Object.defineProperty(globalThis, name, { value: undefined, configurable: true, writable: true });
-      }
+      delete globalThis[name];
+      Object.defineProperty(globalThis, name, { get() {}, set(_) {}, configurable: false });
     } catch (_) {}
   }
 })();
