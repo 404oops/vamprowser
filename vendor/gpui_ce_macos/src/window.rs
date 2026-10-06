@@ -2242,6 +2242,27 @@ unsafe fn is_ime_input_source_active() -> bool {
     }
 }
 
+/// Whether the window's first responder is a view inside this one, rather
+/// than this view itself.
+unsafe fn subview_has_keyboard(this: &Object) -> bool {
+    unsafe {
+        let window: id = msg_send![this, window];
+        if window.is_null() {
+            return false;
+        }
+        let responder: id = msg_send![window, firstResponder];
+        if responder.is_null() || responder == this as *const Object as id {
+            return false;
+        }
+        let is_view: BOOL = msg_send![responder, isKindOfClass: class!(NSView)];
+        if is_view != YES {
+            return false;
+        }
+        let inside: BOOL = msg_send![responder, isDescendantOf: this];
+        inside == YES
+    }
+}
+
 extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: bool) -> BOOL {
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.as_ref().lock();
@@ -2277,6 +2298,21 @@ extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: 
             }
 
             drop(lock);
+
+            // A native subview (a WKWebView) has the keyboard: AppKit offers
+            // its arrow and function keys to every view as key equivalents,
+            // and the subview passes keys its page handled itself up the
+            // responder chain to this view. They're the subview's text, not
+            // GPUI's: fed to this view's input context, the text system
+            // inserts them into the subview a second time (doubled letters,
+            // or 0x1c-0x1f for arrows). Only key bindings may act on them.
+            if unsafe { subview_has_keyboard(this) } {
+                let modifiers = &key_down_event.keystroke.modifiers;
+                if modifiers.platform || modifiers.control {
+                    return run_callback(PlatformInput::KeyDown(key_down_event));
+                }
+                return NO;
+            }
 
             let is_composing =
                 with_input_handler(this, |input_handler| input_handler.marked_text_range())

@@ -1287,8 +1287,15 @@ impl Browser {
                     let moved = me.clone();
                     window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
                         if phase == DispatchPhase::Capture {
+                            // A move without the button down means its
+                            // release went unheard: the band is done.
+                            let released = event.pressed_button != Some(MouseButton::Left);
                             let _ = moved.update(cx, |browser, cx| {
-                                browser.move_selection_band(event.position);
+                                if released {
+                                    browser.bookmark_selection.band = None;
+                                } else {
+                                    browser.move_selection_band(event.position);
+                                }
                                 cx.notify();
                             });
                         }

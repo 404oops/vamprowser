@@ -8,6 +8,9 @@
 //!   settles the encoding without changing a character of the code.
 //! - [`SCRIPT`] runs before the extension's own code in every background,
 //!   content-script and page context; see its comments.
+//! - Proton's sign-in pages reach Proton Pass the Firefox way, through its
+//!   content script, rather than WebKit's page messaging; see
+//!   [`PROTON_PAGE`].
 //!
 //! Every step is idempotent, and [`VERSION`] reapplies them to extensions
 //! installed before a change here.
@@ -20,7 +23,7 @@ use std::{
 use serde_json::Value;
 
 /// Bumped whenever [`apply`] learns something new.
-const VERSION: u32 = 19;
+const VERSION: u32 = 20;
 const MARKER: &str = ".vamprowser-compat";
 const SCRIPT_FILE: &str = "vamprowser-compat.js";
 const WORKER_FILE: &str = "vamprowser-worker.js";
@@ -330,6 +333,7 @@ pub fn apply(dir: &Path) -> Result<(), String> {
     }
     patch_manifest(dir)?;
     bridge_ublock(dir)?;
+    bridge_proton_pass(dir)?;
     fs::write(marker, VERSION.to_string()).map_err(|err| err.to_string())
 }
 
@@ -469,6 +473,92 @@ fn bridge_ublock(dir: &Path) -> Result<(), String> {
             }
         }
     }
+    let text = serde_json::to_string_pretty(&manifest).map_err(|err| err.to_string())?;
+    fs::write(&path, text).map_err(|err| err.to_string())
+}
+
+const PROTON_PASS_ID: &str = "78272b6fa58f4a1abaac99321d503a20@proton.me";
+const PROTON_PAGE_FILE: &str = "vamprowser-proton.js";
+/// Where Proton Pass's `external.js` listens, should its manifest not say.
+const PROTON_PAGES: [&str; 2] = ["https://account.proton.me/*", "https://pass.proton.me/*"];
+
+/// Runs in the page's own world on Proton's account pages, before their
+/// scripts. WebKit gives every web page a `browser.runtime` with
+/// `sendMessage` and `connect` for messaging extensions that declare
+/// `externally_connectable`, which Firefox never does. Proton's sign-in page
+/// (account.proton.me/auth-ext) sees it, and with a Safari user agent sends
+/// its hand-off to Proton Pass's Chrome and Safari extension ids, which no
+/// Firefox add-on answers to: "An error occurred while communicating with
+/// the extension". Without it the page posts to the add-on's content script
+/// (`external.js`), which forwards to its background, as in Firefox.
+const PROTON_PAGE: &str = r#"/* Vamprowser: Proton's pages talk to Proton Pass through its content script, as in Firefox. */
+(() => {
+  for (const name of ['browser', 'chrome']) {
+    try {
+      if (!(name in globalThis)) continue;
+      if (!delete globalThis[name]) {
+        Object.defineProperty(globalThis, name, { value: undefined, configurable: true, writable: true });
+      }
+    } catch (_) {}
+  }
+})();
+"#;
+
+/// Gives Proton Pass a page-world script on the pages its `external.js`
+/// content script serves, hiding WebKit's page messaging there.
+fn bridge_proton_pass(dir: &Path) -> Result<(), String> {
+    let path = dir.join("manifest.json");
+    let text = fs::read_to_string(&path).map_err(|err| err.to_string())?;
+    let Ok(mut manifest) = serde_json::from_str::<Value>(&text) else {
+        return Ok(());
+    };
+    let id = manifest
+        .pointer("/browser_specific_settings/gecko/id")
+        .or_else(|| manifest.pointer("/applications/gecko/id"))
+        .and_then(Value::as_str);
+    if id != Some(PROTON_PASS_ID) {
+        return Ok(());
+    }
+    let Some(scripts) = manifest
+        .get_mut("content_scripts")
+        .and_then(Value::as_array_mut)
+    else {
+        return Ok(());
+    };
+    let ours = Value::String(PROTON_PAGE_FILE.into());
+    scripts.retain(|entry| {
+        !entry
+            .get("js")
+            .and_then(Value::as_array)
+            .is_some_and(|js| js.contains(&ours))
+    });
+    let external = Value::String("external.js".into());
+    let mut matches: Vec<Value> = scripts
+        .iter()
+        .filter(|entry| {
+            entry
+                .get("js")
+                .and_then(Value::as_array)
+                .is_some_and(|js| js.contains(&external))
+        })
+        .filter_map(|entry| entry.get("matches").and_then(Value::as_array))
+        .flatten()
+        .cloned()
+        .collect();
+    if matches.is_empty() {
+        matches = PROTON_PAGES
+            .iter()
+            .map(|&page| Value::String(page.into()))
+            .collect();
+    }
+    scripts.push(serde_json::json!({
+        "matches": matches,
+        "js": [PROTON_PAGE_FILE],
+        "all_frames": false,
+        "run_at": "document_start",
+        "world": "MAIN",
+    }));
+    fs::write(dir.join(PROTON_PAGE_FILE), PROTON_PAGE).map_err(|err| err.to_string())?;
     let text = serde_json::to_string_pretty(&manifest).map_err(|err| err.to_string())?;
     fs::write(&path, text).map_err(|err| err.to_string())
 }
@@ -712,6 +802,31 @@ mod tests {
         );
         assert_eq!(manifest["content_scripts"][0]["js"][0], SCRIPT_FILE);
         assert_eq!(manifest["content_scripts"][1]["js"][0], "main.js");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn proton_pass_pages_lose_webkit_page_messaging() {
+        let dir = temp_extension(&format!(
+            r#"{{"manifest_version":3,"name":"Proton Pass","version":"1",
+               "content_scripts":[{{"matches":["https://*/*"],"js":["orchestrator.js"]}},
+                                  {{"matches":["https://account.proton.me/*"],"js":["external.js"]}}],
+               "browser_specific_settings":{{"gecko":{{"id":"{PROTON_PASS_ID}"}}}}}}"#
+        ));
+        apply(&dir).unwrap();
+        fs::remove_file(dir.join(MARKER)).unwrap();
+        apply(&dir).unwrap();
+        let manifest: Value =
+            serde_json::from_str(&fs::read_to_string(dir.join("manifest.json")).unwrap()).unwrap();
+        let scripts = manifest["content_scripts"].as_array().unwrap();
+        assert_eq!(scripts.len(), 3);
+        let ours = &scripts[2];
+        assert_eq!(ours["js"], serde_json::json!([PROTON_PAGE_FILE]));
+        assert_eq!(ours["matches"], serde_json::json!(["https://account.proton.me/*"]));
+        assert_eq!(ours["world"], "MAIN");
+        assert_eq!(ours["run_at"], "document_start");
+        assert_eq!(scripts[1]["js"][0], SCRIPT_FILE);
+        assert!(dir.join(PROTON_PAGE_FILE).exists());
         let _ = fs::remove_dir_all(dir);
     }
 

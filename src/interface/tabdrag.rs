@@ -7,8 +7,8 @@
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 use gpui::{
-    AnyElement, Bounds, Context, DispatchPhase, MouseMoveEvent, MouseUpEvent, Pixels, Point,
-    WeakEntity, canvas, prelude::*, px,
+    AnyElement, Bounds, Context, DispatchPhase, MouseButton, MouseMoveEvent, MouseUpEvent, Pixels,
+    Point, WeakEntity, canvas, prelude::*, px,
 };
 use objc2_app_kit::{NSEvent, NSWindow};
 use objc2_foundation::NSPoint;
@@ -591,11 +591,21 @@ impl Browser {
                 |_, _, _| {},
                 move |_, _, window, _| {
                     let moved = me.clone();
-                    window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
-                        if phase == DispatchPhase::Capture {
-                            let _ = moved
-                                .update(cx, |browser, cx| browser.drag_moved(event.position, cx));
+                    window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+                        if phase != DispatchPhase::Capture {
+                            return;
                         }
+                        // The button came up where we didn't hear it (a
+                        // release before this tracker was first painted, or
+                        // one a native view took): a move without it isn't
+                        // a drag, and must not carry the tab or window.
+                        if event.pressed_button != Some(MouseButton::Left) {
+                            window.release_pointer();
+                            let _ = moved.update(cx, |browser, cx| browser.cancel_tab_drag(cx));
+                            return;
+                        }
+                        let _ =
+                            moved.update(cx, |browser, cx| browser.drag_moved(event.position, cx));
                     });
                     let ended = me.clone();
                     window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {

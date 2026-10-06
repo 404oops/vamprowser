@@ -1,13 +1,13 @@
 [package]
 name = "vamprowser"
-version = "0.4.10"
+version = "0.4.11"
 edition = "2024"
 rust-version = "1.89"
 description = "A macOS browser with Vampir controls and WebKit"
 license = "GPL-3.0-only"
 
 [dependencies]
-vampir = { version = "0.1.5", default-features = false, features = ["app-icon"] }
+vampir = { version = "0.2.0", default-features = false, features = ["app-icon"] }
 gpui = { package = "gpui-ce", version = "0.2.2", default-features = false }
 gpui_ce_platform = { version = "0.1.0", features = ["font-kit", "runtime_shaders"] }
 wry = { version = "0.57", default-features = false, features = ["devtools"] }

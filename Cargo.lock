@@ -6413,9 +6413,9 @@ dependencies = [
 
 [[package]]
 name = "vampir"
-version = "0.1.5"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "916a9ebed013412a74e97f2bb6cd39bfe250458cc19d49322a834f32a8f4c561"
+checksum = "4417e64bc5f488228a9aa3c1ca13b930310f74d3b826c9675894f282a4dbe45a"
 dependencies = [
  "gpui-ce",
  "image",
@@ -6427,7 +6427,7 @@ dependencies = [
 
 [[package]]
 name = "vamprowser"
-version = "0.4.10"
+version = "0.4.11"
 dependencies = [
  "async-channel",
  "block2 0.6.2",

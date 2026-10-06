@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.4.11 — 2026-10-06
+
+- Typing in web pages no longer passes keys through the browser's own input handling as well. Arrow keys no longer insert square characters, and editors such as X's composer no longer double the first character on a line. The page-specific workarounds for both are removed.
+- Tab drags and bookmark selection boxes end when the mouse button is no longer held, even if the release was missed. A quick click on a tab no longer leaves the window following the cursor.
+- Proton Pass sign-in works with the Safari user agent: on Proton's pages the extension is reached through its content script instead of WebKit's page messaging, which the Firefox build doesn't answer.
+- Updated Vampir to 0.2.0 and use its shared easing curve.
+
 ## v0.4.10 — 2026-10-01
 
 - The omnibox pulse now stays visible across the whole address field when a link is copied or another address action runs. Focusing a text field also makes its selection and input handler ready immediately.

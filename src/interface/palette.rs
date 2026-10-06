@@ -226,11 +226,11 @@ impl Browser {
     /// eases in on opening and out on closing.
     fn palette_presence(state: &PaletteState) -> f32 {
         match state.closing {
-            Some(at) => 1.0 - (at.elapsed().as_secs_f32() / crate::slowed(CLOSE).as_secs_f32()).min(1.0),
-            None => {
-                let t = (state.opened.elapsed().as_secs_f32() / crate::slowed(OPEN).as_secs_f32()).min(1.0);
-                1.0 - (1.0 - t).powi(3)
-            }
+            Some(at) => 1.0 - vampir::easing::progress(at, crate::slowed(CLOSE)),
+            None => vampir::ease_out_cubic(vampir::easing::progress(
+                state.opened,
+                crate::slowed(OPEN),
+            )),
         }
     }
 

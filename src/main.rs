@@ -318,34 +318,6 @@ const URL_CHANGE_SCRIPT: &str = r#"
 })();
 "#;
 
-/// X's Draft editor inserts the first character itself, then WebKit sends
-/// another native insertText for the same key. Only suppress that second
-/// insertion when the editor was empty at keydown and already contains the
-/// exact character by beforeinput.
-const X_EDITOR_SCRIPT: &str = r#"
-(() => {
-  if (!['x.com', 'www.x.com', 'twitter.com', 'www.twitter.com'].includes(location.hostname)) return;
-  const editor = target => target instanceof Element
-    ? target.closest('[data-testid="tweetTextarea_0"]') : null;
-  const text = element => element.innerText.replace(/\n/g, '');
-  let pending = null;
-  document.addEventListener('keydown', event => {
-    const field = editor(event.target);
-    pending = field && !event.isComposing && !event.metaKey && !event.ctrlKey
-      && !event.altKey && event.key.length === 1 && text(field) === ''
-      ? { field, key: event.key } : null;
-  }, true);
-  document.addEventListener('beforeinput', event => {
-    const first = pending;
-    pending = null;
-    if (first && event.inputType === 'insertText' && event.data === first.key
-        && editor(event.target) === first.field && text(first.field) === first.key) {
-      event.preventDefault();
-    }
-  }, true);
-})();
-"#;
-
 /// What the browser's shortcuts depend on besides the key.
 #[derive(Clone, Copy, Default)]
 struct KeyState {
@@ -2581,7 +2553,6 @@ impl Browser {
             .with_devtools(settings.web_inspector)
             .with_initialization_script(EDITING_SCRIPT)
             .with_initialization_script(URL_CHANGE_SCRIPT)
-            .with_initialization_script(X_EDITOR_SCRIPT)
             .with_ipc_handler(move |request| {
                 if let Some(state) = request.body().strip_prefix("editing:") {
                     editing_sender.send(BrowserEvent::PageEditing(id, state == "1"));
@@ -5404,7 +5375,7 @@ impl Browser {
                     .with_animation(
                         ("toolbar-ping", generation),
                         Animation::new(slowed(Duration::from_millis(520)))
-                            .with_easing(|t: f32| 1.0 - (1.0 - t).powi(3)),
+                            .with_easing(vampir::ease_out_cubic),
                         move |ring, t| {
                             let grow = px(5.0 * t);
                             ring.top(-grow)
@@ -5768,7 +5739,7 @@ impl Browser {
                             .with_animation(
                                 ("bookmark-ping", generation),
                                 Animation::new(slowed(Duration::from_millis(520)))
-                                    .with_easing(|t: f32| 1.0 - (1.0 - t).powi(3)),
+                                    .with_easing(vampir::ease_out_cubic),
                                 move |ring, t| {
                                     let grow = px(5.0 * t);
                                     ring.top(-grow)
@@ -5799,7 +5770,7 @@ impl Browser {
                         .with_animation(
                             ("omnibox-ping", generation),
                             Animation::new(slowed(Duration::from_millis(520)))
-                                .with_easing(|t: f32| 1.0 - (1.0 - t).powi(3)),
+                                .with_easing(vampir::ease_out_cubic),
                             move |ring, t| {
                                 let grow = px(5.0 * t);
                                 ring.top(-grow)

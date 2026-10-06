@@ -957,7 +957,7 @@ impl Browser {
                         .with_animation(
                             "suggestions-enter",
                             Animation::new(crate::slowed(Duration::from_millis(160)))
-                                .with_easing(|t: f32| 1.0 - (1.0 - t).powi(3)),
+                                .with_easing(vampir::ease_out_cubic),
                             |panel, t| panel.opacity(t).mt(px(5.0 * (1.0 - t))),
                         ),
                 )

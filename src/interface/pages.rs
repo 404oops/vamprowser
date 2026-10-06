@@ -2390,7 +2390,7 @@ impl Browser {
                     .with_animation(
                         ("shelf-item-enter", id),
                         Animation::new(slowed(Duration::from_millis(220)))
-                            .with_easing(|t: f32| 1.0 - (1.0 - t).powi(3)),
+                            .with_easing(vampir::ease_out_cubic),
                         |wrapper, t| wrapper.w(px(240.0 * t)).opacity(t),
                     ),
             );

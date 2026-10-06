@@ -121,4 +121,4 @@ function testReader() {
 
 testFind();
 testReader();
-console.log('Find and Reader script regressions passed.');
+console.log('Browser script regressions passed.');

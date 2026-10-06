@@ -95,10 +95,6 @@ impl Sweep {
     }
 }
 
-fn ease_out(t: f32) -> f32 {
-    1.0 - (1.0 - t).powi(3)
-}
-
 /// One level of a menu: the top, or a submenu opened from it.
 #[derive(Clone)]
 struct Level {
@@ -674,7 +670,7 @@ impl Render for Menu {
         let rows = if self.animations_ready {
             rows.with_animation(
                 ("menu-level-sweep", self.animation_epoch),
-                Animation::new(crate::slowed(ROW_SWEEP)).with_easing(ease_out),
+                Animation::new(crate::slowed(ROW_SWEEP)).with_easing(vampir::ease_out_cubic),
                 move |rows, t| {
                     rows.relative()
                         .left(px(dx * (1.0 - t)))
@@ -709,7 +705,7 @@ impl Render for Menu {
             panel
                 .with_animation(
                     "menu-unroll",
-                    Animation::new(crate::slowed(SWEEP)).with_easing(ease_out),
+                    Animation::new(crate::slowed(SWEEP)).with_easing(vampir::ease_out_cubic),
                     move |panel, t| {
                         panel
                             .h(px(height * (0.35 + 0.65 * t)))
