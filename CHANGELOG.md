@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.4.13 — 2026-10-06
+
+- An extension can send a tab to one of its own pages, as Proton Pass does with its welcome page after signing in. Those pages load only in a web view made from the extension's configuration, so moving a tab to or from one now replaces its web view instead of failing with "NSURLErrorDomain error -1008". The same applies to typing an extension page's address.
+
 ## v0.4.12 — 2026-10-06
 
 - Proton Pass sign-in now also works in the tab the extension opens. WebKit put its page messaging back on that tab after the page had hidden it, so Proton's page still sent its hand-off to Chrome and Safari extension ids; the names now stay hidden on Proton's pages.

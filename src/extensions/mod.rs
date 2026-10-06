@@ -93,6 +93,12 @@ pub enum ExtensionEvent {
     CloseTab {
         tab_id: u64,
     },
+    /// Load the extension's own `webkit-extension://` page in a tab, which
+    /// needs a web view made from that extension's configuration.
+    LoadTab {
+        tab_id: u64,
+        url: String,
+    },
     ActivateTab {
         tab_id: u64,
     },

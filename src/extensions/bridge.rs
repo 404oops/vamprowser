@@ -126,6 +126,19 @@ define_class!(
             context: &WKWebExtensionContext,
             completion: &ErrorCompletion,
         ) {
+            // A web page's view can't load an extension page (WebKit fails
+            // it with "resource unavailable"), so the browser swaps views.
+            if url.scheme().is_some_and(|scheme| scheme.to_string() == "webkit-extension")
+                && let (Some(shared), Some(url)) =
+                    (self.ivars().shared.upgrade(), url.absoluteString())
+            {
+                shared.emit(ExtensionEvent::LoadTab {
+                    tab_id: self.ivars().id,
+                    url: url.to_string(),
+                });
+                succeed(completion);
+                return;
+            }
             // SAFETY: loading a request in our own web view.
             let _ = unsafe {
                 self.ivars()

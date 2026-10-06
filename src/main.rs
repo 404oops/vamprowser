@@ -792,6 +792,13 @@ impl Chrome {
     }
 }
 
+/// The extension a `webkit-extension://` address belongs to, if it is one.
+fn extension_origin(url: &str) -> Option<String> {
+    url.strip_prefix("webkit-extension://")
+        .and_then(|rest| rest.split('/').next())
+        .map(str::to_ascii_lowercase)
+}
+
 fn site_name(url: &str) -> String {
     let host = url::Url::parse(url)
         .ok()
@@ -3839,7 +3846,38 @@ impl Browser {
         cx.notify();
     }
 
-    fn load_in(&mut self, index: usize, url: &str, _window: &Window, cx: &mut Context<Self>) {
+    /// Drops a tab's web view for a new one that starts at `url`.
+    fn replace_view(&mut self, index: usize, url: &str, window: &Window) {
+        let (id, private, zoom) = {
+            let tab = &self.tabs[index];
+            (tab.id, tab.private, tab.zoom)
+        };
+        let view = match self.create_webview(id, url, private, false, window) {
+            Ok(view) => view,
+            Err(err) => {
+                eprintln!("Could not open WebKit tab: {err}");
+                return;
+            }
+        };
+        if let Some(old) = self.tabs[index].view.take() {
+            let _ = old.set_visible(false);
+            navigation::forget(&old.webview());
+            if let Some(extensions) = self.common.extensions.borrow_mut().as_mut() {
+                extensions.tab_closed(id);
+            }
+        }
+        self.report_opened(id, &view, private);
+        let _ = view.zoom(zoom);
+        let audio_observer = self.observe_tab_audio(id, &view);
+        let url_observer = self.observe_tab_url(id, &view);
+        let tab = &mut self.tabs[index];
+        tab.audio_observer = Some(audio_observer);
+        tab.url_observer = Some(url_observer);
+        tab.view = Some(view);
+        tab.loading = Some((std::time::Instant::now(), None));
+    }
+
+    fn load_in(&mut self, index: usize, url: &str, window: &Window, cx: &mut Context<Self>) {
         let id = self.tabs[index].id;
         if self.auth_forms.remove(&id).is_some() {
             if let Some(view) = &self.tabs[index].view {
@@ -3879,7 +3917,13 @@ impl Browser {
             return;
         }
         self.favicons().load(url);
-        if let Some(view) = &self.tabs[index].view {
+        // An extension's pages load only in a view made from its
+        // configuration, so moving to or from one needs a new view.
+        let swap_view = self.tabs[index].view.is_some()
+            && extension_origin(url) != extension_origin(&self.tabs[index].url);
+        if swap_view {
+            self.replace_view(index, url, window);
+        } else if let Some(view) = &self.tabs[index].view {
             if let Err(err) = view.load_url(url) {
                 eprintln!("Could not load {url}: {err}");
             }
@@ -4811,6 +4855,11 @@ impl Browser {
             ExtensionEvent::ActivateTab { tab_id } => {
                 if let Some(index) = self.index_of(tab_id) {
                     self.select(index, cx);
+                }
+            }
+            ExtensionEvent::LoadTab { tab_id, url } => {
+                if let Some(index) = self.index_of(tab_id) {
+                    self.load_in(index, &url, window, cx);
                 }
             }
             ExtensionEvent::NativeMessage {
@@ -7440,7 +7489,9 @@ fn dispatch_extension_event(common: &Rc<Common>, event: ExtensionEvent, cx: &mut
     }
     let browsers = common.browsers();
     let target = match &event {
-        ExtensionEvent::CloseTab { tab_id } | ExtensionEvent::ActivateTab { tab_id } => browsers
+        ExtensionEvent::CloseTab { tab_id }
+        | ExtensionEvent::ActivateTab { tab_id }
+        | ExtensionEvent::LoadTab { tab_id, .. } => browsers
             .iter()
             .find(|b| b.read(cx).index_of(*tab_id).is_some())
             .cloned(),
