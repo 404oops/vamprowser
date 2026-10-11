@@ -398,6 +398,7 @@ unsafe extern "C-unwind" fn did_receive_auth(
 
 /// Forgets a web view going away.
 pub fn forget(webview: &WKWebView) {
+    crate::page_menu::forget(webview);
     let key = webview as *const WKWebView as usize;
     OPENERS.with(|openers| openers.borrow_mut().remove(&key));
     FAILURES.with(|failures| failures.borrow_mut().remove(&key));
@@ -474,6 +475,28 @@ unsafe extern "C-unwind" fn decide_action(
     action: &AnyObject,
     handler: &Block<dyn Fn(isize)>,
 ) {
+    // App callbacks are not pages. Catch them before both Wry and the
+    // new-tab shortcut so redirects and target="_blank" links work too.
+    // SAFETY: properties of the navigation action supplied by WebKit.
+    let request: Option<Retained<AnyObject>> = unsafe { msg_send![action, request] };
+    let destination: Option<Retained<objc2_foundation::NSURL>> =
+        request.and_then(|request| unsafe { msg_send![&*request, URL] });
+    if let Some(destination) = destination
+        && destination.absoluteString().is_some_and(|url| external_app_url(&url.to_string()))
+    {
+        let source: Option<Retained<AnyObject>> = unsafe { msg_send![action, sourceFrame] };
+        let request: Option<Retained<AnyObject>> =
+            source.and_then(|source| unsafe { msg_send![&*source, request] });
+        let source_url: Option<Retained<objc2_foundation::NSURL>> =
+            request.and_then(|request| unsafe { msg_send![&*request, URL] });
+        let source_url = source_url.or_else(|| unsafe { webview.URL() });
+        let host = source_url.and_then(|url| url.host()).map(|host| host.to_string());
+        // Cancel exactly once, before presenting an asynchronous sheet. No
+        // unsupported-URL page should replace the page doing the handoff.
+        handler.call((0,));
+        crate::interop::ask_open_app(webview, &destination, host.as_deref());
+        return;
+    }
     if let Some((url, front)) = new_tab_click(action) {
         let key = webview as *const WKWebView as usize;
         let opened = OPENERS.with(|openers| {
@@ -498,6 +521,15 @@ unsafe extern "C-unwind" fn decide_action(
         // WKNavigationActionPolicyAllow.
         None => handler.call((1,)),
     }
+}
+
+/// These schemes belong to WebKit or the browser. Everything else is an
+/// external application link, including non-hierarchical mailto: and tel:.
+fn external_app_url(address: &str) -> bool {
+    url::Url::parse(address).is_ok_and(|url| !matches!(url.scheme(),
+        "http" | "https" | "file" | "about" | "data" | "blob" |
+        "javascript" | "webkit-extension" | "vamp"
+    ))
 }
 
 /// Puts [`policy`] in place of wry's for every web view. Wry defines its
@@ -582,6 +614,26 @@ pub fn install() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_callbacks_are_intercepted_but_browser_schemes_are_not() {
+        for address in [
+            "linear://connect/github-account/callback?code=abc&state=xyz",
+            "LINEAR://connect/callback", "mailto:person@example.org",
+            "tel:+12345", "unknown-app:callback",
+        ] {
+            assert!(external_app_url(address), "{address}");
+        }
+        for address in [
+            "https://example.org/callback?code=abc", "http://localhost:3000",
+            "file:///tmp/example.html", "about:blank", "data:text/html,hello",
+            "blob:https://example.org/id", "javascript:alert(1)",
+            "webkit-extension://example/page.html", "vamp://trust-certificate/token",
+            "not a URL",
+        ] {
+            assert!(!external_app_url(address), "{address}");
+        }
+    }
 
     #[test]
     fn only_server_trust_uses_webkit_default_auth_handling() {

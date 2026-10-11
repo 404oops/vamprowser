@@ -1255,6 +1255,16 @@ impl Browser {
             cx,
             |s, value| s.popups = value,
         );
+        let external_launch = self.choose_setting(
+            "external-link-launch",
+            "When a link launches Vamprowser",
+            Some("Choose whether to open the regular startup window alongside the link's popup."),
+            &[(true, "New tab + popup"), (false, "Popup only")],
+            self.settings.external_link_startup_window,
+            palette,
+            cx,
+            |s, value| s.external_link_startup_window = value,
+        );
         let sleep = self.choose_setting(
             "sleep-tabs",
             "Unload tabs you haven't used in",
@@ -1280,7 +1290,11 @@ impl Browser {
             cx,
             |s, on| s.swipe_navigation = on,
         );
-        rows(vec![layout, placement, popups, sleep, swipe], palette).into_any_element()
+        rows(
+            vec![layout, placement, popups, external_launch, sleep, swipe],
+            palette,
+        )
+        .into_any_element()
     }
 
     fn search_settings(

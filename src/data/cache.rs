@@ -23,6 +23,42 @@ pub enum SiteDataKind {
     All,
 }
 
+/// Clear the localStorage area exposed to this file, rather than the
+/// grouped WebKit record (which also includes other kinds of file data).
+/// WebKit can share this storage area with other local files.
+fn file_storage_script(address: &str) -> Option<String> {
+    let mut url = url::Url::parse(address).ok()?;
+    if url.scheme() != "file" {
+        return None;
+    }
+    url.set_fragment(None);
+    let address = serde_json::to_string(url.as_str()).ok()?;
+    Some(format!(r#"(() => {{
+        const current = new URL(location.href);
+        current.hash = '';
+        if (current.protocol !== 'file:' || current.href !== {address}) return false;
+        localStorage.clear();
+        return true;
+    }})()"#))
+}
+
+pub fn clear_file_local_storage(webview: &WKWebView, address: &str) {
+    let Some(script) = file_storage_script(address) else { return };
+    // Reload within the same script, only after clearing succeeds and
+    // while still on the file whose menu was opened.
+    let script = format!("if ({script}) location.reload();");
+    let done = RcBlock::new(move |_result: *mut AnyObject, error: *mut NSError| {
+        if let Some(error) = unsafe { error.as_ref() } {
+            eprintln!("Could not clear local file storage: {error}");
+        }
+    });
+    unsafe {
+        webview.evaluateJavaScript_completionHandler(
+            &NSString::from_str(&script), Some(&done),
+        );
+    }
+}
+
 /// Removes the selected data for records covering this host in this tab's
 /// WebKit data store. Private tabs therefore clear only private data.
 pub fn clear_site_data(webview: &WKWebView, host: String, kind: SiteDataKind) {
@@ -183,6 +219,17 @@ fn erase_for(webview: &WKWebView, hosts: Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_storage_clear_is_guarded_by_the_file_address() {
+        assert!(file_storage_script("https://example.com/").is_none());
+        assert!(file_storage_script("vamp://settings").is_none());
+        assert!(file_storage_script("not a URL").is_none());
+        let script = file_storage_script("file:///tmp/a%20b.html#section").unwrap();
+        assert!(script.contains("current.href !== \"file:///tmp/a%20b.html\""));
+        assert!(script.contains("current.protocol !== 'file:'"));
+        assert!(script.contains("localStorage.clear()"));
+    }
 
     #[test]
     fn records_cover_their_site_and_its_subdomains_only() {

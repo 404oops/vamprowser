@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.4.14 — 2026-10-11
+
+- Files dropped on a page or a tab open in the browser, and local PDFs render instead of staying blank. Upload fields and page drop zones, including ones inside frames, still receive their files.
+- Page context menus are drawn like the browser's own menus, without empty separators or groups. Copying, opening and downloading images, media and links from them works again, and their downloads appear with the others.
+- A page opening another app, such as a `mailto:` link or a sign-in callback, now asks first and names the app.
+- Links from other apps open their compact window without bringing other browser windows forward. Settings → Tabs chooses whether a link that launches Vamprowser also opens the usual startup window.
+- Address suggestions list direct history and bookmark matches first, then searches, then loose matches, and use the selected search engine's own suggestion service where it has one.
+- Local files get a site menu that can clear their local storage.
+- Extensions see a tab before its first page loads, so content scripts can connect at document start; a tab that changes data store keeps its extensions.
+- Removed Brave Search, Mullvad Leta and Brave bookmark import.
+
 ## v0.4.13 — 2026-10-06
 
 - An extension can send a tab to one of its own pages, as Proton Pass does with its welcome page after signing in. Those pages load only in a web view made from the extension's configuration, so moving a tab to or from one now replaces its web view instead of failing with "NSURLErrorDomain error -1008". The same applies to typing an extension page's address.

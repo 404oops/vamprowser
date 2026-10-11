@@ -1,6 +1,6 @@
 [package]
 name = "vamprowser"
-version = "0.4.13"
+version = "0.4.14"
 edition = "2024"
 rust-version = "1.89"
 description = "A macOS browser with Vampir controls and WebKit"
@@ -121,9 +121,15 @@ objc2-core-foundation = { version = "0.3", default-features = false, features = 
 lto = "thin"
 
 [patch.crates-io]
+wry = { path = "vendor/wry" }
 gpui-ce = { path = "vendor/gpui-ce" }
 gpui_ce_macos = { path = "vendor/gpui_ce_macos" }
 
 [[test]]
 name = "gpui_popup_frame_pacing"
 path = "vendor/gpui-ce/tests/local_frame_pacing.rs"
+
+[[test]]
+name = "page_menu_native"
+path = "tests/page-menu-native.rs"
+harness = false

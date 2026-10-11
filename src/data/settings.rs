@@ -347,6 +347,8 @@ pub struct Settings {
     /// to save memory (it reloads when shown); 0 keeps every page loaded.
     pub sleep_tabs_after: u32,
     pub popups: PopupPolicy,
+    /// Also open the regular startup window when an external link launches the app.
+    pub external_link_startup_window: bool,
 
     // Search
     pub search_engine: String,
@@ -400,6 +402,7 @@ impl Default for Settings {
             tab_placement: TabPlacement::End,
             sleep_tabs_after: 60,
             popups: PopupPolicy::NewTab,
+            external_link_startup_window: true,
             search_engine: "duckduckgo".into(),
             instances: HashMap::new(),
             custom_search: String::new(),
@@ -624,22 +627,10 @@ pub const ENGINES: &[SearchEngine] = &[
     ),
     engine_def("kagi", "Kagi", "k", "https://kagi.com/search?q=%s"),
     engine_def(
-        "brave",
-        "Brave Search",
-        "br",
-        "https://search.brave.com/search?q=%s",
-    ),
-    engine_def(
         "startpage",
         "Startpage",
         "sp",
         "https://www.startpage.com/sp/search?query=%s",
-    ),
-    engine_def(
-        "mullvad_leta",
-        "Mullvad Leta",
-        "leta",
-        "https://leta.mullvad.net/search?q=%s&engine=brave",
     ),
     engine_def(
         "ecosia",
@@ -870,6 +861,19 @@ pub fn destination(input: &str, settings: &Settings) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn external_link_launch_preference_defaults_and_round_trips() {
+        let old: Settings = serde_json::from_str("{}").unwrap();
+        assert!(old.external_link_startup_window);
+        let settings = Settings {
+            external_link_startup_window: false,
+            ..old
+        };
+        let saved = serde_json::to_string(&settings).unwrap();
+        let restored: Settings = serde_json::from_str(&saved).unwrap();
+        assert!(!restored.external_link_startup_window);
+    }
+
     #[test]
     fn local_files_and_blank_pages_open_directly() {
         let settings = Settings::default();

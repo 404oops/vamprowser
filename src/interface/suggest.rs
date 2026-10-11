@@ -1,7 +1,8 @@
 //! Address field suggestions: as you type, the field completes the site
 //! you most likely mean, and a list under it offers matching history and
-//! bookmarks, most visited first (history can be removed from there), then
-//! searches: what you typed, and your search engine's suggestions. Like the tab switcher, the list covers the page with a still
+//! bookmarks (history can be removed from there), then searches: what you
+//! typed, and your search engine's suggestions, ahead of loose fuzzy matches.
+//! Like the tab switcher, the list covers the page with a still
 //! of it, because GPUI can't draw over a live WebKit view.
 
 use std::{
@@ -32,7 +33,9 @@ use crate::{
 /// Search suggestions shown at most, and history and bookmarks.
 const REMOTE_ROWS: usize = 4;
 const LOCAL_ROWS: usize = 5;
+const ROWS_PER_SITE: usize = 2;
 const REMOTE_DELAY: Duration = Duration::from_millis(180);
+const DDG_ENDPOINT: &str = "https://duckduckgo.com/ac/?q=%s&type=list";
 
 #[derive(Clone, PartialEq)]
 pub(crate) enum Suggestion {
@@ -186,7 +189,7 @@ fn emphasized(text: String, query: &str) -> StyledText {
 /// no record of who asked.
 pub(crate) fn endpoint(settings: &settings::Settings) -> String {
     let engine = settings.search_engine.as_str();
-    let ddg = "https://duckduckgo.com/ac/?q=%s&type=list";
+    let ddg = DDG_ENDPOINT;
     let instance = |id: &str, path: &str| {
         settings
             .instances
@@ -196,6 +199,7 @@ pub(crate) fn endpoint(settings: &settings::Settings) -> String {
             .map(|base| format!("{base}{path}"))
     };
     match engine {
+        "duckduckgo" | "duckduckgo_lite" | "duckduckgo_html" => ddg.into(),
         "google" | "google_web" => {
             "https://suggestqueries.google.com/complete/search?client=firefox&q=%s".into()
         }
@@ -203,24 +207,42 @@ pub(crate) fn endpoint(settings: &settings::Settings) -> String {
             "https://suggestqueries.google.com/complete/search?client=firefox&ds=yt&q=%s".into()
         }
         "bing" => "https://api.bing.com/osjson.aspx?query=%s".into(),
-        "brave" => "https://search.brave.com/api/suggest?q=%s".into(),
+        "kagi" => "https://kagisuggest.com/api/autosuggest?q=%s".into(),
         "startpage" => "https://www.startpage.com/osuggestions?q=%s".into(),
         "ecosia" => "https://ac.ecosia.org/autocomplete?q=%s&type=list".into(),
         "yahoo" => "https://search.yahoo.com/sugg/os?command=%s&output=fxjson".into(),
         "yandex" => "https://suggest.yandex.com/suggest-ff.cgi?part=%s".into(),
-        "qwant" => "https://api.qwant.com/v3/suggest?q=%s".into(),
+        "qwant" => "https://api.qwant.com/v3/suggest?q=%s&locale=en_US&version=2".into(),
+        "baidu" => "https://www.baidu.com/sugrec?ie=utf-8&json=1&prod=pc&wd=%s".into(),
+        "naver" => "https://ac.search.naver.com/nx/ac?q=%s&r_format=json&st=0".into(),
+        "seznam" => {
+            "https://suggest.seznam.cz/fulltext/cs?phrase=%s&format=json-2&highlight=0&count=6".into()
+        }
+        "swisscows" => "https://api.swisscows.com/suggest?query=%s".into(),
+        "marginalia" => "https://marginalia-search.com/suggest/?partial=%s".into(),
+        // Reference sites expose search APIs rather than query completion:
+        // document titles and crate names make useful searches on those sites.
+        "mdn" => "https://developer.mozilla.org/api/v1/search?q=%s&locale=en-US".into(),
+        "crates" | "docs_rs" => "https://crates.io/api/v1/crates?q=%s&per_page=5".into(),
         "wikipedia" => {
             "https://en.wikipedia.org/w/api.php?action=opensearch&format=json&search=%s".into()
         }
         "searxng" => instance("searxng", "/autocompleter?q=%s").unwrap_or_else(|| ddg.into()),
         "whoogle" => instance("whoogle", "/autocomplete?q=%s").unwrap_or_else(|| ddg.into()),
+        "fourget" => instance("fourget", "/api/v1/ac.php?s=%s&scraper=ddg").unwrap_or_else(|| ddg.into()),
+        "yacy" => instance("yacy", "/suggest.json?query=%s&count=5").unwrap_or_else(|| ddg.into()),
+        // No usable anonymous completion API was found for these providers.
+        // Keep the documented fallback instead of calling obsolete, paid,
+        // authenticated, or autocomplete-prohibited services.
+        "mojeek" | "metager" | "presearch" | "ghostery" | "stract"
+        | "yep" | "perplexity" | "you" | "phind" | "wiby" | "github" | "stackoverflow"
+        | "openstreetmap" | "librey" | "custom" => ddg.into(),
         _ => ddg.into(),
     }
 }
 
 /// Reads suggestions from the shapes services answer in: OpenSearch's
-/// `[query, [suggestions…]]`, a list of `{phrase}` objects, or Qwant's
-/// `{data: {items: [{value}]}}`.
+/// OpenSearch tuples, plain lists, and provider-specific JSON records.
 pub(crate) fn parse(body: &str) -> Vec<String> {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
         return Vec::new();
@@ -243,7 +265,32 @@ pub(crate) fn parse(body: &str) -> Vec<String> {
         return strings(list, None);
     }
     if value.as_array().is_some() {
+        if value.as_array().is_some_and(|items| items.iter().all(|item| item.is_string())) {
+            return strings(&value, None);
+        }
         return strings(&value, Some("phrase"));
+    }
+    if value.get("g").is_some() {
+        return strings(&value["g"], Some("q"));
+    }
+    if let Some(items) = value["items"][0].as_array() {
+        return items.iter().filter_map(|item| item[0].as_str()).map(str::to_owned).collect();
+    }
+    if let Some(items) = value["result"].as_array() {
+        return items.iter()
+            .filter(|item| item["itemType"] == "ItemType.TEXT")
+            .filter_map(|item| {
+                let parts = item["text"].as_array()?;
+                let text: String = parts.iter().filter_map(|part| part["text"].as_str()).collect();
+                (!text.is_empty()).then_some(text)
+            })
+            .collect();
+    }
+    if value.get("documents").is_some() {
+        return strings(&value["documents"], Some("title"));
+    }
+    if value.get("crates").is_some() {
+        return strings(&value["crates"], Some("name"));
     }
     strings(&value["data"]["items"], Some("value"))
 }
@@ -281,6 +328,7 @@ impl RemoteWorker {
                 let agent = agent.get_or_insert_with(|| {
                     ureq::Agent::config_builder()
                         .timeout_global(Some(Duration::from_secs(3)))
+                        .user_agent(concat!("Vamprowser/", env!("CARGO_PKG_VERSION"), " (https://github.com/404oops/vamprowser)"))
                         .build()
                         .into()
                 });
@@ -303,12 +351,41 @@ impl Drop for RemoteWorker {
     }
 }
 
+/// A host prefix or a verbatim title indicates navigation. Merely containing
+/// the query in a page title should leave the search action first.
+fn navigation_match(query: &str, title: &str, address: &str) -> bool {
+    title.trim() == query
+        || (!query.contains(char::is_whitespace) && address.starts_with(query))
+}
+
+fn site(address: &str) -> &str {
+    address.split(['/', '?', '#']).next().unwrap_or(address)
+}
+
+/// Keep fuzzy abbreviations for short names, but require literal query words
+/// for phrases so scattered letters in long titles don't fill the list.
+fn address_page_score(query: &str, title: &str, address: &str) -> Option<i32> {
+    if title.trim() == query {
+        return page_score_fields(query, title, address).map(|score| score + 240);
+    }
+    if query.split_whitespace().count() > 1 {
+        query.split_whitespace().try_fold(0, |total, word| {
+            let title = field_score(word, title).filter(|score| *score >= 75);
+            let address = field_score(word, address)
+                .filter(|score| *score >= 75).map(|score| score - 8);
+            Some(total + title.into_iter().chain(address).max()?)
+        })
+    } else {
+        page_score_fields(query, title, address)
+    }
+}
+
 fn local_matches(
     typed: &str,
     bookmarks: &crate::bookmarks::Bookmarks,
     history: &crate::history::History,
 ) -> (Option<(String, String, String)>, Vec<Suggestion>) {
-    let lower = typed.to_lowercase();
+    let lower = typed.trim().to_lowercase();
     let words: Vec<&str> = lower.split_whitespace().collect();
     if words.is_empty() {
         return (None, Vec::new());
@@ -322,6 +399,7 @@ fn local_matches(
         recent: u64,
         order: usize,
         address: &'a str,
+        navigation: bool,
     }
     let mut found: Vec<Found> = Vec::new();
     // Where each address is in `found`, to combine a bookmark and its visits.
@@ -335,6 +413,7 @@ fn local_matches(
         recent: u64,
         order: usize,
         address: &'a str,
+        navigation: bool,
     ) -> Found<'a> {
         Found {
             url,
@@ -345,6 +424,7 @@ fn local_matches(
             recent,
             order,
             address,
+            navigation,
         }
     }
     let bookmark_fields = bookmarks.scoring_fields();
@@ -354,7 +434,7 @@ fn local_matches(
         let Some(url) = bookmark.url.as_deref() else {
             continue;
         };
-        if let Some(score) = page_score_fields(&lower, title_lower, address_lower)
+        if let Some(score) = address_page_score(&lower, title_lower, address_lower)
             && !at.contains_key(url)
         {
             at.insert(url, found.len());
@@ -367,12 +447,13 @@ fn local_matches(
                 0,
                 found.len(),
                 address_lower,
+                navigation_match(&lower, title_lower, address_lower),
             ));
         }
     }
     for visit in history.recent(usize::MAX) {
         let (title_lower, address_lower) = visit.search_fields();
-        let Some(score) = page_score_fields(&lower, title_lower, address_lower) else {
+        let Some(score) = address_page_score(&lower, title_lower, address_lower) else {
             continue;
         };
         match at.get(visit.url.as_str()) {
@@ -382,6 +463,7 @@ fn local_matches(
                     item.title = &visit.title;
                     item.score = score;
                 }
+                item.navigation |= navigation_match(&lower, title_lower, address_lower);
                 item.visits = visit.visits;
                 item.recent = visit.last_visit;
             }
@@ -396,14 +478,28 @@ fn local_matches(
                     visit.last_visit,
                     found.len(),
                     address_lower,
+                    navigation_match(&lower, title_lower, address_lower),
                 ));
             }
         }
     }
     let compare = |a: &Found<'_>, b: &Found<'_>| {
-        page_rank(b.score, b.bookmark, b.visits, b.recent)
-            .cmp(&page_rank(a.score, a.bookmark, a.visits, a.recent))
+        b.navigation.cmp(&a.navigation)
+            .then_with(|| page_rank(b.score, b.bookmark, b.visits, b.recent)
+                .cmp(&page_rank(a.score, a.bookmark, a.visits, a.recent)))
             .then(a.order.cmp(&b.order))
+    };
+    let mut site_visits: HashMap<&str, u64> = HashMap::new();
+    for entry in &found {
+        *site_visits.entry(site(entry.address)).or_default() += u64::from(entry.visits);
+    }
+    let completion_rank = |entry: &Found<'_>| {
+        let host = site(entry.address);
+        (
+            host == lower || host.split('.').next() == Some(lower.as_str()),
+            site_visits.get(host).copied().unwrap_or_default(),
+            entry.visits,
+        )
     };
     let bookmarked = |url: &str| found.iter().any(|f| f.url == url && f.bookmark);
 
@@ -422,7 +518,7 @@ fn local_matches(
                 address[..end].trim_end_matches('/').len() >= typed.len()
                     && entry.address.starts_with(&lower)
             })
-            .min_by(|a, b| compare(a, b))
+            .min_by(|a, b| completion_rank(b).cmp(&completion_rank(a)).then_with(|| compare(a, b)))
             .map(|entry| {
                 let address = bare(entry.url);
                 let end = if lower.contains('/') {
@@ -461,19 +557,42 @@ fn local_matches(
             target.trim_end_matches('/') != entry.url.trim_end_matches('/')
         })
     });
-    // Only five rows will be drawn. Select those before sorting so a large
-    // history does not need a full sort on every address-field edit.
-    if found.len() > LOCAL_ROWS {
-        found.select_nth_unstable_by(LOCAL_ROWS, compare);
-        found.truncate(LOCAL_ROWS);
-    }
+    // Apply the site quota before the row limit: a busy site must not crowd
+    // out equally relevant pages from other sites. Count the completion too.
     found.sort_unstable_by(compare);
+    let mut site_rows: HashMap<String, usize> = HashMap::new();
+    if let Some((_, target, _)) = &completion {
+        site_rows.insert(site(&bare(target).to_lowercase()).to_owned(), 1);
+    }
+    found.retain(|entry| {
+        let count = site_rows.entry(site(entry.address).to_owned()).or_default();
+        *count += 1;
+        *count <= ROWS_PER_SITE
+    });
+    found.truncate(LOCAL_ROWS.saturating_sub(rows.len()));
     rows.extend(found.into_iter().map(|entry| Suggestion::Page {
         url: entry.url.to_owned(),
         title: entry.title.to_owned(),
         bookmark: entry.bookmark,
     }));
     (completion, rows)
+}
+
+/// Strong navigation matches lead; searches precede other history matches.
+fn suggestion_rows(typed: &str, local: Vec<Suggestion>, remote: &[String]) -> Vec<Suggestion> {
+    let lower = typed.trim().to_lowercase();
+    let (mut rows, other): (Vec<_>, Vec<_>) = local.into_iter().partition(|row| {
+        let Suggestion::Page { title, url, .. } = row else { return false; };
+        navigation_match(&lower, &title.to_lowercase(), &bare(url).to_lowercase())
+    });
+    rows.push(Suggestion::Search(typed.trim().to_owned()));
+    rows.extend(remote.iter()
+        .filter(|s| s.to_lowercase() != lower)
+        .take(REMOTE_ROWS)
+        .cloned()
+        .map(Suggestion::Search));
+    rows.extend(other);
+    rows
 }
 
 impl Browser {
@@ -491,23 +610,12 @@ impl Browser {
         local_matches(typed, &self.bookmarks(), &self.history())
     }
 
-    /// The rows for what's typed: history and bookmarks, then searches.
+    /// Navigation matches, searches for the current query, then other pages.
     fn rows_for(&self, typed: &str, local: Vec<Suggestion>) -> Vec<Suggestion> {
-        let mut rows = local;
-        rows.push(Suggestion::Search(typed.trim().to_owned()));
-        let lower = typed.trim().to_lowercase();
-        if let Some(state) = &self.suggest {
-            rows.extend(
-                state
-                    .remote
-                    .iter()
-                    .filter(|s| s.to_lowercase() != lower)
-                    .take(REMOTE_ROWS)
-                    .cloned()
-                    .map(Suggestion::Search),
-            );
-        }
-        rows
+        let remote = self.suggest.as_ref()
+            .filter(|state| state.remote_for == typed)
+            .map_or(&[][..], |state| state.remote.as_slice());
+        suggestion_rows(typed, local, remote)
     }
 
     /// Something was typed in the address field (not set by us): suggest,
@@ -557,7 +665,7 @@ impl Browser {
         let highlight = completed.then_some(0);
         let private = self.current().private;
         let remote_wanted = self.settings.search_suggestions && !private;
-        let rows = self.rows_for(&text, local);
+        let rows = self.rows_for(&text, local.clone());
         let state = self.suggest.get_or_insert_with(|| SuggestState {
             typed: String::new(),
             remote: Vec::new(),
@@ -575,11 +683,7 @@ impl Browser {
         state.typed = text.clone();
         state.highlight = highlight;
         state.picked = false;
-        state.local = rows
-            .iter()
-            .take_while(|row| matches!(row, Suggestion::Page { .. }))
-            .cloned()
-            .collect();
+        state.local = local;
         state.rows = rows;
         state.remote_later = None;
         if remote_wanted && state.remote_for != text {
@@ -615,6 +719,7 @@ impl Browser {
         if state.typed != query {
             return;
         }
+        let selected = state.highlight.and_then(|index| state.rows.get(index)).cloned();
         state.remote = found;
         state.remote_for = query;
         let typed = state.typed.clone();
@@ -622,7 +727,7 @@ impl Browser {
         let rows = self.rows_for(&typed, local);
         if let Some(state) = &mut self.suggest {
             state.rows = rows;
-            state.highlight = state.highlight.filter(|&h| h < state.rows.len());
+            state.highlight = selected.and_then(|row| state.rows.iter().position(|item| *item == row));
         }
         cx.notify();
     }
@@ -982,6 +1087,180 @@ mod tests {
     }
 
     #[test]
+    fn reads_regional_reference_and_plain_list_suggestions() {
+        assert_eq!(parse(r#"["rust","rustdesk"]"#), ["rust", "rustdesk"]);
+        assert_eq!(parse(r#"{"g":[{"q":"rust语言"},{"q":"rustdesk"},{}]}"#), ["rust语言", "rustdesk"]);
+        assert_eq!(parse(r#"{"items":[[["rust"],["rusty 뜻"]]]}"#), ["rust", "rusty 뜻"]);
+        assert_eq!(parse(r#"{"result":[{"itemType":"ItemType.TEXT","text":[{"text":"rust"},{"text":" paint"}]},{"itemType":"ItemType.LINK","text":[{"text":"omit"}]}]}"#), ["rust paint"]);
+        assert_eq!(parse(r#"{"documents":[{"title":"Rust to WebAssembly"},{}]}"#), ["Rust to WebAssembly"]);
+        assert_eq!(parse(r#"{"crates":[{"name":"serde"},{"name":"serde_json"}]}"#), ["serde", "serde_json"]);
+        for body in ["{}", "[]", r#"{"items":[null]}"#, r#"{"result":[{}]}"#, r#"{"g":false}"#] {
+            assert!(parse(body).is_empty(), "{body}");
+        }
+    }
+
+    #[test]
+    fn every_engine_has_an_explicit_suggestion_source_or_fallback() {
+        let native = [
+            ("duckduckgo", "duckduckgo.com"), ("duckduckgo_lite", "duckduckgo.com"),
+            ("duckduckgo_html", "duckduckgo.com"), ("kagi", "kagisuggest.com"),
+            ("startpage", "www.startpage.com"),
+            ("ecosia", "ac.ecosia.org"), ("qwant", "api.qwant.com"),
+            ("swisscows", "api.swisscows.com"), ("google", "suggestqueries.google.com"),
+            ("google_web", "suggestqueries.google.com"), ("bing", "api.bing.com"),
+            ("yahoo", "search.yahoo.com"), ("yandex", "suggest.yandex.com"),
+            ("baidu", "www.baidu.com"), ("naver", "ac.search.naver.com"),
+            ("seznam", "suggest.seznam.cz"), ("marginalia", "marginalia-search.com"),
+            ("wikipedia", "en.wikipedia.org"), ("mdn", "developer.mozilla.org"),
+            ("crates", "crates.io"), ("docs_rs", "crates.io"),
+            ("youtube", "suggestqueries.google.com"),
+        ];
+        let hosted = ["searxng", "whoogle", "fourget", "yacy"];
+        let fallback = ["mojeek", "metager", "presearch", "ghostery", "stract",
+            "yep", "perplexity", "you", "phind", "wiby", "github", "stackoverflow",
+            "openstreetmap", "librey", "custom"];
+        let mut settings = settings::Settings::default();
+        for engine in settings::ENGINES {
+            settings.search_engine = engine.id.into();
+            let template = endpoint(&settings);
+            assert_eq!(template.matches("%s").count(), 1, "{}", engine.id);
+            if let Some((_, host)) = native.iter().find(|(id, _)| *id == engine.id) {
+                assert_eq!(url::Url::parse(&template).unwrap().host_str(), Some(*host), "{}", engine.id);
+            } else {
+                assert!(hosted.contains(&engine.id) || fallback.contains(&engine.id),
+                    "Choose a suggestion source for the new engine: {}", engine.id);
+                assert_eq!(template, DDG_ENDPOINT, "{}", engine.id);
+            }
+        }
+    }
+
+    #[test]
+    fn self_hosted_suggestions_keep_the_configured_instance_path() {
+        let mut settings = settings::Settings::default();
+        for (engine, path) in [
+            ("searxng", "/autocompleter?q=%s"), ("whoogle", "/autocomplete?q=%s"),
+            ("fourget", "/api/v1/ac.php?s=%s&scraper=ddg"), ("yacy", "/suggest.json?query=%s&count=5"),
+        ] {
+            settings.search_engine = engine.into();
+            settings.instances.insert(engine.into(), " https://search.example/base/ ".into());
+            assert_eq!(endpoint(&settings), format!("https://search.example/base{path}"));
+            settings.instances.insert(engine.into(), "  ".into());
+            assert_eq!(endpoint(&settings), DDG_ENDPOINT);
+        }
+    }
+
+    #[test]
+    fn kagi_uses_its_own_suggestion_service() {
+        let settings = settings::Settings {
+            search_engine: "kagi".into(),
+            ..Default::default()
+        };
+        assert_eq!(endpoint(&settings), "https://kagisuggest.com/api/autosuggest?q=%s");
+    }
+
+    #[test]
+    fn searches_lead_loose_fuzzy_matches() {
+        let bookmarks = crate::bookmarks::Bookmarks::new(vec![
+            crate::bookmarks::Node::link("Hacker News", "https://news.ycombinator.com/"),
+        ]);
+        let (_, local) = local_matches("hn", &bookmarks, &crate::history::History::default());
+        assert_eq!(local.len(), 1);
+        let rows = suggestion_rows("hn", local, &["hn".into(), "hn jobs".into()]);
+        assert_eq!(rows[0].fill(), "hn");
+        assert_eq!(rows[1].fill(), "hn jobs");
+        assert_eq!(rows[2].fill(), "https://news.ycombinator.com/");
+    }
+
+    #[test]
+    fn verbatim_titles_lead_searches_and_fuzzy_phrases_are_filtered() {
+        let bookmarks = crate::bookmarks::Bookmarks::new(vec![
+            crate::bookmarks::Node::link("Rust Docs", "https://rust-lang.org/"),
+            crate::bookmarks::Node::link("Rust Download Console", "https://example.org/"),
+        ]);
+        let (_, local) = local_matches("rust docs", &bookmarks, &crate::history::History::default());
+        assert_eq!(local.len(), 1);
+        let rows = suggestion_rows("rust docs", local, &["rust docs examples".into()]);
+        assert_eq!(rows[0].fill(), "https://rust-lang.org/");
+        assert_eq!(rows[1].fill(), "rust docs");
+        assert_eq!(rows[2].fill(), "rust docs examples");
+    }
+
+    #[test]
+    fn ordinary_queries_search_first_and_drop_unrelated_frequent_pages() {
+        let bookmarks = crate::bookmarks::Bookmarks::default();
+        let mut history = crate::history::History::default();
+        for _ in 0..20 {
+            history.record("https://x.com/post/1", "what a joke — feedback makes you pure");
+        }
+        history.record("https://kagi.com/search?q=what+does", "what does the @ mean in python - Kagi Search");
+        let (completion, local) = local_matches("what does", &bookmarks, &history);
+        assert!(completion.is_none());
+        assert_eq!(local.len(), 1);
+        let rows = suggestion_rows("what does", local, &["what does larp mean".into()]);
+        assert_eq!(rows[0].fill(), "what does");
+        assert_eq!(rows[1].fill(), "what does larp mean");
+        assert!(rows[2].fill().starts_with("https://kagi.com/"));
+    }
+
+    #[test]
+    fn exact_site_name_beats_a_more_frequent_prefix() {
+        let bookmarks = crate::bookmarks::Bookmarks::default();
+        let mut history = crate::history::History::default();
+        for _ in 0..20 {
+            history.record("https://xbox.com/games", "Xbox");
+        }
+        history.record("https://x.com/post/1", "A post");
+        let (completion, local) = local_matches("x", &bookmarks, &history);
+        assert_eq!(completion.unwrap().1, "https://x.com/");
+        let rows = suggestion_rows("x", local, &[]);
+        assert_eq!(rows[0].fill(), "https://x.com/");
+    }
+
+    #[test]
+    fn quick_prefix_uses_site_visits_across_pages() {
+        let bookmarks = crate::bookmarks::Bookmarks::default();
+        let mut history = crate::history::History::default();
+        for _ in 0..3 {
+            history.record("https://your-site.com/", "Your Site");
+        }
+        for i in 0..6 {
+            history.record(&format!("https://www.youtube.com/watch?v={i}"), "A video");
+        }
+        let (completion, local) = local_matches("you", &bookmarks, &history);
+        assert_eq!(completion.unwrap().1, "https://www.youtube.com/");
+        let rows = suggestion_rows("you", local, &[]);
+        assert_eq!(rows[0].fill(), "https://www.youtube.com/");
+        assert_eq!(rows.iter().filter(|row| row.fill().contains("youtube.com")).count(), ROWS_PER_SITE);
+    }
+
+    #[test]
+    fn verbatim_title_survives_a_full_list_of_partial_matches() {
+        let bookmarks = crate::bookmarks::Bookmarks::default();
+        let mut history = crate::history::History::default();
+        history.record("https://docs.example/exact", "Rust Docs");
+        for i in 0..10 {
+            history.record(&format!("https://site{i}.example/"), "Rust Docs and More");
+        }
+        let (_, local) = local_matches("rust docs", &bookmarks, &history);
+        let rows = suggestion_rows("rust docs", local, &[]);
+        assert_eq!(rows[0].fill(), "https://docs.example/exact");
+        assert_eq!(rows[1].fill(), "rust docs");
+    }
+
+    #[test]
+    fn site_quota_leaves_room_for_other_relevant_pages() {
+        let bookmarks = crate::bookmarks::Bookmarks::default();
+        let mut history = crate::history::History::default();
+        history.record("https://docs.example/", "Learn Rust");
+        for i in 0..20 {
+            history.record(&format!("https://x.com/post/{i}"), "Learn Rust");
+        }
+        let (_, local) = local_matches("learn rust", &bookmarks, &history);
+        assert_eq!(local.len(), ROWS_PER_SITE + 1);
+        assert!(local.iter().any(|row| row.fill() == "https://docs.example/"));
+    }
+
+    #[test]
     fn bare_addresses_drop_scheme_and_www() {
         assert_eq!(bare("https://www.youtube.com/watch"), "youtube.com/watch");
         assert_eq!(bare("http://example.org"), "example.org");
@@ -992,23 +1271,23 @@ mod tests {
         let bookmarks = crate::bookmarks::Bookmarks::new(
             (0..12)
                 .map(|i| {
-                    crate::bookmarks::Node::link("Rust Docs", format!("https://example.org/{i}"))
+                    crate::bookmarks::Node::link("Rust Docs", format!("https://example{i}.org/"))
                 })
                 .collect(),
         );
         let mut history = crate::history::History::default();
-        history.record("https://example.org/8", "Rust Docs");
+        history.record("https://example8.org/", "Rust Docs");
         let (completion, rows) = local_matches("rust docs", &bookmarks, &history);
         assert!(completion.is_none());
         let urls: Vec<&str> = rows.iter().map(Suggestion::fill).collect();
         assert_eq!(
             urls,
             [
-                "https://example.org/8",
-                "https://example.org/0",
-                "https://example.org/1",
-                "https://example.org/2",
-                "https://example.org/3"
+                "https://example8.org/",
+                "https://example0.org/",
+                "https://example1.org/",
+                "https://example2.org/",
+                "https://example3.org/"
             ]
         );
         assert!(
@@ -1020,7 +1299,7 @@ mod tests {
     #[test]
     fn address_completion_finds_prefix_beyond_the_top_local_rows() {
         let mut nodes: Vec<_> = (0..12)
-            .map(|i| crate::bookmarks::Node::link("Rust", format!("https://example.org/{i}")))
+            .map(|i| crate::bookmarks::Node::link("Rust", format!("https://example{i}.org/")))
             .collect();
         nodes.push(crate::bookmarks::Node::link(
             "Documentation",
@@ -1037,7 +1316,7 @@ mod tests {
                 "Documentation".into()
             ))
         );
-        assert_eq!(rows.len(), LOCAL_ROWS + 1);
+        assert_eq!(rows.len(), LOCAL_ROWS);
         assert_eq!(rows[0].fill(), "https://rust-lang.org/");
         let (completion, rows) = local_matches("rust-lang.org/le", &bookmarks, &history);
         assert_eq!(completion.unwrap().1, "https://rust-lang.org/learn");

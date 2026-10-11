@@ -10,15 +10,16 @@ A macOS browser built in Rust: Apple's WebKit (through Wry's `WKWebView`) for pa
   - Windows come back only when you ask: ⌘⇧T, once a window's own closed tabs run out, reopens the windows you closed, and after a relaunch the ones open when you quit, where you left them (Settings → General can restore them at launch instead). Closing the last window leaves the app running, and the Dock icon opens a new one.
 - **Minimal mode** (⌘⇧M) shows only the page, under a hairline. Point at the top of the window and the browser slides in over the page without it reflowing.
 - **Trackpad pinch** magnifies the page smoothly without reflowing its layout. ⌘0 resets both pinch magnification and page zoom.
-- **Links from other apps** open in a compact page window on the current desktop. Drag its slim titlebar to move the window or drop its live page onto a browser window's tabs. Click **Expand** to turn it into a full browser window. Opening another tab expands it too.
+- **Links from other apps** open in a compact page window on the current desktop without bringing the other browser windows forward. In **Settings → Tabs**, choose **New tab + popup** or **Popup only** for links that launch Vamprowser. Drag its slim titlebar to move the window or drop its live page onto a browser window's tabs. Click **Expand** to turn it into a full browser window. Opening another tab expands it too.
 - **Address field**: suggestions as you type.
   - It completes the site you most likely mean.
-  - The list shows matching history and bookmarks, most visited first, then your search engine's suggestions.
+  - The list shows direct history and bookmark matches first, then searches and search engine suggestions, followed by loose fuzzy matches.
+  - Suggestions use the selected engine's service where available: DuckDuckGo (including Lite and HTML), Kagi, Startpage, Ecosia, Qwant, Swisscows, Google, Bing, Yahoo, Yandex, Baidu, Naver, Seznam, Marginalia, Wikipedia, and YouTube. MDN suggests document titles; crates.io and docs.rs suggest crate names from crates.io. SearXNG, Whoogle, 4get, and YaCy use your configured instance; 4get uses its DuckDuckGo scraper. Other engines, or self-hosted engines without an instance, use DuckDuckGo suggestions. Suggestions are never requested from private tabs.
   - Remove a page from history with its × or ⇧⌫.
   - A progress bar runs along the field as a page loads.
 - **Bookmarks** with folders, nested as deep as you like. Folders on the bookmarks bar open as menus. ⌘D saves the page and offers to file it in a folder.
   - The **bookmark manager** (⌥⌘B, `vamp://bookmarks`) shows the folder tree beside the chosen folder, with search across everything and drag and drop to reorder and file.
-  - It imports from Safari, Chrome, Brave, Edge, Vivaldi and Arc, or any browser's HTML bookmarks file, and exports one.
+  - It imports from Safari, Chrome, Edge, Vivaldi and Arc, or any browser's HTML bookmarks file, and exports one.
 - **Find in page** (⌘F): a bar above the page counts the matches; Enter and ⌘G go to the next, ⇧Enter and ⇧⌘G the previous, Esc closes it.
 - **Reader Mode** (⌥⌘R, or View → Reader Mode) shows the article already loaded in the current tab in a clean reading layout. Use the shortcut again or Close to return to the page. It does not fetch restricted content.
 - **Hints** (button names and shortcuts, and tab titles in the icon rail) are drawn by macOS above the page, so a page never cuts them off.
@@ -26,7 +27,7 @@ A macOS browser built in Rust: Apple's WebKit (through Wry's `WKWebView`) for pa
 - **The browser's own pages** are native, not web pages: the Start page, Settings, History and Downloads, each with its own `vamp://` address (`vamp://settings/privacy`, `vamp://downloads`, …). Downloads also appear on a shelf along the bottom, old-Chrome style.
 - **Settings** cover:
   - appearance, startup and tabs;
-  - every search engine worth having: Kagi, Brave, Startpage, Mullvad Leta, Marginalia, SearXNG/Whoogle/4get/LibreY with your own instance, a custom URL, and `@keyword` one-off searches;
+  - search engines including Kagi, Startpage, Marginalia, SearXNG/Whoogle/4get/LibreY with your own instance, a custom URL, and `@keyword` one-off searches;
   - privacy: tracking protection, third-party cookie blocking, HTTPS-only, Global Privacy Control, search suggestions, camera/microphone/screen permissions, clearing data (it asks first), and exporting or importing everything;
   - history, downloads, a customisable toolbar, extensions and more.
 - **Extensions**: Firefox add-ons from addons.mozilla.org (by link or name), or a `.xpi`, `.zip` or unpacked folder, run by WebKit's WebExtension support (macOS 15.4+).

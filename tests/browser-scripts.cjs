@@ -119,6 +119,37 @@ function testReader() {
   assert(Math.abs(result.value - 7194.662756598241) < 1e-6, 'Article scoring stays unchanged');
 }
 
+function testFileDrop() {
+  const source = fs.readFileSync('src/browser/file_drop.rs', 'utf8');
+  const script = source.match(/pub const SCRIPT: &str = r#"([\s\S]*?)"#;/)[1];
+  const listeners = new Map();
+  const messages = [];
+  vm.runInNewContext(script, {
+    window: {webkit: {messageHandlers: {ipc: {postMessage: message => messages.push(message)}}}},
+    addEventListener: (name, listener) => listeners.set(name, listener)
+  });
+  const report = (target, defaultPrevented = false, path = [target]) => {
+    listeners.get('dragover')({target, defaultPrevented, composedPath: () => path});
+    return messages.at(-1);
+  };
+  const element = (tagName, extra = {}) => ({nodeType: 1, tagName, ...extra});
+  assert.equal(report(element('BODY')), 'file-drop-target:0', 'Ordinary page drops navigate');
+  assert.equal(report(element('INPUT', {type:'file'})), 'file-drop-target:1', 'Native upload inputs keep files');
+  assert.equal(report(element('LABEL', {control:{type:'file'}})), 'file-drop-target:1', 'Upload labels keep files');
+  assert.equal(report(element('DIV'), true), 'file-drop-target:1', 'Page-owned drop zones keep files');
+  assert.equal(report(element('SPAN'), false, [element('SPAN'), element('DIV', {isContentEditable:true})]), 'file-drop-target:1', 'Editable ancestors and shadow paths keep files');
+  const sent = messages.length;
+  report(element('DIV'), true);
+  assert.equal(messages.length, sent, 'Repeated dragover reports are not resent');
+  listeners.get('dragenter')();
+  assert.equal(messages.at(-1), 'file-drop-target:0', 'A new drag forgets the previous target');
+  listeners.get('dragenter')();
+  assert.equal(messages.length, sent + 2, 'Entering a frame always reports, as another frame may have reported since');
+  listeners.get('dragend')();
+  assert.equal(messages.at(-1), 'file-drop-target:0');
+}
+
 testFind();
 testReader();
+testFileDrop();
 console.log('Browser script regressions passed.');

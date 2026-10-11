@@ -25,6 +25,10 @@ mod media;
 mod navigation;
 #[path = "browser/page_cursor.rs"]
 mod page_cursor;
+#[path = "browser/page_menu.rs"]
+mod page_menu;
+#[path = "browser/file_drop.rs"]
+mod file_drop;
 #[path = "browser/pointer_lock.rs"]
 mod pointer_lock;
 #[path = "browser/reader.rs"]
@@ -180,6 +184,8 @@ enum BrowserEvent {
     DownloadStarted(String, PathBuf, PathBuf, bool),
     DownloadFinished(String, Option<PathBuf>, bool),
     DownloadDragStarted,
+    FilesDropped(u64, Vec<PathBuf>),
+    PageMenu(u64, usize),
     DownloadDragSnapshot(u64, std::time::Instant, Option<Vec<u8>>),
     MediaInspected(
         u64,
@@ -2119,8 +2125,14 @@ impl Browser {
             // An external link opens on the current Space rather than taking
             // the user to the Space holding an existing browser window.
             let native = unsafe { &*(ns_window as *const objc2_app_kit::NSWindow) };
+            // A nonactivating panel can receive keyboard input without
+            // activating the app and raising its other browser windows.
+            // Keep it at ordinary window level so another app can cover it.
+            native.setLevel(0);
+            native.setHidesOnDeactivate(false);
             native.setCollectionBehavior(
-                native.collectionBehavior()
+                (native.collectionBehavior()
+                    & !objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllSpaces)
                     | objc2_app_kit::NSWindowCollectionBehavior::MoveToActiveSpace,
             );
         }
@@ -2458,7 +2470,8 @@ impl Browser {
         }
     }
 
-    /// A WebKit view for tab `id`, configured from the current settings.
+    /// An unloaded WebKit view for tab `id`, configured from the current settings.
+    /// Call `register_and_load_webview` before using it.
     fn create_webview(
         &self,
         id: u64,
@@ -2495,6 +2508,9 @@ impl Browser {
         let trust_sender = route.clone();
         let editing_sender = route.clone();
         let auth_sender = route.clone();
+        let drop_sender = route.clone();
+        let page_accepts_drop = Rc::new(Cell::new(false));
+        let drop_target = page_accepts_drop.clone();
         // The HTTPS address last tried instead of an HTTP one, in this tab.
         // Forgotten once a page loads, so a later visit to the same HTTP
         // address isn't taken for a redirect loop.
@@ -2526,9 +2542,17 @@ impl Browser {
         let extensions = self.common.extensions.borrow();
         let own_store = store.and_then(|store| {
             let mtm = objc2::MainThreadMarker::new()?;
+            // Keep extensions attached when a public tab changes data stores.
             // SAFETY: a plain constructor and setter, on the main thread.
             unsafe {
-                let configuration = objc2_web_kit::WKWebViewConfiguration::new(mtm);
+                let configuration = if !private {
+                    extensions
+                        .as_ref()
+                        .map(|extensions| extensions.webview_configuration_for(url))
+                } else {
+                    None
+                }
+                .unwrap_or_else(|| objc2_web_kit::WKWebViewConfiguration::new(mtm));
                 configuration.setWebsiteDataStore(store);
                 Some(configuration)
             }
@@ -2553,15 +2577,27 @@ impl Browser {
         // YouTube) and leave an empty page until Reload.
         let mut builder = builder
             .with_visible(false)
+            .with_drag_drop_handler(move |event| {
+                match event {
+                    wry::DragDropEvent::Drop { paths, .. } if !page_accepts_drop.get() && paths.iter().any(|path| path.is_file()) => {
+                        drop_sender.send(BrowserEvent::FilesDropped(id, paths));
+                        true
+                    }
+                    _ => false,
+                }
+            })
             .with_back_forward_navigation_gestures(settings.swipe_navigation)
             .with_accept_first_mouse(true)
             .with_incognito(private)
             .with_autoplay(!settings.block_autoplay)
             .with_devtools(settings.web_inspector)
+            .with_initialization_script_for_main_only(file_drop::SCRIPT, false)
             .with_initialization_script(EDITING_SCRIPT)
             .with_initialization_script(URL_CHANGE_SCRIPT)
             .with_ipc_handler(move |request| {
-                if let Some(state) = request.body().strip_prefix("editing:") {
+                if let Some(state) = request.body().strip_prefix("file-drop-target:") {
+                    drop_target.set(state == "1");
+                } else if let Some(state) = request.body().strip_prefix("editing:") {
                     editing_sender.send(BrowserEvent::PageEditing(id, state == "1"));
                 } else if let Some(payload) = request.body().strip_prefix("http-auth:")
                     && let Ok([user, password]) = serde_json::from_str::<[String; 2]>(payload)
@@ -2717,6 +2753,10 @@ impl Browser {
         // Wry's classes exist from the first web view on.
         navigation::install();
         pointer_lock::enable(&view.webview());
+        let menu_route = self.route(id);
+        page_menu::enable(&view.webview(), move |menu| {
+            menu_route.send(BrowserEvent::PageMenu(id, menu));
+        });
         let route = self.route(id);
         let failed_route = route.clone();
         navigation::open_new_tabs_with(&view.webview(), move |url, front| {
@@ -2744,14 +2784,8 @@ impl Browser {
             // Do this before navigation: hidden WKWebViews can still autoplay.
             audio::set_suspended(&view.webview(), true);
         }
-        if self.common.rules.borrow().ready() {
-            view.load_url(url)?;
-        } else {
-            self.common
-                .waiting_loads
-                .borrow_mut()
-                .push((Rc::downgrade(&view), url.to_owned()));
-        }
+        // The caller registers this view with extensions before starting
+        // navigation in `register_and_load_webview`, so document-start scripts have a tab.
         Ok(view)
     }
 
@@ -2805,7 +2839,7 @@ impl Browser {
                 } else {
                     match self.create_webview(id, &url, private, media_suspended, window) {
                         Ok(view) => {
-                            self.report_opened(id, &view, private);
+                            self.register_and_load_webview(id, &view, private, &url);
                             (Page::Web, url, Some(view))
                         }
                         Err(err) => {
@@ -2912,7 +2946,7 @@ impl Browser {
         let (id, url, private, zoom) = (tab.id, tab.url.clone(), tab.private, tab.zoom);
         match self.create_webview(id, &url, private, false, window) {
             Ok(view) => {
-                self.report_opened(id, &view, private);
+                self.register_and_load_webview(id, &view, private, &url);
                 let _ = view.zoom(zoom);
                 let audio_observer = self.observe_tab_audio(id, &view);
                 let url_observer = self.observe_tab_url(id, &view);
@@ -3327,6 +3361,16 @@ impl Browser {
     fn site_security_menu(&self, url: &str) -> Vec<(native::MenuEntry, Option<Command>)> {
         use commands::submenu;
         use settings::Protection;
+        if url::Url::parse(url).is_ok_and(|url| url.scheme() == "file") {
+            return vec![
+                (native::MenuEntry::disabled("Local file").with_icon(Icon::Globe), None),
+                (native::MenuEntry::disabled("Local files may share stored data"), None),
+                (native::MenuEntry::Separator, None),
+                (native::MenuEntry::item("Clear local storage")
+                    .with_icon(Icon::Database),
+                    Some(Command::ClearFileLocalStorage(url.to_owned()))),
+            ];
+        }
         let Some(host) = site_controls::host(url) else {
             return Vec::new();
         };
@@ -3586,6 +3630,7 @@ impl Browser {
                 extensions.tab_closed(id);
             }
         }
+        self.register_and_load_webview(id, &view, private, url);
         self.tabs[index].audio_observer = Some(self.observe_tab_audio(id, &view));
         self.tabs[index].url_observer = Some(self.observe_tab_url(id, &view));
         let _ = view.zoom(zoom);
@@ -3818,6 +3863,21 @@ impl Browser {
         self.select(index, cx);
     }
 
+    fn open_dropped_files(&mut self, paths: &[PathBuf], tab_id: u64, window: &Window, cx: &mut Context<Self>) {
+        let mut files = paths.iter().filter(|path| path.is_file());
+        if let Some(path) = files.next() {
+            self.open_dropped_download(path, tab_id, window, cx);
+        }
+        let private = self.tabs.iter().find(|tab| tab.id == tab_id).map(|tab| tab.private);
+        if let Some(private) = private {
+            for path in files {
+                if let Ok(url) = url::Url::from_file_path(path) {
+                    self.open_tab(TabTarget::Url(url.into()), private, true, window, cx);
+                }
+            }
+        }
+    }
+
     fn begin_download_drag(&mut self) {
         let tab = self.current();
         let Some(view) = tab.view.as_ref().filter(|_| tab.page == Page::Web) else {
@@ -3866,7 +3926,7 @@ impl Browser {
                 extensions.tab_closed(id);
             }
         }
-        self.report_opened(id, &view, private);
+        self.register_and_load_webview(id, &view, private, url);
         let _ = view.zoom(zoom);
         let audio_observer = self.observe_tab_audio(id, &view);
         let url_observer = self.observe_tab_url(id, &view);
@@ -4159,6 +4219,19 @@ impl Browser {
                     }
                     self.refresh_other_windows(cx);
                     cx.notify();
+                }
+                BrowserEvent::FilesDropped(id, paths) => self.open_dropped_files(&paths, id, window, cx),
+                BrowserEvent::PageMenu(id, token) => {
+                    let Some(menu) = page_menu::take(token) else { continue; };
+                    if self.current().id == id && self.current().page == Page::Web && !menu.entries.is_empty() {
+                        let receiver = app_menu::open(cx, window, menu.position, menu.entries.clone(), self.controls.palette());
+                        cx.spawn_in(window, async move |this, cx| {
+                            let chosen = receiver.recv().await.ok().flatten();
+                            let _ = this.update_in(cx, |browser, _, _| {
+                                menu.finish(chosen.filter(|_| browser.current().id == id && browser.current().page == Page::Web));
+                            });
+                        }).detach();
+                    }
                 }
                 BrowserEvent::DownloadDragStarted => self.begin_download_drag(),
                 BrowserEvent::DownloadDragSnapshot(id, request, jpeg) => {
@@ -4804,9 +4877,24 @@ impl Browser {
         });
     }
 
-    fn report_opened(&mut self, id: u64, view: &Rc<WebView>, private: bool) {
+    /// Registers the web view before its first navigation. Content scripts
+    /// can connect at document start, when WebKit must already know the tab.
+    fn register_and_load_webview(&mut self, id: u64, view: &Rc<WebView>, private: bool, url: &str) {
         if !private && let Some(extensions) = self.common.extensions.borrow_mut().as_mut() {
             extensions.tab_opened(id, &view.webview());
+            if self.tabs.get(self.selected).is_some_and(|tab| tab.id == id) {
+                extensions.tab_activated(id);
+            }
+        }
+        if self.common.rules.borrow().ready() {
+            if let Err(err) = view.load_url(url) {
+                eprintln!("Could not load {url}: {err}");
+            }
+        } else {
+            self.common
+                .waiting_loads
+                .borrow_mut()
+                .push((Rc::downgrade(view), url.to_owned()));
         }
     }
 
@@ -6023,6 +6111,10 @@ impl Browser {
         .on_drop(cx.listener(move |this, path: &PathBuf, window, cx| {
             this.open_dropped_download(path, id, window, cx);
         }))
+        .drag_over::<gpui::ExternalPaths>(move |style, _, _, _| style.border_2().border_color(accent))
+        .on_drop(cx.listener(move |this, paths: &gpui::ExternalPaths, window, cx| {
+            this.open_dropped_files(paths.paths(), id, window, cx);
+        }))
     }
 
     /// What a tab list lays out: departing tabs still shrinking away, the
@@ -6951,6 +7043,10 @@ impl Render for Browser {
                 let id = this.current().id;
                 this.open_dropped_download(path, id, window, cx);
             }))
+            .drag_over::<gpui::ExternalPaths>(move |style, _, _, _| style.border_2().border_color(palette.accent))
+            .on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, window, cx| {
+                this.open_dropped_files(paths.paths(), this.current().id, window, cx);
+            }))
             .children(find_bar)
             .child(
                 div()
@@ -7428,6 +7524,7 @@ fn open_compact_window(cx: &mut App, common: Rc<Common>, url: String) {
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         window_min_size: Some(size(px(360.0), px(260.0))),
+        kind: gpui::WindowKind::PopUp,
         // Configure the native window for the current Space before showing
         // it. GPUI otherwise orders it front while constructing it, before
         // Browser::new can set MoveToActiveSpace.
@@ -7576,6 +7673,10 @@ macro_rules! route {
     };
 }
 
+fn is_external_link(url: &str) -> bool {
+    url::Url::parse(url).is_ok_and(|url| matches!(url.scheme(), "http" | "https" | "file"))
+}
+
 fn main() {
     // Before anything reads the profile or starts WebKit.
     sitedata::finish_import();
@@ -7679,7 +7780,19 @@ fn main() {
             saved.windows.clone()
         };
         let settings = Settings::load();
-        if (settings.startup == Startup::Restore || common.restore_session_on_launch)
+        // AppKit delivers launch URLs before applicationDidFinishLaunching,
+        // which runs this callback. Drain them before creating startup windows.
+        let mut launch_urls = Vec::new();
+        while let Ok(urls) = opened_rx.try_recv() {
+            launch_urls.extend(urls.into_iter().filter(|url| is_external_link(url)));
+        }
+        if !launch_urls.is_empty() && !settings.external_link_startup_window {
+            // Preserve the previous session for explicit reopening, but don't
+            // put a regular window behind a popup-only launch.
+            for window in windows.into_iter().rev() {
+                common.remember_closed(window, &settings.home_page);
+            }
+        } else if (settings.startup == Startup::Restore || common.restore_session_on_launch)
             && !windows.is_empty()
         {
             for window in windows {
@@ -7764,15 +7877,17 @@ fn main() {
         .detach();
         // URLs and files macOS hands over, including the ones that launched
         // the app, get small page windows that can join a browser window.
+        let launched_from_link = !launch_urls.is_empty();
+        for url in launch_urls {
+            open_compact_window(cx, common.clone(), url);
+        }
         let forward = common.clone();
         cx.spawn(async move |cx| {
             while let Ok(urls) = opened_rx.recv().await {
                 let common = forward.clone();
                 cx.update(|cx| {
                     for url in urls {
-                        if url::Url::parse(&url)
-                            .is_ok_and(|url| matches!(url.scheme(), "http" | "https" | "file"))
-                        {
+                        if is_external_link(&url) {
                             open_compact_window(cx, common.clone(), url);
                         }
                     }
@@ -7860,7 +7975,9 @@ fn main() {
             FindPrevious => Command::FindPrevious,
             About => Command::Settings(Section::About),
         });
-        cx.activate(true);
+        if !launched_from_link {
+            cx.activate(true);
+        }
     });
 }
 

@@ -182,6 +182,7 @@ pub enum Command {
     SetSiteProtection(String, Option<Protection>),
     SetSiteCookies(String, Option<bool>),
     ClearSiteData(String, crate::cache::SiteDataKind),
+    ClearFileLocalStorage(String),
     /// The whole profile, logins and all, to an archive.
     ExportBrowserData,
     /// An archive in place of the profile, relaunching.
@@ -472,6 +473,11 @@ impl Browser {
             Command::ClearSiteData(host, kind) => {
                 if let Some(view) = &self.current().view {
                     crate::cache::clear_site_data(&view.webview(), host, kind);
+                }
+            }
+            Command::ClearFileLocalStorage(url) => {
+                if let Some(view) = &self.current().view {
+                    crate::cache::clear_file_local_storage(&view.webview(), &url);
                 }
             }
             Command::ToggleStartSection(section) => {

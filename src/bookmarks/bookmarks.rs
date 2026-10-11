@@ -440,17 +440,15 @@ fn find(nodes: &[Node], id: u64) -> Option<&Node> {
 pub enum Source {
     Safari,
     Chrome,
-    Brave,
     Edge,
     Vivaldi,
     Arc,
 }
 
 impl Source {
-    pub const ALL: [Source; 6] = [
+    pub const ALL: [Source; 5] = [
         Source::Safari,
         Source::Chrome,
-        Source::Brave,
         Source::Edge,
         Source::Vivaldi,
         Source::Arc,
@@ -460,7 +458,6 @@ impl Source {
         match self {
             Source::Safari => "Safari",
             Source::Chrome => "Google Chrome",
-            Source::Brave => "Brave",
             Source::Edge => "Microsoft Edge",
             Source::Vivaldi => "Vivaldi",
             Source::Arc => "Arc",
@@ -473,7 +470,6 @@ impl Source {
         Some(match self {
             Source::Safari => home.join("Library/Safari/Bookmarks.plist"),
             Source::Chrome => support.join("Google/Chrome/Default/Bookmarks"),
-            Source::Brave => support.join("BraveSoftware/Brave-Browser/Default/Bookmarks"),
             Source::Edge => support.join("Microsoft Edge/Default/Bookmarks"),
             Source::Vivaldi => support.join("Vivaldi/Default/Bookmarks"),
             Source::Arc => support.join("Arc/User Data/Default/Bookmarks"),
