@@ -127,6 +127,8 @@ pub enum TabPlacement {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PopupPolicy {
+    /// Foreground popups use compact windows. Keep the serialized name
+    /// for profiles saved before related WebKit popups were supported.
     #[default]
     NewTab,
     BackgroundTab,

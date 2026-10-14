@@ -17,12 +17,12 @@ use vampir::{ButtonVariant, Palette, TextInput, WidgetContext, color, lighting};
 
 use crate::{
     Browser, BrowserEvent, Chrome, Page, SettingsInputs, WithHint,
-    commands::{Command, Place, Section},
+    commands::{Command, MenuItem, Place, Section},
     downloads::DownloadState,
     history::Visit,
     icons::{Icon, icon},
     interop,
-    native::{self, MenuEntry},
+    native,
     settings::{
         self, NewTabPage, PopupPolicy, Protection, SchemeChoice, Settings, SitePermission,
         StartSection, Startup, TabPlacement, TintMode, ToolbarItem, UserAgent,
@@ -548,18 +548,18 @@ impl Browser {
                             .on_click(cx.listener(|this, event: &gpui::ClickEvent, window, cx| {
                                 let items = StartSection::ALL
                                     .into_iter()
-                                    .map(|section| (
-                                        MenuEntry::checked(
+                                    .map(|section| {
+                                        MenuItem::action(
+                                            Some(Command::ToggleStartSection(section)),
                                             section.label(),
-                                            this.settings.start_page_sections.shown(section),
-                                        ),
-                                        Some(Command::ToggleStartSection(section)),
-                                    ))
+                                        )
+                                        .checked(this.settings.start_page_sections.shown(section))
+                                    })
                                     .collect();
                                 this.context_menu(event.position(), items, window, cx);
                             }))
                             .child("•••")
-                            .with_hint("Customize start page".into(), crate::hint::Side::Below, cx),
+                            .with_hint("Customize start page".into(), vampir::HintSide::Below, cx),
                     ),
             );
         let tile = |id: (&'static str, usize),
@@ -741,14 +741,20 @@ impl Browser {
                     .child("Bookmark pages with ⌘D and they'll appear here, along with the sites you visit most. ⌘K finds any tab, bookmark or page."),
             );
         }
-        div()
+        // A column, not a row: in a row the column would be stretched to
+        // the page's height and overflow it, with nothing to scroll.
+        let scroll = self.controls.scroll("start-page");
+        let page = div()
             .id("start-page")
             .size_full()
             .overflow_y_scroll()
+            .track_scroll(&scroll)
             .bg(palette.backdrop)
             .flex()
-            .justify_center()
-            .child(column)
+            .flex_col()
+            .items_center()
+            .child(column);
+        self.scrolled("start-page", page, &scroll, palette, cx)
             .into_any_element()
     }
 
@@ -914,18 +920,12 @@ impl Browser {
             Section::About => self.about(palette, cx),
         };
         let notice = self.notice.clone();
-        div()
-            .size_full()
-            .flex()
-            .bg(palette.backdrop)
-            .child(nav)
-            .child(
-                div()
+        let scroll = self.controls.scroll("settings-scroll");
+        let scrolling = div()
                     .id("settings-scroll")
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .h_full()
+                    .size_full()
                     .overflow_y_scroll()
+                    .track_scroll(&scroll)
                     .child(
                         div()
                             .max_w(px(760.0))
@@ -953,7 +953,17 @@ impl Browser {
                                 )
                             })
                             .child(body),
-                    ),
+                    );
+        div()
+            .size_full()
+            .flex()
+            .bg(palette.backdrop)
+            .child(nav)
+            .child(
+                self.scrolled("settings-scroll", scrolling, &scroll, palette, cx)
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .h_full(),
             )
             .into_any_element()
     }
@@ -1244,9 +1254,9 @@ impl Browser {
         let popups = self.choose_setting(
             "popups",
             "Links that open new windows",
-            Some("Pop-ups become tabs; blocking stops them entirely."),
+            Some("Pop-ups open in compact windows or background tabs; blocking stops them entirely."),
             &[
-                (PopupPolicy::NewTab, "New tab"),
+                (PopupPolicy::NewTab, "Compact window"),
                 (PopupPolicy::BackgroundTab, "Background tab"),
                 (PopupPolicy::Block, "Block"),
             ],
@@ -2104,9 +2114,9 @@ impl Browser {
             true,
             palette,
             cx,
-            |_, _, _| {
+            |_, _, cx| {
                 if let Some(dir) = crate::state::data_path("") {
-                    interop::open_file(&dir);
+                    cx.open_with_system(&dir);
                 }
             },
         )
@@ -2189,7 +2199,7 @@ impl Browser {
 
     /// A download's right-click menu, built when it's asked for, so the
     /// rows drawing it needn't keep a copy of the download.
-    fn download_menu(&self, id: u64) -> Vec<(MenuEntry, Option<Command>)> {
+    fn download_menu(&self, id: u64) -> Vec<MenuItem> {
         let downloads = self.downloads();
         let Some(item) = downloads.get(id) else {
             return Vec::new();
@@ -2197,28 +2207,42 @@ impl Browser {
         let exists = item.exists();
         let done = item.state == DownloadState::Done && exists;
         vec![
-            (
-                entry("Open", done).with_icon(Icon::Open),
+            MenuItem::action(
                 Some(Command::OpenDownload(item.id)),
-            ),
-            (
-                entry("Show in Finder", exists).with_icon(Icon::Search),
+                "Open",
+            )
+            .enabled(done)
+            .icon(Icon::Open),
+            MenuItem::action(
                 Some(Command::RevealDownload(item.id)),
-            ),
-            (
-                MenuEntry::item("Copy Download Link").with_icon(Icon::Link),
+                "Show in Finder",
+            )
+            .enabled(exists)
+            .icon(Icon::Search),
+            MenuItem::action(
                 Some(Command::Copy(item.url.clone())),
-            ),
-            (
-                MenuEntry::item("Remove from List").with_icon(Icon::Close),
+                "Copy Download Link",
+            )
+            .icon(Icon::Link),
+            MenuItem::action(
                 Some(Command::RemoveDownload(item.id)),
-            ),
+                "Remove from List",
+            )
+            .icon(Icon::Close),
         ]
     }
 
     /// The indeterminate bar under a download in progress: WebKit doesn't
-    /// report how far along it is.
-    fn busy_bar(id: (&'static str, u64), width: f32, palette: Palette) -> AnyElement {
+    /// report how far along it is. Its sweep is read off the clock, and
+    /// the browser redraws for it at [`crate::BUSY_BAR_FRAME`] while a
+    /// download runs: a GPUI animation that repeats would draw the whole
+    /// window at every display tick for the length of the download.
+    fn busy_bar(_id: (&'static str, u64), width: f32, palette: Palette) -> AnyElement {
+        let period = slowed(Duration::from_millis(1100)).as_millis().max(1);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_millis());
+        let t = (now % period) as f32 / period as f32;
         div()
             .relative()
             .w(px(width))
@@ -2234,11 +2258,7 @@ impl Browser {
                     .w(px(width * 0.35))
                     .rounded(px(2.0))
                     .bg(palette.accent)
-                    .with_animation(
-                        id,
-                        Animation::new(slowed(Duration::from_millis(1100))).repeat(),
-                        move |bar, t| bar.left(px(-width * 0.35 + t * width * 1.35)),
-                    ),
+                    .left(px(-width * 0.35 + t * width * 1.35)),
             )
             .into_any_element()
     }
@@ -2712,15 +2732,18 @@ impl Browser {
             );
         }
         drop(downloads);
-        div()
+        let scroll = self.controls.scroll("downloads-page");
+        let page = div()
             .id("downloads-page")
             .size_full()
             .overflow_y_scroll()
-            .track_scroll(&self.controls.scroll("downloads-page"))
+            .track_scroll(&scroll)
             .bg(palette.backdrop)
             .flex()
-            .justify_center()
-            .child(column)
+            .flex_col()
+            .items_center()
+            .child(column);
+        self.scrolled("downloads-page", page, &scroll, palette, cx)
             .into_any_element()
     }
 
@@ -2730,12 +2753,12 @@ impl Browser {
                 if let Some(item) = self.downloads().get(id)
                     && item.state == DownloadState::Done
                 {
-                    interop::open_file(&item.path);
+                    cx.open_with_system(&item.path);
                 }
             }
             Command::RevealDownload(id) => {
                 if let Some(item) = self.downloads().get(id) {
-                    interop::show_in_finder(&item.path);
+                    cx.reveal_path(&item.path);
                 }
             }
             Command::RemoveDownload(id) => self.downloads().remove(id),
@@ -2755,19 +2778,11 @@ static APP_ICON: LazyLock<Arc<gpui::Image>> = LazyLock::new(|| {
     ))
 });
 
-fn entry(label: &str, enabled: bool) -> MenuEntry {
-    if enabled {
-        MenuEntry::item(label)
-    } else {
-        MenuEntry::disabled(label)
-    }
-}
-
 /// Each download's chip on the shelf, centred in its height.
 const SHELF_ITEM_HEIGHT: f32 = 40.0;
 
 /// A file's size as Finder shows it: decimal units, one decimal place.
-fn file_size(bytes: u64) -> String {
+pub(crate) fn file_size(bytes: u64) -> String {
     let bytes = bytes as f64;
     match bytes {
         b if b < 1e3 => format!("{b} bytes"),

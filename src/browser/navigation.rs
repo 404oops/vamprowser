@@ -127,6 +127,7 @@ pub struct AuthChallenge {
 
 thread_local! {
     /// By web view address.
+    static CLOSERS: RefCell<HashMap<usize, Box<dyn Fn()>>> = RefCell::default();
     static OPENERS: RefCell<HashMap<usize, Opener>> = RefCell::default();
     /// By web view address.
     static FAILURES: RefCell<HashMap<usize, FailureHandler>> = RefCell::default();
@@ -213,6 +214,30 @@ type DecideAction = unsafe extern "C-unwind" fn(&AnyObject, Sel, &WKWebView, &An
 pub fn open_new_tabs_with(webview: &WKWebView, open: impl Fn(String, bool) + 'static) {
     let key = webview as *const WKWebView as usize;
     OPENERS.with(|openers| openers.borrow_mut().insert(key, Box::new(open)));
+}
+
+/// Only browser-created popups honor a page's window.close request.
+pub fn on_close(webview: &WKWebView, close: impl Fn() + 'static) {
+    let key = webview as *const WKWebView as usize;
+    CLOSERS.with(|closers| closers.borrow_mut().insert(key, Box::new(close)));
+    unsafe {
+        let delegate = webview.UIDelegate();
+        let Some(delegate) = delegate else { return; };
+        let class = AnyObject::class(&*(Retained::as_ptr(&delegate).cast::<AnyObject>()));
+        type DidClose = unsafe extern "C-unwind" fn(&AnyObject, Sel, &WKWebView);
+        let imp: Imp = std::mem::transmute::<DidClose, Imp>(did_close);
+        ffi::class_addMethod(class as *const AnyClass as *mut AnyClass,
+            sel!(webViewDidClose:), imp, c"v@:@".as_ptr());
+        webview.setUIDelegate(None);
+        webview.setUIDelegate(Some(&delegate));
+    }
+}
+
+unsafe extern "C-unwind" fn did_close(_this: &AnyObject, _cmd: Sel, webview: &WKWebView) {
+    let key = webview as *const WKWebView as usize;
+    CLOSERS.with(|closers| {
+        if let Some(close) = closers.borrow().get(&key) { close(); }
+    });
 }
 
 /// Has `webview` report pages that fail to load to `failed`: wry leaves
@@ -400,6 +425,7 @@ unsafe extern "C-unwind" fn did_receive_auth(
 pub fn forget(webview: &WKWebView) {
     crate::page_menu::forget(webview);
     let key = webview as *const WKWebView as usize;
+    CLOSERS.with(|closers| closers.borrow_mut().remove(&key));
     OPENERS.with(|openers| openers.borrow_mut().remove(&key));
     FAILURES.with(|failures| failures.borrow_mut().remove(&key));
     AUTH_HANDLERS.with(|handlers| handlers.borrow_mut().remove(&key));

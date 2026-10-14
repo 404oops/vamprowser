@@ -1,19 +1,23 @@
-//! macOS file pickers, extension permission alerts, and WebKit page snapshots.
+//! macOS permission alerts, WebKit page snapshots, and the local clock.
 
-use std::cell::Cell;
+use std::{
+    cell::Cell,
+    sync::{Arc, Mutex},
+};
 
 use block2::RcBlock;
-use objc2::{AnyThread, MainThreadMarker, rc::Retained};
+use gpui::RenderImage;
+use objc2::{AnyThread, MainThreadMarker};
 use objc2_app_kit::{
-    NSAlert, NSAlertFirstButtonReturn, NSBitmapImageFileType, NSBitmapImageRep, NSImage,
+    NSAlert, NSAlertFirstButtonReturn, NSBitmapImageRep, NSCompositingOperation,
+    NSDeviceRGBColorSpace, NSGraphicsContext, NSImage,
 };
 use objc2_foundation::{
-    NSCalendar, NSCalendarUnit, NSDate, NSDateFormatter, NSDateFormatterStyle, NSDictionary,
-    NSError, NSNumber, NSString,
+    NSCalendar, NSCalendarUnit, NSDate, NSDateFormatter, NSDateFormatterStyle, NSError, NSNumber,
+    NSPoint, NSRect, NSSize, NSString,
 };
 use objc2_web_kit::{WKSnapshotConfiguration, WKWebView};
 
-use crate::icons::Icon;
 
 /// WebKit's default media prompt forgets its answer when a view is rebuilt.
 /// Ask here so an explicit lasting choice can be stored for this host.
@@ -57,110 +61,54 @@ pub fn ask_site_permission(
     }
 }
 
-/// One row of a context menu.
-#[derive(Clone)]
-pub enum MenuEntry {
-    Item {
-        label: String,
-        enabled: bool,
-        checked: bool,
-        /// Drawn ahead of the label, so a row can be found by its shape.
-        icon: Option<Icon>,
-    },
-    Separator,
-    /// A row that opens another menu.
-    Submenu {
-        label: String,
-        entries: Vec<MenuEntry>,
-        icon: Option<Icon>,
-    },
+/// A page's still held by the browser. Dropping it (closing what it was
+/// behind) gives its texture back on the next frame drawn: see
+/// [`release_stale`]. Not cloned, so a frame drawing it can't let it go.
+pub struct Still(Arc<RenderImage>);
+
+impl Still {
+    pub fn new(image: Arc<RenderImage>) -> Self {
+        Self(image)
+    }
+
+    /// The image, to draw.
+    pub fn image(&self) -> Arc<RenderImage> {
+        self.0.clone()
+    }
 }
 
-impl MenuEntry {
-    pub fn item(label: impl Into<String>) -> Self {
-        MenuEntry::Item {
-            label: label.into(),
-            enabled: true,
-            checked: false,
-            icon: None,
-        }
-    }
-
-    pub fn disabled(label: impl Into<String>) -> Self {
-        MenuEntry::Item {
-            label: label.into(),
-            enabled: false,
-            checked: false,
-            icon: None,
-        }
-    }
-
-    pub fn checked(label: impl Into<String>, checked: bool) -> Self {
-        MenuEntry::Item {
-            label: label.into(),
-            enabled: true,
-            checked,
-            icon: None,
-        }
-    }
-
-    /// The same row with `icon` ahead of its label.
-    pub fn with_icon(mut self, with: Icon) -> Self {
-        match &mut self {
-            MenuEntry::Item { icon, .. } | MenuEntry::Submenu { icon, .. } => *icon = Some(with),
-            MenuEntry::Separator => {}
-        }
-        self
-    }
-
-    pub fn icon(&self) -> Option<Icon> {
-        match self {
-            MenuEntry::Item { icon, .. } | MenuEntry::Submenu { icon, .. } => *icon,
-            MenuEntry::Separator => None,
+impl Drop for Still {
+    fn drop(&mut self) {
+        if let Ok(mut stale) = STALE.lock() {
+            stale.push(self.0.clone());
         }
     }
 }
 
-/// Asks for a file to open, of the given extensions. Blocks until chosen.
-pub fn choose_file(extensions: &[&str]) -> Option<std::path::PathBuf> {
-    let mtm = MainThreadMarker::new()?;
-    let panel = objc2_app_kit::NSOpenPanel::openPanel(mtm);
-    panel.setCanChooseFiles(true);
-    panel.setCanChooseDirectories(false);
-    panel.setAllowsMultipleSelection(false);
-    #[allow(deprecated)]
-    {
-        let types: Vec<Retained<NSString>> =
-            extensions.iter().map(|e| NSString::from_str(e)).collect();
-        let types = objc2_foundation::NSArray::from_retained_slice(&types);
-        panel.setAllowedFileTypes(Some(&types));
+/// Stills let go of, until a window frees their textures.
+static STALE: Mutex<Vec<Arc<RenderImage>>> = Mutex::new(Vec::new());
+
+/// Frees the textures of stills no longer held. Called as a window draws,
+/// since only then is there a window to free them from.
+pub fn release_stale(window: &mut gpui::Window, cx: &mut gpui::App) {
+    let stale: Vec<_> = match STALE.lock() {
+        Ok(mut stale) if !stale.is_empty() => stale.drain(..).collect(),
+        _ => return,
+    };
+    for image in stale {
+        cx.drop_image(image, Some(window));
     }
-    if panel.runModal() != objc2_app_kit::NSModalResponseOK {
-        return None;
-    }
-    panel
-        .URL()?
-        .path()
-        .map(|p| std::path::PathBuf::from(p.to_string()))
 }
 
-/// Asks where to save a file, suggesting `name`. Blocks until chosen.
-pub fn choose_save_path(name: &str) -> Option<std::path::PathBuf> {
-    let mtm = MainThreadMarker::new()?;
-    let panel = objc2_app_kit::NSSavePanel::savePanel(mtm);
-    panel.setNameFieldStringValue(&NSString::from_str(name));
-    if panel.runModal() != objc2_app_kit::NSModalResponseOK {
-        return None;
-    }
-    panel
-        .URL()?
-        .path()
-        .map(|p| std::path::PathBuf::from(p.to_string()))
-}
-
-/// Asks WebKit for a still of the page as JPEG, delivered on the main
-/// thread; `None` if it couldn't.
-pub fn snapshot(webview: &WKWebView, done: impl FnOnce(Option<Vec<u8>>) + 'static) {
+/// Asks WebKit for a still of the page, delivered ready to draw, on a
+/// thread of its own; `None` if it couldn't. The pixels are copied out on
+/// the main thread (the image is WebKit's), but nothing is encoded or
+/// decoded: the still is drawn as soon as it arrives, and the main thread
+/// gets on with the overlay's opening frames.
+pub fn snapshot(
+    webview: &WKWebView,
+    done: impl FnOnce(Option<Arc<RenderImage>>) + Send + 'static,
+) {
     let Some(mtm) = MainThreadMarker::new() else {
         done(None);
         return;
@@ -172,8 +120,12 @@ pub fn snapshot(webview: &WKWebView, done: impl FnOnce(Option<Vec<u8>>) + 'stati
         };
         // SAFETY: WebKit passes a valid image or null for the callback's
         // duration.
-        let bytes = unsafe { image.as_ref() }.and_then(jpeg);
-        done(bytes);
+        match unsafe { image.as_ref() }.and_then(|image| rgba_pixels(image, None)) {
+            Some((width, height, pixels)) => {
+                std::thread::spawn(move || done(render_image(width, height, pixels)));
+            }
+            None => done(None),
+        }
     });
     // SAFETY: a fresh configuration and a block of the documented type;
     // WebKit calls it once on the main thread.
@@ -239,20 +191,90 @@ mod snapshot_tests {
     }
 }
 
-/// Straight from the image's bitmap, rather than through a TIFF encoding
-/// and back.
-fn jpeg(image: &NSImage) -> Option<Vec<u8>> {
-    // SAFETY: a null rect asks for the image at its own size, and no
-    // context or hints are needed.
-    let cg_image =
-        unsafe { image.CGImageForProposedRect_context_hints(std::ptr::null_mut(), None, None) }?;
-    let rep = NSBitmapImageRep::initWithCGImage(NSBitmapImageRep::alloc(), &cg_image);
-    let properties = NSDictionary::new();
-    // SAFETY: an empty properties dictionary is valid for any file type.
-    let data = unsafe {
-        rep.representationUsingType_properties(NSBitmapImageFileType::JPEG, &properties)
+/// A small image (a file icon) drawn `pixels` square, ready to draw, made
+/// here and now: a few kilobytes, so not worth a thread.
+pub fn render_image_of(image: &NSImage, pixels: u32) -> Option<Arc<RenderImage>> {
+    let (width, height, data) = rgba_pixels(image, Some((pixels as isize, pixels as isize)))?;
+    render_image(width, height, data)
+}
+
+/// The image's pixels as tightly packed 8-bit RGBA, premultiplied, drawn
+/// into a bitmap of that one known layout (at the image's own pixel size,
+/// or `size`): the image's own layout can be any of several.
+fn rgba_pixels(image: &NSImage, size: Option<(isize, isize)>) -> Option<(u32, u32, Vec<u8>)> {
+    let (width, height) = match size {
+        Some(size) => size,
+        None => image
+            .representations()
+            .iter()
+            .map(|rep| (rep.pixelsWide(), rep.pixelsHigh()))
+            .max()?,
+    };
+    if width <= 0 || height <= 0 || width > 1 << 14 || height > 1 << 14 {
+        return None;
+    }
+    // SAFETY: null planes ask AppKit to allocate the bitmap; the rest
+    // describes 8-bit RGBA, which it lays out as such.
+    let target = unsafe {
+        NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
+            NSBitmapImageRep::alloc(),
+            std::ptr::null_mut(),
+            width,
+            height,
+            8,
+            4,
+            true,
+            false,
+            NSDeviceRGBColorSpace,
+            0,
+            0,
+        )
     }?;
-    Some(data.to_vec())
+    if target.bitsPerPixel() != 32 || target.samplesPerPixel() != 4 {
+        return None;
+    }
+    let context = NSGraphicsContext::graphicsContextWithBitmapImageRep(&target)?;
+    let whole = NSRect::new(
+        NSPoint::new(0.0, 0.0),
+        NSSize::new(width as f64, height as f64),
+    );
+    NSGraphicsContext::saveGraphicsState_class();
+    NSGraphicsContext::setCurrentContext(Some(&context));
+    // The bitmap's units are its pixels: the image fills it pixel for
+    // pixel, from whichever of its representations fits best.
+    // SAFETY: drawing into the current context, which is the bitmap's.
+    unsafe {
+        image.drawInRect_fromRect_operation_fraction(
+            whole,
+            NSRect::ZERO,
+            NSCompositingOperation::Copy,
+            1.0,
+        )
+    };
+    NSGraphicsContext::restoreGraphicsState_class();
+    let bytes_per_row = usize::try_from(target.bytesPerRow()).ok()?;
+    let (width, height) = (width as usize, height as usize);
+    let data = target.bitmapData();
+    if data.is_null() || bytes_per_row < width * 4 {
+        return None;
+    }
+    let mut pixels = Vec::with_capacity(width * height * 4);
+    for row in 0..height {
+        // SAFETY: the bitmap is `height` rows of `bytes_per_row` bytes,
+        // each holding `width` 4-byte pixels, and lives as long as `target`.
+        let line = unsafe { std::slice::from_raw_parts(data.add(row * bytes_per_row), width * 4) };
+        pixels.extend_from_slice(line);
+    }
+    Some((width as u32, height as u32, pixels))
+}
+
+/// A GPUI image from RGBA pixels: it draws BGRA.
+fn render_image(width: u32, height: u32, mut pixels: Vec<u8>) -> Option<Arc<RenderImage>> {
+    for pixel in pixels.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+    let buffer = image::RgbaImage::from_raw(width, height, pixels)?;
+    Some(Arc::new(RenderImage::new(vec![image::Frame::new(buffer)])))
 }
 
 /// The hour of the day where the user is, 0 to 23.

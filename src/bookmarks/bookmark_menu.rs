@@ -3,7 +3,7 @@
 use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc, time::Duration};
 
 use gpui::{
-    Animation, AnimationExt, AnyElement, Bounds, Context, Image, ImageFormat, MouseButton, Pixels, SharedString, Window,
+    Animation, AnimationExt, AnyElement, Bounds, Context, MouseButton, Pixels, SharedString, Window,
     canvas, div, img, prelude::*, px,
 };
 use vampir::{Palette, color, lighting};
@@ -25,7 +25,7 @@ pub(crate) struct BookmarkMenu {
     /// The folders open, from the one on the bar to the innermost.
     path: Vec<u64>,
     /// A still of the web page while the menu is drawn above it.
-    snapshot: Option<Arc<Image>>,
+    snapshot: Option<native::Still>,
     tab: u64,
     opened: std::time::Instant,
 }
@@ -74,14 +74,14 @@ impl Browser {
         cx.notify();
     }
 
-    pub(crate) fn bookmark_snapshot(&mut self, tab: u64, opened: std::time::Instant, jpeg: Option<Vec<u8>>, cx: &mut Context<Self>) {
+    pub(crate) fn bookmark_snapshot(&mut self, tab: u64, opened: std::time::Instant, image: Option<Arc<gpui::RenderImage>>, cx: &mut Context<Self>) {
         if self.current().id != tab { return }
         let Some(menu) = &mut self.bookmark_menu else { return };
         if menu.tab != tab || menu.opened != opened {
             return;
         }
-        let Some(jpeg) = jpeg else { return };
-        menu.snapshot = Some(Arc::new(Image::from_bytes(ImageFormat::Jpeg, jpeg)));
+        let Some(image) = image else { return };
+        menu.snapshot = Some(native::Still::new(image));
         if let Some(view) = &self.current().view {
             let _ = view.set_visible(false);
         }
@@ -89,7 +89,7 @@ impl Browser {
     }
 
     pub(crate) fn bookmark_menu_backdrop(&self) -> Option<AnyElement> {
-        let snapshot = self.bookmark_menu.as_ref()?.snapshot.clone()?;
+        let snapshot = self.bookmark_menu.as_ref()?.snapshot.as_ref()?.image();
         Some(img(snapshot).absolute().top_0().left_0().size_full().into_any_element())
     }
 

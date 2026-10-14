@@ -2,12 +2,14 @@
 //! glide along to show the rest, pause, and come back, as the iOS lock
 //! screen does with a song title. In place of tooltips.
 
-use std::{cell::RefCell, collections::HashMap, rc::Rc, time::Duration};
-
-use gpui::{
-    Animation, AnimationExt, AnyElement, ElementId, Font, Pixels, SharedString, TextRun, Window,
-    canvas, div, prelude::*, px,
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    rc::Rc,
+    time::{Duration, Instant},
 };
+
+use gpui::{AnyElement, Font, Pixels, SharedString, TextRun, Window, canvas, div, prelude::*, px};
 
 /// Speed of the glide, in points a second.
 const SPEED: f32 = 42.0;
@@ -32,6 +34,50 @@ pub(crate) struct Measurement {
     text_width: f32,
     available_width: f32,
     overflow: f32,
+    /// When the glide began: the label's motion is read off the clock, so
+    /// it needs frames only while moving, not through its pauses.
+    started: Instant,
+}
+
+/// Where a gliding label is, `elapsed` into its cycle over `overflow`:
+/// how far left it's drawn, and whether it's moving (needs a frame now)
+/// or how long until it next does.
+fn position(elapsed: f32, overflow: f32) -> (f32, Option<Duration>) {
+    let travel = overflow + 6.0;
+    let glide = travel / SPEED;
+    let total = HOLD_START + glide + HOLD_END + RETURN;
+    let at = elapsed % total;
+    let until = |next: f32| Some(Duration::from_secs_f32((next - at).max(0.0)));
+    if at < HOLD_START {
+        (0.0, until(HOLD_START))
+    } else if at < HOLD_START + glide {
+        let p = (at - HOLD_START) / glide;
+        // Eased at both ends, like a hand scrolling.
+        (travel * smooth(p), None)
+    } else if at < HOLD_START + glide + HOLD_END {
+        (travel, until(HOLD_START + glide + HOLD_END))
+    } else {
+        // Back to the start, briskly but not in a jump.
+        let p = (at - HOLD_START - glide - HOLD_END) / RETURN;
+        (travel * (1.0 - smooth(p.min(1.0))), None)
+    }
+}
+
+/// When the labels gliding in `widths` next need drawing: `Some(zero)` if
+/// one is moving now, else how long until one moves again; `None` with
+/// nothing gliding. The host asks after building its frame, and requests
+/// the next frame or a redraw then, as it does for its other motion.
+pub(crate) fn next_wake(widths: &Widths) -> Option<Duration> {
+    widths
+        .borrow()
+        .values()
+        .filter(|entry| entry.overflow > 1.0)
+        .map(|entry| {
+            position(entry.started.elapsed().as_secs_f32(), entry.overflow)
+                .1
+                .unwrap_or_default()
+        })
+        .min()
 }
 
 pub(crate) type Widths = Rc<RefCell<HashMap<u64, Measurement>>>;
@@ -118,6 +164,8 @@ pub(crate) fn label(
             });
             let overflow = text_width - available_width;
             let changed = previous.is_none_or(|entry| (entry.overflow - overflow).abs() > 1.0);
+            // A resize mid-glide keeps its place in the cycle.
+            let started = previous.map_or_else(Instant::now, |entry| entry.started);
             record.insert(
                 key,
                 Measurement {
@@ -128,6 +176,7 @@ pub(crate) fn label(
                     text_width,
                     available_width,
                     overflow,
+                    started,
                 },
             );
             // Just found out it doesn't fit: draw again, gliding.
@@ -142,45 +191,51 @@ pub(crate) fn label(
     .left_0()
     .size_full();
     let container = container.child(measure);
-    let overflow = widths
+    let (overflow, elapsed) = widths
         .borrow()
         .get(&key)
-        .map_or(0.0, |entry| entry.overflow);
+        .map_or((0.0, 0.0), |entry| {
+            (entry.overflow, entry.started.elapsed().as_secs_f32())
+        });
     if overflow <= 1.0 {
         return container
             .child(div().truncate().child(text))
             .into_any_element();
     }
-    let travel = overflow + 6.0;
-    let glide = travel / SPEED;
-    let total = HOLD_START + glide + HOLD_END + RETURN;
+    // Read off the clock rather than animated by GPUI, which would draw
+    // the whole window every frame for as long as the pointer rests here,
+    // pauses included; see [`next_wake`].
+    let (offset, _) = position(elapsed, overflow);
     container
         .child(
             div()
                 .flex_none()
                 .whitespace_nowrap()
-                .child(text)
-                .with_animation(
-                    ElementId::NamedInteger("marquee".into(), key),
-                    Animation::new(Duration::from_secs_f32(total)).repeat(),
-                    move |el, t| {
-                        let at = t * total;
-                        let offset = if at < HOLD_START {
-                            0.0
-                        } else if at < HOLD_START + glide {
-                            let p = (at - HOLD_START) / glide;
-                            // Eased at both ends, like a hand scrolling.
-                            travel * smooth(p)
-                        } else if at < HOLD_START + glide + HOLD_END {
-                            travel
-                        } else {
-                            // Back to the start, briskly but not in a jump.
-                            let p = (at - HOLD_START - glide - HOLD_END) / RETURN;
-                            travel * (1.0 - smooth(p.min(1.0)))
-                        };
-                        el.ml(px(-offset))
-                    },
-                ),
+                .ml(px(-offset))
+                .child(text),
         )
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_label_rests_glides_rests_and_returns() {
+        let overflow = 36.0;
+        let travel = overflow + 6.0;
+        let glide = travel / SPEED;
+        assert_eq!(position(0.0, overflow), (0.0, Some(Duration::from_secs_f32(HOLD_START))));
+        let (mid, moving) = position(HOLD_START + glide / 2.0, overflow);
+        assert!(mid > 0.0 && mid < travel && moving.is_none());
+        let (held, wait) = position(HOLD_START + glide + 0.1, overflow);
+        assert_eq!(held, travel);
+        assert!(wait.is_some_and(|wait| wait > Duration::ZERO));
+        let (back, moving) = position(HOLD_START + glide + HOLD_END + RETURN / 2.0, overflow);
+        assert!(back > 0.0 && back < travel && moving.is_none());
+        // Round again.
+        let total = HOLD_START + glide + HOLD_END + RETURN;
+        assert_eq!(position(total + 0.01, overflow).0, 0.0);
+    }
 }

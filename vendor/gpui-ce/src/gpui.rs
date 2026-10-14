@@ -337,6 +337,25 @@ where
     }
 }
 
+/// Frame presentation counters from the platform renderer, for diagnostics.
+#[derive(Default, Debug, Clone, Copy, PartialEq)]
+pub struct FrameStats {
+    /// Frames handed to the GPU since the window was created.
+    pub presented: u64,
+    /// Draws skipped because too many earlier frames were still queued.
+    pub skipped: u64,
+    /// Frames committed and not yet finished by the GPU.
+    pub in_flight: u32,
+    /// How long the last frame waited for a drawable.
+    pub last_drawable_wait: std::time::Duration,
+    /// The longest any frame waited for a drawable.
+    pub max_drawable_wait: std::time::Duration,
+    /// Main-thread time of the last presented frame, drawable wait included.
+    pub last_draw: std::time::Duration,
+    /// The longest main-thread time of any presented frame.
+    pub max_draw: std::time::Duration,
+}
+
 /// Information about the GPU GPUI is running on.
 #[derive(Default, Debug, serde::Serialize, serde::Deserialize, Clone)]
 pub struct GpuSpecs {

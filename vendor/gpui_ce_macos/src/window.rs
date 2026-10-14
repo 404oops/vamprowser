@@ -1045,6 +1045,28 @@ impl MacWindow {
                     );
                 }
                 WindowKind::Dialog => {
+                    // An inactive app has no main window. Its frontmost
+                    // window takes the sheet instead, so the dialog doesn't
+                    // open loose behind other apps.
+                    let main_window = if main_window.is_null() {
+                        let windows: id = msg_send![app, orderedWindows];
+                        let count: NSUInteger = msg_send![windows, count];
+                        (0..count)
+                            .map(|index| -> id { msg_send![windows, objectAtIndex: index] })
+                            .find(|&window| {
+                                let visible: BOOL = msg_send![window, isVisible];
+                                let normal: BOOL = msg_send![window, isKindOfClass: WINDOW_CLASS];
+                                visible == YES && normal == YES
+                            })
+                            .unwrap_or(nil)
+                    } else {
+                        main_window
+                    };
+                    let active: BOOL = msg_send![app, isActive];
+                    if active == NO {
+                        // NSInformationalRequest: one bounce of the Dock icon.
+                        let _: NSInteger = msg_send![app, requestUserAttention: 10 as NSUInteger];
+                    }
                     if !main_window.is_null() {
                         let parent = {
                             let active_sheet: id = msg_send![main_window, attachedSheet];
@@ -1755,9 +1777,13 @@ impl PlatformWindow for MacWindow {
         self.0.as_ref().lock().toggle_tab_bar_callback = Some(callback);
     }
 
-    fn draw(&self, scene: &gpui::Scene) {
+    fn draw(&self, scene: &gpui::Scene) -> bool {
         let mut this = self.0.lock();
-        this.renderer.draw(scene);
+        this.renderer.draw(scene)
+    }
+
+    fn frame_stats(&self) -> Option<gpui::FrameStats> {
+        Some(self.0.lock().renderer.frame_stats())
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {

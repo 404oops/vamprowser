@@ -9,7 +9,7 @@ use std::{
 };
 
 use gpui::{
-    AnyElement, Context, Image, ImageFormat, MouseButton, SharedString, Window, div,
+    AnyElement, Context, MouseButton, SharedString, Window, div,
     prelude::*, px,
 };
 use vampir::{Palette, color, lighting};
@@ -182,7 +182,7 @@ impl Browser {
 
     /// The page's still has arrived (or couldn't be taken): swap the live
     /// page out for it.
-    pub(crate) fn palette_snapshot(&mut self, tab: u64, request: std::time::Instant, jpeg: Option<Vec<u8>>, cx: &mut Context<Self>) {
+    pub(crate) fn palette_snapshot(&mut self, tab: u64, request: std::time::Instant, image: Option<Arc<gpui::RenderImage>>, cx: &mut Context<Self>) {
         // A still of a tab no longer in front (asked for before a switch) is
         // no use behind anything.
         if self.current().id != tab {
@@ -191,7 +191,7 @@ impl Browser {
         let Some(palette) = self.palette.as_mut().filter(|p| p.closing.is_none() && p.snapshot_request == request) else {
             return;
         };
-        palette.snapshot = jpeg.map(|bytes| Arc::new(Image::from_bytes(ImageFormat::Jpeg, bytes)));
+        palette.snapshot = image.map(native::Still::new);
         // It can only be seen from now, with the page's still behind it: its
         // fade starts here, not at the key press, or it would pop in half
         // faded.

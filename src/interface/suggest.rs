@@ -17,7 +17,7 @@ use std::{
 };
 
 use gpui::{
-    Animation, AnimationExt, AnyElement, Bounds, Context, FontWeight, Image, ImageFormat,
+    Animation, AnimationExt, AnyElement, Bounds, Context, FontWeight,
     MouseButton, Pixels, SharedString, StyledText, Task, Window, div, img, prelude::*, px,
 };
 use unicode_segmentation::UnicodeSegmentation;
@@ -71,7 +71,7 @@ pub(crate) struct SuggestState {
     /// the completion the field shows.
     picked: bool,
     /// A still of the page it covers, which is hidden meanwhile.
-    snapshot: Option<Arc<Image>>,
+    snapshot: Option<native::Still>,
     snapshot_request: Option<std::time::Instant>,
     /// The page's still has come (or couldn't be had): the list can show
     /// without half of it hidden behind the live page.
@@ -102,7 +102,46 @@ fn field_score(word: &str, field: &str) -> Option<i32> {
     if word.chars().count() < 2 {
         return None;
     }
-    vampir::fuzzy_score(word, field).map(|score| (35 + score).clamp(1, 65))
+    fuzzy_score_lower(word, field).map(|score| (35 + score).clamp(1, 65))
+}
+
+/// `vampir::fuzzy_score` for a query and a candidate already lowercased:
+/// the same subsequence scoring, without lowercasing (and allocating) both
+/// again for every field of every page on every keystroke.
+fn fuzzy_score_lower(query: &str, candidate: &str) -> Option<i32> {
+    if query.chars().all(char::is_whitespace) {
+        return Some(0);
+    }
+    let mut haystack = candidate.chars().enumerate();
+    let mut score = 0i32;
+    let mut last_index: Option<usize> = None;
+    let mut previous = None;
+    for needle in query.chars() {
+        if needle.is_whitespace() {
+            continue;
+        }
+        loop {
+            let (index, ch) = haystack.next()?;
+            let starts_word = previous.is_none_or(|previous: char| {
+                previous.is_whitespace() || previous == '-' || previous == '_'
+            });
+            previous = Some(ch);
+            if ch != needle {
+                continue;
+            }
+            // Starting a word is the strongest signal that this is the
+            // match the person meant.
+            score += if starts_word { 12 } else { 2 };
+            if last_index == Some(index.saturating_sub(1)) {
+                score += 6;
+            }
+            last_index = Some(index);
+            break;
+        }
+    }
+    // Among equally good matches, the shortest candidate is the one that
+    // most nearly *is* the query.
+    Some(score - (candidate.chars().count() as i32 / 8))
 }
 
 #[cfg(test)]
@@ -766,7 +805,7 @@ impl Browser {
             let mut history = self.history();
             history.remove(&url);
             history.remove(url.trim_end_matches('/'));
-            history.save();
+            history.save_in_background();
         }
         // The field showed that page (completed, or picked with the arrows):
         // it goes back to what was typed.
@@ -811,7 +850,7 @@ impl Browser {
         }
     }
 
-    pub(crate) fn suggest_snapshot(&mut self, tab: u64, request: std::time::Instant, jpeg: Option<Vec<u8>>, cx: &mut Context<Self>) {
+    pub(crate) fn suggest_snapshot(&mut self, tab: u64, request: std::time::Instant, image: Option<Arc<gpui::RenderImage>>, cx: &mut Context<Self>) {
         if self.current().id != tab {
             return;
         }
@@ -821,7 +860,7 @@ impl Browser {
         if state.snapshot_request != Some(request) {
             return;
         }
-        state.snapshot = jpeg.map(|bytes| Arc::new(Image::from_bytes(ImageFormat::Jpeg, bytes)));
+        state.snapshot = image.map(native::Still::new);
         state.covered = true;
         if state.snapshot.is_some()
             && let Some(view) = &self.tabs[self.selected].view
@@ -888,7 +927,7 @@ impl Browser {
 
     /// The still of the page while the list covers it, in place of the page.
     pub(crate) fn suggestion_backdrop(&self) -> Option<AnyElement> {
-        let snapshot = self.suggest.as_ref()?.snapshot.clone()?;
+        let snapshot = self.suggest.as_ref()?.snapshot.as_ref()?.image();
         Some(img(snapshot).absolute().top_0().left_0().size_full().into_any_element())
     }
 

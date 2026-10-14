@@ -70,7 +70,14 @@ impl Download {
             &self.path
         };
         let mut sizes = sizes().lock().ok()?;
-        let seen = sizes.entry(path.clone()).or_insert(Seen { looked: None, pending: false, size: None });
+        // Drawn for every row on every frame: no copy of the path unless
+        // it's new here.
+        let seen = match sizes.get_mut(path) {
+            Some(seen) => seen,
+            None => sizes
+                .entry(path.clone())
+                .or_insert(Seen { looked: None, pending: false, size: None }),
+        };
         let due = seen.looked.is_none_or(|at| at.elapsed() > RECHECK);
         if due && !seen.pending {
             seen.pending = true;

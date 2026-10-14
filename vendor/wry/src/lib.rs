@@ -521,6 +521,11 @@ pub struct NewWindowOpener {
 #[non_exhaustive]
 #[derive(Debug)]
 pub struct NewWindowFeatures {
+  /// Whether this request comes from activating a link, rather than
+  /// JavaScript opening a popup. Useful when links and popups have
+  /// different browser UI.
+  #[cfg(target_os = "macos")]
+  pub is_link: bool,
   /// Specifies the size of the content area
   /// as defined by the user's operating system where the new window will be generated.
   pub size: Option<dpi::LogicalSize<f64>>,

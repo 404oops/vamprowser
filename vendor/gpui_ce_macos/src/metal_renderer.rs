@@ -2,7 +2,7 @@ use crate::metal_atlas::MetalAtlas;
 use anyhow::Result;
 use block::ConcreteBlock;
 use cocoa::{
-    base::{NO, YES},
+    base::YES,
     foundation::{NSSize, NSUInteger},
     quartzcore::AutoresizingMask,
 };
@@ -39,7 +39,16 @@ use metal::{
 use objc::{self, msg_send, sel, sel_impl};
 use parking_lot::Mutex;
 
-use std::{cell::Cell, ffi::c_void, mem, ptr, sync::Arc};
+use std::{
+    cell::Cell,
+    ffi::c_void,
+    mem, ptr,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 // Exported to metal
 pub(crate) type PointF = gpui::Point<f32>;
@@ -57,6 +66,29 @@ const PATH_SAMPLE_COUNT: u32 = 4;
 /// render inline (unblurred at the inner level) rather than allocating unbounded VRAM. Must match
 /// the wgpu backend's `MAX_FILTER_DEPTH` so nested blur renders consistently across platforms.
 const MAX_FILTER_DEPTH: usize = 2;
+
+/// How many frames may be presented and not yet on screen before the next
+/// draw is skipped: all of the layer's drawables. A frame's presented
+/// handler fires a tick after it is committed in the normal course of
+/// things, so a smaller limit drops every third frame of a steady
+/// animation; this one only trips when the compositor has fallen a full
+/// queue behind, which is exactly when `nextDrawable` would block.
+const MAX_FRAMES_IN_FLIGHT: u32 = 3;
+
+/// If no queued frame has reached the screen for this long, draw anyway:
+/// a presented handler that never fires (a drawable the compositor dropped)
+/// must not leave the window skipping forever.
+const IN_FLIGHT_STALE: Duration = Duration::from_millis(250);
+
+#[derive(Default)]
+struct FrameStats {
+    presented: u64,
+    skipped: u64,
+    last_drawable_wait: Duration,
+    max_drawable_wait: Duration,
+    last_draw: Duration,
+    max_draw: Duration,
+}
 
 pub(crate) type Context = Arc<Mutex<InstanceBufferPool>>;
 pub(crate) type Renderer = MetalRenderer;
@@ -132,6 +164,12 @@ pub(crate) struct MetalRenderer {
     is_apple_gpu: bool,
     is_unified_memory: bool,
     presents_with_transaction: bool,
+    /// Frames presented and not yet shown on screen. Decremented from each
+    /// drawable's presented handler, off the main thread.
+    frames_in_flight: Arc<AtomicU32>,
+    /// When the last frame was committed, for [`IN_FLIGHT_STALE`].
+    last_commit: Option<Instant>,
+    stats: FrameStats,
     /// For headless rendering, tracks whether output should be opaque
     opaque: bool,
     command_queue: CommandQueue,
@@ -240,12 +278,15 @@ impl MetalRenderer {
         // Support direct-to-display rendering if the window is not transparent
         // https://developer.apple.com/documentation/metal/managing-your-game-window-for-metal-in-macos
         layer.set_opaque(!transparent);
-        layer.set_maximum_drawable_count(3);
+        layer.set_maximum_drawable_count(MAX_FRAMES_IN_FLIGHT as u64);
         // Allow texture reading for visual tests (captures screenshots without ScreenCaptureKit)
         #[cfg(any(test, feature = "test-support"))]
         layer.set_framebuffer_only(false);
         unsafe {
-            let _: () = msg_send![&*layer, setAllowsNextDrawableTimeout: NO];
+            // A backstop only: `draw` already skips when the drawables are
+            // all out, so this just turns an unexpected stall into one
+            // dropped frame instead of a frozen UI thread.
+            let _: () = msg_send![&*layer, setAllowsNextDrawableTimeout: YES];
             let _: () = msg_send![&*layer, setNeedsDisplayOnBoundsChange: YES];
             let _: () = msg_send![
                 &*layer,
@@ -440,6 +481,9 @@ impl MetalRenderer {
             device,
             layer,
             presents_with_transaction: false,
+            frames_in_flight: Arc::new(AtomicU32::new(0)),
+            last_commit: None,
+            stats: FrameStats::default(),
             is_apple_gpu,
             is_unified_memory,
             opaque,
@@ -484,6 +528,19 @@ impl MetalRenderer {
 
     pub fn sprite_atlas(&self) -> &Arc<MetalAtlas> {
         &self.sprite_atlas
+    }
+
+    /// Counters since the renderer was created, for a diagnostics overlay.
+    pub fn frame_stats(&self) -> gpui::FrameStats {
+        gpui::FrameStats {
+            presented: self.stats.presented,
+            skipped: self.stats.skipped,
+            in_flight: self.frames_in_flight.load(Ordering::Relaxed),
+            last_drawable_wait: self.stats.last_drawable_wait,
+            max_drawable_wait: self.stats.max_drawable_wait,
+            last_draw: self.stats.last_draw,
+            max_draw: self.stats.max_draw,
+        }
     }
 
     pub fn set_presents_with_transaction(&mut self, presents_with_transaction: bool) {
@@ -583,30 +640,54 @@ impl MetalRenderer {
         // nothing to do
     }
 
-    pub fn draw(&mut self, scene: &Scene) {
+    /// Presents `scene`. Returns `false` when nothing was presented because
+    /// the GPU or compositor still holds too many earlier frames; the caller
+    /// should present again on the next display tick rather than wait.
+    pub fn draw(&mut self, scene: &Scene) -> bool {
         let layer = match &self.layer {
             Some(l) => l.clone(),
             None => {
                 log::error!(
                     "draw() called on headless renderer - use render_scene_to_image() instead"
                 );
-                return;
+                return true;
             }
         };
+        // Presenting inside a transaction (live resize) must block: AppKit is
+        // waiting for this exact frame to match the new window size.
+        if !self.presents_with_transaction
+            && self.frames_in_flight.load(Ordering::Acquire) >= MAX_FRAMES_IN_FLIGHT
+        {
+            if self
+                .last_commit
+                .is_some_and(|committed| committed.elapsed() < IN_FLIGHT_STALE)
+            {
+                self.stats.skipped += 1;
+                return false;
+            }
+            // Nothing has reached the screen in all that time: the count
+            // has lost a presented handler (a drawable the compositor
+            // dropped). Start over, or the window would be held to one
+            // frame per stale period for the rest of its life.
+            self.frames_in_flight.store(0, Ordering::Release);
+        }
         let viewport_size = layer.drawable_size();
         let viewport_size: Size<DevicePixels> = size(
             (viewport_size.width.ceil() as i32).into(),
             (viewport_size.height.ceil() as i32).into(),
         );
+        let started = Instant::now();
         let drawable = if let Some(drawable) = layer.next_drawable() {
             drawable
         } else {
-            log::error!(
-                "failed to retrieve next drawable, drawable size: {:?}",
-                viewport_size
-            );
-            return;
+            // Timed out: the compositor kept every drawable. Not an error;
+            // the frame is presented on the next tick.
+            self.stats.skipped += 1;
+            return false;
         };
+        let waited = started.elapsed();
+        self.stats.last_drawable_wait = waited;
+        self.stats.max_drawable_wait = self.stats.max_drawable_wait.max(waited);
 
         loop {
             let mut instance_buffer = self
@@ -629,6 +710,22 @@ impl MetalRenderer {
                     let block = block.copy();
                     command_buffer.add_completed_handler(&block);
 
+                    let frames_in_flight = self.frames_in_flight.clone();
+                    let presented = ConcreteBlock::new(move |_: &metal::DrawableRef| {
+                        // Never below zero: a handler firing after a stale
+                        // reset must not wrap the count to the maximum and
+                        // skip every frame from then on.
+                        let _ = frames_in_flight.fetch_update(
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                            |count| count.checked_sub(1),
+                        );
+                    });
+                    let presented = presented.copy();
+                    drawable.add_presented_handler(&presented);
+                    self.frames_in_flight.fetch_add(1, Ordering::AcqRel);
+                    self.last_commit = Some(Instant::now());
+
                     if self.presents_with_transaction {
                         command_buffer.commit();
                         command_buffer.wait_until_scheduled();
@@ -637,7 +734,11 @@ impl MetalRenderer {
                         command_buffer.present_drawable(drawable);
                         command_buffer.commit();
                     }
-                    return;
+                    let took = started.elapsed();
+                    self.stats.last_draw = took;
+                    self.stats.max_draw = self.stats.max_draw.max(took);
+                    self.stats.presented += 1;
+                    return true;
                 }
                 Err(err) => {
                     log::error!(
@@ -658,6 +759,8 @@ impl MetalRenderer {
                 }
             }
         }
+        // Rendering failed outright; retrying next tick would not help.
+        true
     }
 
     /// Renders the scene to a texture and returns the pixel data as an RGBA image.

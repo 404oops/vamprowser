@@ -8,6 +8,7 @@ A macOS browser built in Rust: Apple's WebKit (through Wry's `WKWebView`) for pa
   - **Drag tabs** to reorder them, out of the strip to tear one off into its own window, or onto another window's tabs to move it there, live page and all. The window it will join lights up, with the tab's ghost where it will land.
   - ⌘-click or middle-click a link to open it in a new tab behind (⌘⇧-click, in front).
   - Windows come back only when you ask: ⌘⇧T, once a window's own closed tabs run out, reopens the windows you closed, and after a relaunch the ones open when you quit, where you left them (Settings → General can restore them at launch instead). Closing the last window leaves the app running, and the Dock icon opens a new one.
+- Ordinary links that request a new tab open as tabs. **Scripted web popups** use compact windows with a titlebar, preserving their opener for sign-in callbacks. They close when the site asks and stay separate from ordinary browser windows. Settings → Tabs can open them as background tabs or block them.
 - **Minimal mode** (⌘⇧M) shows only the page, under a hairline. Point at the top of the window and the browser slides in over the page without it reflowing.
 - **Trackpad pinch** magnifies the page smoothly without reflowing its layout. ⌘0 resets both pinch magnification and page zoom.
 - **Links from other apps** open in a compact page window on the current desktop without bringing the other browser windows forward. In **Settings → Tabs**, choose **New tab + popup** or **Popup only** for links that launch Vamprowser. Drag its slim titlebar to move the window or drop its live page onto a browser window's tabs. Click **Expand** to turn it into a full browser window. Opening another tab expands it too.
@@ -54,6 +55,10 @@ Requires macOS, Xcode, and a recent Rust toolchain.
 ```sh
 cargo run
 ```
+
+Set `VAMPROWSER_FRAME_STATS=1` to draw the renderer's frame counters in
+the window's corner: frames presented and skipped, how long the last frame
+waited for the compositor, and how long it took to draw.
 
 ## License
 

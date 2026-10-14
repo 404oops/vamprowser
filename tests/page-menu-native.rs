@@ -1,6 +1,6 @@
 #![allow(dead_code, unused_imports)]
 // The file-picker module also mentions site permissions; this target exercises
-// only its real MenuEntry type, without loading or mutating a browser profile.
+// only its real menu rows, without loading or mutating a browser profile.
 mod settings { pub enum SitePermission { Allow, Block } }
 // AppKit objects and WebKit menu completions must be exercised on the main
 // thread, so this regression target deliberately uses no Rust test harness.

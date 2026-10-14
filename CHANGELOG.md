@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.4.15 — 2026-10-14
+
+- Smoother drawing all round. Favicons are read and decoded off the main thread instead of inside each frame, page stills for the tab switcher, suggestions and bookmark menus are handed to the renderer without a JPEG round trip and their textures are freed afterwards, file-type icons are drawn once at a small size, and extension badge updates, the download busy bar and gliding labels no longer redraw the whole window on every display tick. The renderer skips a frame while the GPU is still busy rather than blocking, and its in-flight counter can no longer get stuck. Set `VAMPROWSER_FRAME_STATS=1` to see frame counters in the window's corner.
+- The downloads shelf slides in and out instead of popping, and the Downloads page opens at once.
+- The Start page, Downloads page, Settings and the bookmark manager scroll when their content overflows, with a scrollbar.
+- Minimal mode keeps the page against the browser's edge wherever it is: under the hairline when folded, and below the toolbar and beside the sidebar as they slide in.
+- Scripted popups (`window.open`) get a compact window with a titlebar that keeps its link to the opening page, so sign-in callbacks, `postMessage` and shared cookies work, and it closes when the page asks. Links that request a new window still open as tabs. Settings → Tabs can open popups as background tabs or block them.
+- ⌘←, ⌘→, ⌘[, ⌘] and the mouse side buttons navigate back and forward reliably, including when macOS delivers the event without a window. Inside a text field ⌘← and ⌘→ still move the caret.
+- Menus, dialogs, hints and tooltips are drawn by Vampir. A dialog that appears while the browser is in the background attaches to its frontmost window and bounces the Dock icon. Import and export use the standard macOS open and save panels.
+- The page context menu's search row uses the chosen search engine, with the selected text, instead of macOS Services.
+- Media downloads: top rows for the best video and audio macOS plays natively, quality submenus with sizes, automatic captions in their own submenu, exact formats fetched and merged into MP4 or MKV, downloads one at a time with 403 retries, and the folder bundle saves one merged video with subtitles and description.
+- History saves after forgetting a page, clearing history or closing a window no longer block on disk, and address suggestions do less work per keystroke.
+
 ## v0.4.14 — 2026-10-11
 
 - Files dropped on a page or a tab open in the browser, and local PDFs render instead of staying blank. Upload fields and page drop zones, including ones inside frames, still receive their files.

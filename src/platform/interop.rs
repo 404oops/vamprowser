@@ -1,13 +1,13 @@
 //! How the browser meets the rest of macOS: being the default browser, and
-//! showing downloaded files in Finder. Opening URLs and files handed over
+//! file icons for the downloads list. Opening URLs and files handed over
 //! by other apps arrives through GPUI's `on_open_urls`; the Info.plist
 //! declares the schemes and document types.
 
 use std::{collections::HashMap, path::Path, sync::{Arc, LazyLock, Mutex}};
 
 use objc2::{MainThreadMarker, Message};
-use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep, NSWorkspace};
-use objc2_foundation::{NSArray, NSBundle, NSDictionary, NSString, NSURL};
+use objc2_app_kit::NSWorkspace;
+use objc2_foundation::{NSBundle, NSString, NSURL};
 
 /// Safari-style confirmation for a page handing a URL to another app.
 /// The original NSURL is passed intact to Launch Services: callback query
@@ -59,28 +59,21 @@ pub fn ask_open_app(webview: &objc2_web_kit::WKWebView, url: &NSURL, host: Optio
 /// A shared icon for the filename's type. Download rows may include hundreds
 /// of files, so resolving and decoding an icon for every path stalls drawing.
 #[allow(deprecated)]
-pub fn download_icon(path: &Path) -> Option<Arc<gpui::Image>> {
-    static ICONS: LazyLock<Mutex<HashMap<String, Option<Arc<gpui::Image>>>>> =
+/// The icon macOS shows for files like `path`, by extension, drawn once at
+/// the size the downloads list and shelf show it (30 points, at Retina).
+/// Rasterised straight from the system's icon, rather than through a TIFF
+/// of all its sizes up to 1024 pixels and a PNG of the largest: that took
+/// long enough per kind of file to hold the first frame of the shelf.
+pub fn download_icon(path: &Path) -> Option<Arc<gpui::RenderImage>> {
+    const ICON_PIXELS: u32 = 64;
+    static ICONS: LazyLock<Mutex<HashMap<String, Option<Arc<gpui::RenderImage>>>>> =
         LazyLock::new(|| Mutex::new(HashMap::new()));
     let kind = path.extension().and_then(|ext| ext.to_str()).unwrap_or("").to_ascii_lowercase();
     if let Some(icon) = ICONS.lock().ok()?.get(&kind).cloned() {
         return icon;
     }
     let image = NSWorkspace::sharedWorkspace().iconForFileType(&NSString::from_str(&kind));
-    let icon = image.TIFFRepresentation().and_then(|tiff| {
-        let bitmap = NSBitmapImageRep::imageRepsWithData(&tiff)
-            .iter()
-            .filter_map(|rep| rep.downcast::<NSBitmapImageRep>().ok())
-            .max_by_key(|rep| rep.pixelsWide())?;
-        // SAFETY: an empty properties dictionary is valid for PNG output.
-        let png = unsafe {
-            bitmap.representationUsingType_properties(
-                NSBitmapImageFileType::PNG,
-                &NSDictionary::new(),
-            )
-        }?;
-        Some(Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, png.to_vec())))
-    });
+    let icon = crate::native::render_image_of(&image, ICON_PIXELS);
     ICONS.lock().ok()?.insert(kind, icon.clone());
     icon
 }
@@ -127,17 +120,4 @@ pub fn make_default_browser() {
             None,
         );
     }
-}
-
-/// Reveals a file in Finder, selected.
-pub fn show_in_finder(path: &std::path::Path) {
-    let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
-    NSWorkspace::sharedWorkspace()
-        .activateFileViewerSelectingURLs(&NSArray::from_retained_slice(&[url]));
-}
-
-/// Opens a file with its default app.
-pub fn open_file(path: &std::path::Path) {
-    let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
-    NSWorkspace::sharedWorkspace().openURL(&url);
 }

@@ -188,6 +188,7 @@ define_class!(
         match new_window_req_handler(
           url.to_string(),
           NewWindowFeatures {
+            is_link: action.navigationType() == objc2_web_kit::WKNavigationType::LinkActivated,
             size: if let (Some(width), Some(height)) =
               (window_features.width(), window_features.height())
             {

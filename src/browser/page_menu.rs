@@ -2,7 +2,7 @@
 //! actions and completion until selection. Completing early releases WebKit's
 //! menu proxy and makes image, media and extension actions silently do nothing.
 
-use crate::{icons::Icon, native::MenuEntry};
+use crate::icons::Icon;
 use block2::{Block, RcBlock};
 use objc2::{
     Message, ffi,
@@ -11,12 +11,33 @@ use objc2::{
     sel,
 };
 use objc2_app_kit::{NSMenu, NSMenuItem, NSUserInterfaceItemIdentification};
+use vampir::{MenuItem, NativeMenu};
 use objc2_web_kit::WKWebView;
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
     fmt,
 };
+
+/// Runs in every frame and reports the text a context menu would search
+/// for. The page's message arrives before WebKit proposes its menu.
+pub const SELECTION_SCRIPT: &str = r#"(() => {
+  const handler = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.ipc;
+  if (!handler) return;
+  addEventListener('contextmenu', () => {
+    let text = '';
+    try {
+      const field = document.activeElement;
+      if (field && field.type !== 'password' &&
+          (field.tagName === 'TEXTAREA' || field.tagName === 'INPUT') &&
+          typeof field.selectionStart === 'number') {
+        text = field.value.slice(field.selectionStart, field.selectionEnd);
+      }
+    } catch (_) {}
+    if (!text) text = String(getSelection() || '');
+    handler.postMessage('context-selection:' + text);
+  }, true);
+})()"#;
 
 type Handler = Box<dyn Fn(usize)>;
 thread_local! {
@@ -25,38 +46,65 @@ thread_local! {
     static HANDLERS: RefCell<HashMap<usize, Handler>> = RefCell::default();
 }
 
-struct Action {
-    menu: Retained<NSMenu>,
-    index: isize,
-    // NSMenuItem targets are weak. Keep them alive as long as the popup.
-    _target: Option<Retained<AnyObject>>,
-}
-
 pub struct Request {
-    pub entries: Vec<MenuEntry>,
+    menu: NativeMenu,
     pub position: gpui::Point<gpui::Pixels>,
-    actions: Vec<Option<Action>>,
+    /// The action of WebKit's search row, and what the browser searches
+    /// for in its place.
+    search: Option<usize>,
+    query: Option<String>,
     completion: Option<RcBlock<dyn Fn(*mut NSMenu)>>,
 }
 
 impl fmt::Debug for Request {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PageMenu")
-            .field("rows", &self.actions.len())
+            .field("menu", &self.menu)
             .finish()
     }
 }
 
 impl Request {
-    pub fn finish(mut self, chosen: Option<usize>) {
-        if let Some(action) = chosen
-            .and_then(|index| self.actions.get(index))
-            .and_then(Option::as_ref)
+    /// The menu's rows, for the floating menu to show.
+    pub fn items(&self) -> Vec<MenuItem<usize>> {
+        self.menu.items().to_vec()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.menu.is_empty()
+    }
+
+    /// Has the search row search for `query` with the browser's own engine,
+    /// named by `label`. Without a selection WebKit's row is left as it is.
+    pub fn search_with(&mut self, label: String, query: &str) {
+        let query = query.split_whitespace().collect::<Vec<_>>().join(" ");
+        if query.is_empty() {
+            return;
+        }
+        if let Some(index) = self.search
+            && let Some(row) = self.menu.row_mut(index)
         {
+            row.label = label.into();
+            self.query = Some(query);
+        }
+    }
+
+    /// Runs the chosen row's WebKit action, or for the search row returns
+    /// the selected text for the browser to search for itself.
+    pub fn finish(mut self, chosen: Option<usize>) -> Option<String> {
+        if let Some(query) = self.query.take()
+            && chosen.is_some()
+            && chosen == self.search
+        {
+            self.complete();
+            return Some(query);
+        }
+        if let Some(index) = chosen {
             // Dispatch while WebKit's completion still owns the menu proxy.
-            action.menu.performActionForItemAtIndex(action.index);
+            self.menu.run(index);
         }
         self.complete();
+        None
     }
 
     fn complete(&mut self) {
@@ -93,63 +141,17 @@ fn icon(item: &NSMenuItem) -> Option<Icon> {
     }
 }
 
-fn convert(menu: &NSMenu, actions: &mut Vec<Option<Action>>) -> Vec<MenuEntry> {
-    let mut entries = Vec::new();
-    for (index, item) in menu.itemArray().iter().enumerate() {
-        // Option-key alternates replace their primary row in AppKit menus;
-        // drawn here they would duplicate it.
-        if item.isHidden() || item.isAlternate() {
-            continue;
-        }
-        if item.isSeparatorItem() {
-            if entries.is_empty() || matches!(entries.last(), Some(MenuEntry::Separator)) {
-                continue;
-            }
-            entries.push(MenuEntry::Separator);
-            actions.push(None);
-        } else if let Some(submenu) = item.submenu() {
-            if !item.isEnabled() {
-                entries.push(MenuEntry::Item {
-                    label: item.title().to_string(),
-                    enabled: false,
-                    checked: false,
-                    icon: icon(&item),
-                });
-                actions.push(None);
-                continue;
-            }
-            let mut children = Vec::new();
-            let child_entries = convert(&submenu, &mut children);
-            if child_entries.is_empty() {
-                continue;
-            }
-            actions.push(None); // Submenus occupy an index, too.
-            actions.extend(children);
-            entries.push(MenuEntry::Submenu {
-                label: item.title().to_string(),
-                entries: child_entries,
-                icon: icon(&item),
-            });
-        } else {
-            entries.push(MenuEntry::Item {
-                label: item.title().to_string(),
-                enabled: item.isEnabled(),
-                checked: item.state() != 0,
-                icon: icon(&item),
-            });
-            actions.push(Some(Action {
-                menu: menu.retain(),
-                index: index as isize,
-                _target: item.target(),
-            }));
-        }
-    }
-    if matches!(entries.last(), Some(MenuEntry::Separator)) {
-        entries.pop();
-        actions.pop();
-    }
-    entries
+/// WebKit's menu as Vampir rows, its actions kept to run on a choice.
+fn adopt(menu: &NSMenu) -> NativeMenu {
+    NativeMenu::adopt(menu, |item| icon(item).map(Into::into))
 }
+
+/// The action of WebKit's "Search with Google" row, if the menu has one.
+fn search_row(menu: &NativeMenu) -> Option<usize> {
+    menu.find(|action| action.identifier().as_deref() == Some(SEARCH_IDENTIFIER))
+}
+
+const SEARCH_IDENTIFIER: &str = "WKMenuItemIdentifierSearchWeb";
 
 unsafe extern "C-unwind" fn proposed_menu(
     _this: &AnyObject,
@@ -182,11 +184,12 @@ unsafe extern "C-unwind" fn proposed_menu(
         } else {
             content.bounds().size.height - location.y
         };
-        let mut actions = Vec::new();
-        let entries = convert(menu, &mut actions);
+        let menu = adopt(menu);
+        let search = search_row(&menu);
         let request = Request {
-            entries,
-            actions,
+            menu,
+            search,
+            query: None,
             position: gpui::point(gpui::px(location.x as f32), gpui::px(y as f32)),
             completion: Some(completion.copy()),
         };
@@ -297,63 +300,18 @@ pub fn verify_native_menu() {
             &NSString::from_str(""),
         )
     };
-    menu.addItem(&NSMenuItem::separatorItem(mtm));
     menu.addItem(&row("Reload"));
-    menu.addItem(&NSMenuItem::separatorItem(mtm));
-    let hidden = row("Hidden service");
-    hidden.setHidden(true);
-    menu.addItem(&hidden);
-    let alternate = row("Reload Without Content Blockers");
-    alternate.setAlternate(true);
-    menu.addItem(&alternate);
-    menu.addItem(&NSMenuItem::separatorItem(mtm));
-    let empty = row("Empty submenu");
-    empty.setSubmenu(Some(&NSMenu::new(mtm)));
-    menu.addItem(&empty);
-    let disabled = row("Unavailable");
-    disabled.setEnabled(false);
-    menu.addItem(&disabled);
-    let submenu = NSMenu::new(mtm);
-    submenu.addItem(&NSMenuItem::separatorItem(mtm));
-    let checked = row("Checked option");
-    checked.setState(1);
-    submenu.addItem(&checked);
-    submenu.addItem(&NSMenuItem::separatorItem(mtm));
-    let parent = row("Options");
-    parent.setSubmenu(Some(&submenu));
-    menu.addItem(&parent);
-    menu.addItem(&NSMenuItem::separatorItem(mtm));
-    let mut actions = Vec::new();
-    let entries = convert(&menu, &mut actions);
-    assert_eq!(
-        entries.len(),
-        4,
-        "No leading, trailing, repeated separators or empty submenus"
-    );
-    assert!(matches!(entries[1], MenuEntry::Separator));
-    assert!(matches!(entries[2], MenuEntry::Item { enabled: false, .. }));
-    match &entries[3] {
-        MenuEntry::Submenu { entries, .. } => {
-            assert_eq!(entries.len(), 1);
-            assert!(matches!(entries[0], MenuEntry::Item { checked: true, .. }));
-        }
-        _ => panic!("Expected submenu"),
-    }
-    assert_eq!(
-        actions.len(),
-        5,
-        "Preorder action positions match Vampir's submenu indexes"
-    );
-    assert_eq!(actions[0].as_ref().unwrap().index, 1);
-    assert_eq!(actions[2].as_ref().unwrap().index, 7);
-    assert_eq!(actions[4].as_ref().unwrap().index, 1);
+    let adopted = adopt(&menu);
+    assert_eq!(adopted.items().len(), 1);
+    assert_eq!(search_row(&adopted), None);
     let calls = Rc::new(Cell::new(0));
     let make = || {
         let calls = calls.clone();
         Request {
-            entries: vec![],
+            menu: adopt(&NSMenu::new(mtm)),
             position: gpui::point(gpui::px(0.0), gpui::px(0.0)),
-            actions: vec![],
+            search: None,
+            query: None,
             completion: Some(RcBlock::new(move |menu: *mut NSMenu| {
                 assert!(menu.is_null(), "Suppress the AppKit popup");
                 calls.set(calls.get() + 1);
@@ -387,13 +345,12 @@ pub fn verify_native_menu() {
         item.setTarget(Some(&target));
     }
     action_menu.addItem(&item);
-    let mut actions = Vec::new();
-    let entries = convert(&action_menu, &mut actions);
     let completed = state.clone();
     Request {
-        entries,
+        menu: adopt(&action_menu),
         position: gpui::point(gpui::px(0.0), gpui::px(0.0)),
-        actions,
+        search: None,
+        query: None,
         completion: Some(RcBlock::new(move |_: *mut NSMenu| {
             assert_eq!(completed.get(), 1);
             completed.set(2);
@@ -404,5 +361,33 @@ pub fn verify_native_menu() {
         state.get(),
         2,
         "Selection dispatches the original native action and completes once"
+    );
+    let search_menu = NSMenu::new(mtm);
+    search_menu.addItem(&row("Copy"));
+    let search_row = row("Search with Google");
+    search_row.setIdentifier(Some(&NSString::from_str(SEARCH_IDENTIFIER)));
+    search_menu.addItem(&search_row);
+    let adopted = adopt(&search_menu);
+    let index = self::search_row(&adopted).expect("WebKit's search row is recognised by its identifier");
+    let mut request = Request {
+        menu: adopted,
+        position: gpui::point(gpui::px(0.0), gpui::px(0.0)),
+        search: Some(index),
+        query: None,
+        completion: Some(RcBlock::new(|menu: *mut NSMenu| assert!(menu.is_null()))),
+    };
+    request.search_with("Search with Kagi".into(), "  \n ");
+    assert!(
+        matches!(&request.items()[1], MenuItem::Action(action) if action.label == "Search with Google"),
+        "Without a selection WebKit's row stays"
+    );
+    request.search_with("Search with Kagi".into(), " vampire\n  bats ");
+    assert!(
+        matches!(&request.items()[1], MenuItem::Action(action) if action.label == "Search with Kagi")
+    );
+    assert_eq!(
+        request.finish(Some(index)).as_deref(),
+        Some("vampire bats"),
+        "The browser searches instead of handing the text to Services"
     );
 }

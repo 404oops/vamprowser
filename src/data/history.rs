@@ -147,6 +147,16 @@ impl History {
     /// Periodic serialization and disk work must not interrupt scrolling,
     /// typing or WebKit callbacks on the foreground thread.
     pub(crate) fn save_periodically(&mut self) {
+        self.save_in_background();
+    }
+
+    /// Writes the file off this thread if anything changed. For what a
+    /// person does in the browser (forgetting a page, closing a window):
+    /// the writer takes one snapshot at a time, newest last, so an older
+    /// write can't bring a removed row back, and nothing waits for the
+    /// disk. Quitting and exporting still [`History::save`] for a durable
+    /// file.
+    pub(crate) fn save_in_background(&mut self) {
         if cfg!(test) || (!self.dirty && !self.save_failed.load(Ordering::Relaxed)) {
             return;
         }

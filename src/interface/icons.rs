@@ -62,6 +62,12 @@ pub enum Icon {
     Sliders,
 }
 
+impl From<Icon> for vampir::MenuIcon {
+    fn from(glyph: Icon) -> Self {
+        vampir::MenuIcon::new(move |size, color| icon(glyph, size, color).into_any_element())
+    }
+}
+
 /// `icon` drawn `size` points square in `color`.
 pub fn icon(icon: Icon, size: f32, color: Rgba) -> impl IntoElement {
     canvas(

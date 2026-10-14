@@ -75,7 +75,7 @@ impl Candidate {
 }
 
 /// A decoded icon ready to draw.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Favicon {
     pub image: Arc<Image>,
     /// Mostly dark ink, which needs a light plate behind it on a dark theme.
@@ -118,11 +118,45 @@ fn plain_site_key(url: &str) -> Option<&str> {
     (plain && named).then_some(host)
 }
 
+/// What a background look-up for a site's icon came back with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// A plain [`Favicons::load`]: the disk cache, nothing more.
+    FromDisk,
+    /// A [`Favicons::want`] that found what it had (in memory or on disk)
+    /// fresh enough, or the site recently found to have none, and so
+    /// didn't fetch.
+    Fresh,
+    /// Fetched from the network and found.
+    Fetched,
+    /// Fetched from the network and nothing found; `icon` may still be a
+    /// stale one from disk, kept rather than forgotten.
+    NothingFound,
+}
+
+/// A site icon look-up's result, delivered from a background thread.
+#[derive(Debug)]
+pub struct Loaded {
+    pub key: String,
+    pub icon: Option<Favicon>,
+    pub outcome: Outcome,
+}
+
 /// Icons in memory, and the bookkeeping that keeps each site to one fetch.
+///
+/// Nothing here reads the disk or decodes an image on the calling thread:
+/// those run on the icon threads and come back through the notifier as a
+/// [`Loaded`], which the owner hands to [`Favicons::fetched`].
 pub struct Favicons {
     dir: Option<PathBuf>,
     icons: HashMap<String, Favicon>,
+    /// Sites being fetched (from the network, or checked on disk first).
     pending: HashSet<String>,
+    /// Sites whose cached file is being read from disk.
+    loading: HashSet<String>,
+    /// Sites found to have nothing cached on disk this session, so a
+    /// plain load doesn't read the disk for them again.
+    missing: HashSet<String>,
     /// Sites already fetched with a page's own links this session,
     /// successfully or not.
     tried: HashSet<String>,
@@ -132,19 +166,42 @@ pub struct Favicons {
     /// Sites looked for without a page's links, as lists do for sites not
     /// open: once a session is enough, and a page's own links still count.
     looked_up: HashSet<String>,
+    /// Where background look-ups report back, on their own thread.
+    notify: Arc<dyn Fn(Loaded) + Send + Sync>,
 }
 
 impl Favicons {
-    pub fn new() -> Self {
+    pub fn new(notify: impl Fn(Loaded) + Send + Sync + 'static) -> Self {
         let dir = std::env::var_os("HOME")
             .map(|home| PathBuf::from(home).join("Library/Caches/Vamprowser/Favicons"));
         Self {
             dir,
             icons: HashMap::new(),
             pending: HashSet::new(),
+            loading: HashSet::new(),
+            missing: HashSet::new(),
             tried: HashSet::new(),
             waiting: HashMap::new(),
             looked_up: HashSet::new(),
+            notify: Arc::new(notify),
+        }
+    }
+
+    /// Whether drawing `url`'s site without an icon should ask for one:
+    /// false once it's in memory, on its way, or already looked for this
+    /// session. Asked for every icon-less row on every frame, so the usual
+    /// address is checked without allocating.
+    pub fn wanted(&self, url: &str) -> bool {
+        let settled = |key: &str| {
+            self.icons.contains_key(key)
+                || self.pending.contains(key)
+                || self.loading.contains(key)
+                || self.tried.contains(key)
+                || self.looked_up.contains(key)
+        };
+        match plain_site_key(url) {
+            Some(key) => !settled(key),
+            None => site_key(url).is_some_and(|key| !settled(&key)),
         }
     }
 
@@ -163,33 +220,39 @@ impl Favicons {
         self.icons.get(key)
     }
 
-    /// Brings `url`'s site icon in from disk, if it is cached there.
+    /// Brings `url`'s site icon in from disk, if it is cached there: read
+    /// and decoded off this thread, arriving as a [`Loaded`].
     pub fn load(&mut self, url: &str) {
         let Some(key) = site_key(url) else {
             return;
         };
-        if self.icons.contains_key(&key) {
+        if self.icons.contains_key(&key)
+            || self.loading.contains(&key)
+            || self.missing.contains(&key)
+            || self.pending.contains(&key)
+        {
             return;
         }
-        if let Some(icon) = self
-            .path(&key, "png")
-            .and_then(|path| fs::read(path).ok())
-            .and_then(decode)
-        {
-            self.icons.insert(key, icon);
-        }
+        let png_path = self.path(&key, "png");
+        let notify = self.notify.clone();
+        self.loading.insert(key.clone());
+        in_background(move || {
+            let icon = png_path
+                .and_then(|path| fs::read(path).ok())
+                .and_then(decode);
+            notify(Loaded {
+                key,
+                icon,
+                outcome: Outcome::FromDisk,
+            });
+        });
     }
 
     /// Makes sure `url`'s site has an icon: from memory, from disk, or else
-    /// fetched in the background, calling `done` with the PNG (or `None`)
-    /// on that thread. `candidates` are the page's own links when it has
+    /// fetched from the network, all off this thread; what's found arrives
+    /// as a [`Loaded`]. `candidates` are the page's own links when it has
     /// loaded; without them the site's HTML is read for links.
-    pub fn want(
-        &mut self,
-        url: &str,
-        candidates: Option<Vec<Candidate>>,
-        done: impl FnOnce(String, Option<Vec<u8>>) + Send + 'static,
-    ) {
+    pub fn want(&mut self, url: &str, candidates: Option<Vec<Candidate>>) {
         let Some(key) = site_key(url) else {
             return;
         };
@@ -205,30 +268,47 @@ impl Favicons {
         if candidates.is_none() && !self.looked_up.insert(key.clone()) {
             return;
         }
-        self.load(url);
-        let fresh = |path: Option<PathBuf>, within: Duration| {
-            path.and_then(|path| fs::metadata(path).ok())
-                .and_then(|meta| meta.modified().ok())
-                .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-                .is_some_and(|age| age < within)
-        };
-        if self.icons.contains_key(&key) && fresh(self.path(&key, "png"), FRESH) {
-            return;
-        }
-        // A page's own links are worth trying even if its HTML had none:
-        // they may have been added by script.
-        let page_has_links = candidates.as_ref().is_some_and(|c| !c.is_empty());
-        if !page_has_links && fresh(self.path(&key, "none"), RETRY_MISSING) {
-            return;
-        }
         self.pending.insert(key.clone());
         if candidates.is_some() {
             self.tried.insert(key.clone());
         }
+        // A plain load under way reports on its own; this one reads the
+        // disk again only if neither it nor memory has the icon.
+        let in_memory = self.icons.contains_key(&key);
+        let read_disk = !in_memory && !self.missing.contains(&key);
         let png_path = self.path(&key, "png");
         let none_path = self.path(&key, "none");
+        let notify = self.notify.clone();
         let url = url.to_owned();
         in_background(move || {
+            let fresh = |path: Option<&PathBuf>, within: Duration| {
+                path.and_then(|path| fs::metadata(path).ok())
+                    .and_then(|meta| meta.modified().ok())
+                    .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+                    .is_some_and(|age| age < within)
+            };
+            let cached = if read_disk {
+                png_path
+                    .as_ref()
+                    .and_then(|path| fs::read(path).ok())
+                    .and_then(decode)
+            } else {
+                None
+            };
+            let have_icon = in_memory || cached.is_some();
+            // A page's own links are worth trying even if its HTML had none:
+            // they may have been added by script.
+            let page_has_links = candidates.as_ref().is_some_and(|c| !c.is_empty());
+            if (have_icon && fresh(png_path.as_ref(), FRESH))
+                || (!page_has_links && fresh(none_path.as_ref(), RETRY_MISSING))
+            {
+                notify(Loaded {
+                    key,
+                    icon: cached,
+                    outcome: Outcome::Fresh,
+                });
+                return;
+            }
             let png = fetch(&url, candidates);
             if let (Some(dir), Some(png_path), Some(none_path)) = (
                 png_path.as_ref().and_then(|p| p.parent()),
@@ -248,22 +328,43 @@ impl Favicons {
                     None => {}
                 }
             }
-            done(key, png);
+            let (icon, outcome) = match png.and_then(decode) {
+                Some(icon) => (Some(icon), Outcome::Fetched),
+                None => (cached, Outcome::NothingFound),
+            };
+            notify(Loaded { key, icon, outcome });
         });
     }
 
-    /// Takes in the result of a background fetch. Returns the page's own
+    /// Takes in what a background look-up found. Returns the page's own
     /// links to try next, with its address, if they came during a fetch
     /// without them that found nothing.
-    pub fn fetched(&mut self, key: String, png: Option<Vec<u8>>) -> Option<(String, Vec<Candidate>)> {
-        self.pending.remove(&key);
-        let waiting = self.waiting.remove(&key);
-        match png.and_then(decode) {
+    pub fn fetched(&mut self, loaded: Loaded) -> Option<(String, Vec<Candidate>)> {
+        let Loaded { key, icon, outcome } = loaded;
+        // A plain load and a fetch can be under way for one site at once;
+        // each answer ends only its own.
+        if outcome == Outcome::FromDisk {
+            self.loading.remove(&key);
+        } else {
+            self.pending.remove(&key);
+        }
+        match icon {
             Some(icon) => {
-                self.icons.insert(key, icon);
+                self.missing.remove(&key);
+                self.icons.insert(key.clone(), icon);
+            }
+            None if !self.icons.contains_key(&key) => {
+                self.missing.insert(key.clone());
+            }
+            None => {}
+        }
+        match outcome {
+            Outcome::NothingFound => self.waiting.remove(&key),
+            Outcome::Fetched | Outcome::Fresh => {
+                self.waiting.remove(&key);
                 None
             }
-            None => waiting,
+            Outcome::FromDisk => None,
         }
     }
 
